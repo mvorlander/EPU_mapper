@@ -1,0 +1,3 @@
+# container artifacts
+container/*.tar
+container/*.sif
