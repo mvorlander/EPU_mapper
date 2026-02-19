@@ -1,0 +1,456 @@
+import argparse
+import io
+import json
+import json
+import urllib.parse
+import webbrowser
+import threading
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, FileResponse, Response, JSONResponse
+import uvicorn
+
+from build_collage import _collect_grids, find_grid_image, find_grid_mrc, gather_foil_and_data, _mrc_to_image, write_review_report, write_selected_report, _resolve_atlas_path, parse_metadata
+
+
+def _find_mrc_for_jpg(path: Path) -> Path | None:
+    cand = path.with_suffix(".mrc")
+    if cand.is_file():
+        return cand
+    cand = path.with_suffix(".mrcs")
+    if cand.is_file():
+        return cand
+    return None
+
+
+def _format_meta(meta: dict) -> list[str]:
+    lines = []
+    for key in ("pixel_size", "exposure", "dose", "defocus"):
+        if key in meta:
+            txt = meta[key]
+            if key == "dose":
+                txt += " e-/Å²"
+            lines.append(f"{key.replace('_', ' ')}: {txt}")
+    return lines
+
+
+def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path | None = None) -> FastAPI:
+    base_dir = base_dir.resolve()
+    grids = _collect_grids(base_dir)
+    if not grids:
+        raise RuntimeError(f"no GridSquare directories found in {base_dir}")
+    items = []
+    for _gid, gdir in grids:
+        grid_img = find_grid_image(gdir)
+        mrc_path = find_grid_mrc(gdir)
+        atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir) if atlas_name else None
+        foils, datas = gather_foil_and_data(gdir)
+        foil_list = []
+        for foil_id, p in sorted(foils.items(), key=lambda x: x[0]):
+            foil_list.append({"id": foil_id, "path": p, "mrc": _find_mrc_for_jpg(p)})
+        data_list = []
+        for data_id, p in sorted(datas.items(), key=lambda x: x[0]):
+            if data_id in foils:
+                meta_lines = []
+                xml_path = p.with_suffix(".xml")
+                if xml_path.is_file():
+                    meta_lines = _format_meta(parse_metadata(xml_path))
+                data_list.append({"id": data_id, "path": p, "mrc": _find_mrc_for_jpg(p), "meta": meta_lines})
+        items.append({"id": _gid, "dir": gdir, "grid_img": grid_img, "name": grid_img.name, "mrc": mrc_path, "atlas": atlas_path, "foils": foil_list, "data": data_list})
+
+    responses_file = base_dir / "review_responses.json"
+
+    def _load_responses() -> dict[str, dict]:
+        if responses_file.is_file():
+            try:
+                return json.loads(responses_file.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def _save_responses(current: dict[str, dict]) -> None:
+        try:
+            responses_file.write_text(json.dumps(current))
+        except Exception:
+            return
+
+    responses = _load_responses()
+
+    app = FastAPI()
+
+    def review_html(idx: int) -> str:
+        item = items[idx]
+        has_data = bool(item["data"])
+        nodata_html = "" if has_data else "<div class=\"note warn\">No screening data available for this GridSquare.</div>"
+        grid_has_mrc = bool(item["mrc"])
+        grid_mrc_json = "true" if grid_has_mrc else "false"
+        grid_mrc_note = "" if grid_has_mrc else "<div class=\"note\">No grid MRC available.</div>"
+        atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}\" class=\"atlas-img\"/>" if item["atlas"] else "<div class=\"note\">No atlas found.</div>"
+        data_by_id = {}
+        for d in item["data"]:
+            data_by_id.setdefault(d["id"], []).append(d)
+        if item["foils"]:
+            groups = []
+            for f in item["foils"]:
+                foil_thumb = f"<img class=\"thumb\" data-kind=\"foil\" data-name=\"{f['path'].name}\" data-has-mrc=\"{1 if f['mrc'] else 0}\" src=\"/foil?idx={idx}&name={urllib.parse.quote(f['path'].name)}\"/>"
+                data_imgs = []
+                for p in data_by_id.get(f["id"], []):
+                    meta_html = ""
+                    if p.get("meta"):
+                        meta_html = "<div class=\"meta\">" + "<br>".join(p["meta"]) + "</div>"
+                    data_imgs.append(f"<div class=\"data-card\"><img class=\"thumb\" data-kind=\"data\" data-name=\"{p['path'].name}\" data-has-mrc=\"{1 if p['mrc'] else 0}\" src=\"/data?idx={idx}&name={urllib.parse.quote(p['path'].name)}\"/>{meta_html}</div>")
+                data_block = f"<div class=\"thumb-grid\">{''.join(data_imgs)}</div>" if data_imgs else "<div class=\"note\">No data images for this FoilHole.</div>"
+                groups.append(f"<div class=\"foil-group\"><div class=\"foil-row\">{foil_thumb}<div class=\"data-block\">{data_block}</div></div></div>")
+            thumb_html = "<div class=\"section-title\">Foil holes and data</div>" + "".join(groups)
+        else:
+            thumb_html = "<div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div>"
+        return f"""<html><head><meta charset=\"utf-8\"><title>Review GridSquare {item['id']}</title>
+<style>
+:root{{color-scheme:light;--img-size:380px;--thumb-size:280px;}}
+body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}}
+.page{{max-width:1300px;margin:0 auto;padding:24px;}}
+.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}}
+.title{{font-size:20px;font-weight:600;}}
+.subtitle{{color:#666;font-size:13px;margin-top:2px;}}
+.progress{{color:#666;}}
+.layout{{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start;}}
+.card{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:14px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}
+.image-frame{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:10px;display:inline-block;}}
+.image-frame img{{width:var(--img-size);height:var(--img-size);object-fit:contain;display:block;}}
+.atlas-img{{max-width:100%;height:auto;display:block;}}
+.actions{{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;}}
+.btn{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;}}
+.btn:hover{{background:#f0f2f5;}}
+.btn:disabled{{opacity:0.5;cursor:default;}}
+.rate-buttons{{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;}}
+.rate{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;min-width:38px;}}
+.rate.active{{background:#1b6ef3;color:#fff;border-color:#1b6ef3;}}
+.note{{color:#555;font-size:13px;margin:6px 0;}}
+.note.warn{{color:#b00020;}}
+.section-title{{font-size:14px;font-weight:600;margin:10px 0 6px;}}
+.thumb-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--thumb-size),1fr));gap:10px;}}
+.thumb{{width:var(--thumb-size);height:var(--thumb-size);object-fit:contain;border-radius:6px;border:1px solid #e1e4e8;display:block;background:#fff;cursor:pointer;}}
+.thumb.selected{{outline:2px solid #1b6ef3;}}
+.data-card{{display:flex;flex-direction:column;gap:6px;}}
+.meta{{font-size:12px;color:#444;line-height:1.2;}}
+.foil-group{{border-top:1px solid #eef0f3;padding-top:10px;margin-top:10px;}}
+.foil-row{{display:flex;align-items:flex-start;gap:12px;}}
+.data-block{{flex:1;}}
+textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;padding:8px;font-size:14px;}}
+.submit-row{{margin-top:10px;}}
+</style>
+</head>
+<body>
+<div class=\"page\">
+<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div></div><div class=\"progress\">{idx + 1} / {len(items)}</div></div>
+{nodata_html}
+<div class=\"layout\">
+<div class=\"left\">
+<div class=\"image-frame\"><img id=\"gridimg\" src=\"/grid?idx={idx}\"/></div>
+<div class=\"card\">{thumb_html}</div>
+</div>
+<div class=\"right\">
+<div class=\"card\">
+<div class=\"section-title\">Atlas</div>
+{atlas_html}
+</div>
+<div class=\"card\">
+<div class=\"section-title\">Rating</div>
+<div class=\"rate-buttons\">
+<button type=\"button\" class=\"rate\" data-v=\"1\">1</button>
+<button type=\"button\" class=\"rate\" data-v=\"2\">2</button>
+<button type=\"button\" class=\"rate\" data-v=\"3\">3</button>
+<button type=\"button\" class=\"rate\" data-v=\"4\">4</button>
+<button type=\"button\" class=\"rate\" data-v=\"5\">5</button>
+<button type=\"button\" id=\"skip\" class=\"btn\">Skip</button>
+</div>
+<div class=\"section-title\">Selected image</div>
+<div id=\"selected-image\" class=\"note\">GridSquare</div>
+<div class=\"actions\">
+<button type=\"button\" id=\"show-jpeg\" class=\"btn\">Show JPEG</button>
+<button type=\"button\" id=\"show-mrc\" class=\"btn\">Show MRC</button>
+</div>
+{grid_mrc_note}
+<div id=\"contrast-panel\" style=\"display:none;margin-bottom:8px;\">
+<div>Low: <span id=\"lowv\">2</span>% <input type=\"range\" id=\"low\" min=\"0\" max=\"99\" value=\"2\"></div>
+<div>High: <span id=\"highv\">98</span>% <input type=\"range\" id=\"high\" min=\"1\" max=\"100\" value=\"98\"></div>
+</div>
+<div class=\"section-title\">Report</div>
+<label class=\"note\"><input type=\"checkbox\" id=\"include-report\"> Include this GridSquare in the final report</label>
+<div>Selected rating: <span id=\"selected\">3</span></div>
+<div>Comments:</div>
+<textarea id=\"comment\" rows=\"4\"></textarea>
+<div class=\"submit-row\"><button type=\"button\" id=\"submit\" class=\"btn\">Submit (Ctrl+Enter)</button></div>
+<div id=\"submit-status\" class=\"note\"></div>
+</div>
+</div>
+</div>
+<script>
+const IDX = {idx};
+const GRID_HAS_MRC = {grid_mrc_json};
+let rating = 3;
+let selectedKind = 'grid';
+let selectedName = '';
+let selectedHasMrc = GRID_HAS_MRC;
+function setRating(v){{
+  rating = v;
+  document.getElementById('selected').textContent = String(v);
+  document.querySelectorAll('.rate').forEach(b=>b.classList.toggle('active', parseInt(b.dataset.v) === v));
+}}
+async function submitReview(){{
+  const statusEl = document.getElementById('submit-status');
+  statusEl.textContent = 'Submitting...';
+  try {{
+    const payload = {{idx: IDX, rating: rating, comment: document.getElementById('comment').value, include: document.getElementById('include-report').checked}};
+    const res = await fetch('/submit', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(payload)}});
+    const text = await res.text();
+    if (!res.ok) {{
+      statusEl.textContent = 'Submit failed: ' + res.status;
+      alert(text);
+      return;
+    }}
+    let data;
+    try {{
+      data = JSON.parse(text);
+    }} catch (e) {{
+      statusEl.textContent = 'Submit failed: bad response';
+      alert(text);
+      return;
+    }}
+    if (data.next === null) {{ window.location = '/done'; }}
+    else {{ window.location = '/review/' + data.next; }}
+  }} catch (e) {{
+    statusEl.textContent = 'Submit failed';
+    alert(String(e));
+  }}
+}}
+Array.from(document.querySelectorAll('.rate')).forEach(b=>{{ b.onclick = () => setRating(parseInt(b.dataset.v)); }});
+document.getElementById('skip').onclick = () => {{ rating = 0; submitReview(); }};
+setRating(3);
+function jpgUrl(kind,name){{
+  if (kind === 'grid') return '/grid?idx=' + IDX + '&t=' + Date.now();
+  if (kind === 'foil') return '/foil?idx=' + IDX + '&name=' + encodeURIComponent(name) + '&t=' + Date.now();
+  return '/data?idx=' + IDX + '&name=' + encodeURIComponent(name) + '&t=' + Date.now();
+}}
+function mrcUrl(){{
+  const low = document.getElementById('low').value;
+  const high = document.getElementById('high').value;
+  return '/mrc_file?idx=' + IDX + '&kind=' + selectedKind + '&name=' + encodeURIComponent(selectedName) + '&low=' + low + '&high=' + high + '&t=' + Date.now();
+}}
+function updateButtons(){{
+  document.getElementById('show-mrc').disabled = !selectedHasMrc;
+}}
+function selectImage(kind,name,hasMrc){{
+  selectedKind = kind;
+  selectedName = name || '';
+  selectedHasMrc = !!hasMrc;
+  const label = kind === 'grid' ? 'GridSquare' : (kind + ': ' + name);
+  document.getElementById('selected-image').textContent = label;
+  document.getElementById('gridimg').src = jpgUrl(kind,name);
+  document.getElementById('contrast-panel').style.display = 'none';
+  updateButtons();
+  document.querySelectorAll('.thumb').forEach(t=>t.classList.toggle('selected', t.dataset.kind === kind && t.dataset.name === name));
+}}
+Array.from(document.querySelectorAll('.thumb')).forEach(t=>{{
+  t.onclick = () => selectImage(t.dataset.kind, t.dataset.name, t.dataset.hasMrc === '1');
+}});
+document.getElementById('gridimg').onclick = () => selectImage('grid','',GRID_HAS_MRC);
+function updateContrast(){{
+  const lowEl = document.getElementById('low');
+  const highEl = document.getElementById('high');
+  let low = parseInt(lowEl.value);
+  let high = parseInt(highEl.value);
+  if (low >= high) {{
+    if (low > 0) {{ low = high - 1; lowEl.value = String(low); }}
+    else {{ high = low + 1; highEl.value = String(high); }}
+  }}
+  document.getElementById('lowv').textContent = String(low);
+  document.getElementById('highv').textContent = String(high);
+  document.getElementById('gridimg').src = mrcUrl();
+}}
+document.getElementById('show-mrc').onclick = () => {{
+  if (!selectedHasMrc) return;
+  document.getElementById('contrast-panel').style.display = 'block';
+  updateContrast();
+}};
+document.getElementById('show-jpeg').onclick = () => {{
+  document.getElementById('gridimg').src = jpgUrl(selectedKind, selectedName);
+}};
+document.getElementById('low').oninput = updateContrast;
+document.getElementById('high').oninput = updateContrast;
+updateButtons();
+document.getElementById('submit').onclick = submitReview;
+document.addEventListener('keydown', (e)=>{{
+  if (e.key >= '1' && e.key <= '5') {{ setRating(parseInt(e.key)); }}
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ submitReview(); }}
+}});
+</script>
+</body></html>"""
+
+    @app.get("/")
+    def root():
+        return HTMLResponse("""<html><head><meta charset=\"utf-8\"><title>Grid review</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}
+.page{max-width:900px;margin:0 auto;padding:32px;}
+.card{background:#fff;border:1px solid #e1e4e8;border-radius:12px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}
+.title{font-size:22px;font-weight:600;margin-bottom:8px;}
+.note{color:#555;font-size:14px;line-height:1.4;}
+.btn{display:inline-block;margin-top:14px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;}
+</style>
+</head><body><div class=\"page\"><div class=\"card\"><div class=\"title\">Grid review</div>
+<div class=\"note\">Review GridSquare, FoilHole, and Data images. Click any thumbnail to inspect it. Use "Show MRC" to adjust contrast when available. Rate each GridSquare and leave comments. A PDF report is generated at the end.</div>
+<a class=\"btn\" href=\"/review/0\">Start review</a>
+</div></div></body></html>""")
+
+    @app.get("/review/{idx}")
+    def review(idx: int):
+        if idx < 0 or idx >= len(items):
+            return HTMLResponse("<html><body>Invalid index</body></html>", status_code=404)
+        return HTMLResponse(review_html(idx))
+
+    @app.get("/grid")
+    def grid(idx: int):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        return FileResponse(items[idx]["grid_img"], media_type="image/jpeg")
+
+    @app.get("/atlas")
+    def atlas(idx: int):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        atlas_path = items[idx]["atlas"]
+        if not atlas_path or not atlas_path.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(atlas_path)
+
+    @app.get("/data")
+    def data(idx: int, name: str):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        for p in items[idx]["data"]:
+            if p["path"].name == name and p["path"].is_file():
+                return FileResponse(p["path"])
+        raise HTTPException(status_code=404)
+
+    @app.get("/foil")
+    def foil(idx: int, name: str):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        for p in items[idx]["foils"]:
+            if p["path"].name == name and p["path"].is_file():
+                return FileResponse(p["path"])
+        raise HTTPException(status_code=404)
+
+    @app.get("/mrc_file")
+    def mrc_file(idx: int, kind: str, name: str, low: float = 2.0, high: float = 98.0):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        mrc_path = None
+        if kind == "grid":
+            mrc_path = items[idx]["mrc"]
+        elif kind == "foil":
+            for p in items[idx]["foils"]:
+                if p["path"].name == name:
+                    mrc_path = p["mrc"]
+                    break
+        elif kind == "data":
+            for p in items[idx]["data"]:
+                if p["path"].name == name:
+                    mrc_path = p["mrc"]
+                    break
+        if not mrc_path or not mrc_path.is_file():
+            raise HTTPException(status_code=404)
+        img = _mrc_to_image(mrc_path, low, high)
+        if img is None:
+            raise HTTPException(status_code=404)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    @app.get("/mrc")
+    def mrc(idx: int, low: float = 2.0, high: float = 98.0):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        mrc_path = items[idx]["mrc"]
+        if not mrc_path or not mrc_path.is_file():
+            raise HTTPException(status_code=404)
+        img = _mrc_to_image(mrc_path, low, high)
+        if img is None:
+            raise HTTPException(status_code=404)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    @app.post("/submit")
+    async def submit(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        try:
+            try:
+                idx = int(data.get("idx", -1))
+            except Exception:
+                idx = -1
+            try:
+                rating = int(data.get("rating", 0))
+            except Exception:
+                try:
+                    rating = int(float(data.get("rating", 0)))
+                except Exception:
+                    rating = 0
+            comment = str(data.get("comment", ""))
+            include = bool(data.get("include", False))
+            if idx < 0 or idx >= len(items):
+                return JSONResponse({"next": None})
+            name = items[idx]["dir"].name
+            responses[name] = {"rating": rating, "comment": comment, "include": include}
+            _save_responses(responses)
+            responses.update(_load_responses())
+            next_idx = idx + 1
+            if next_idx >= len(items):
+                return JSONResponse({"next": None})
+            return JSONResponse({"next": next_idx})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/done")
+    def done():
+        return HTMLResponse("<html><body>All GridSquares reviewed. <a id=\"report-link\" href=\"/report\">Download report</a> | <a id=\"selected-link\" href=\"/selected_report\">Download selected report</a><script>document.getElementById('report-link').href = '/report?t=' + Date.now();document.getElementById('selected-link').href = '/selected_report?t=' + Date.now();</script></body></html>")
+
+    @app.get("/report")
+    def report():
+        report_out = report_file or (base_dir / "review_report.pdf")
+        write_review_report(base_dir, report_out, atlas_name, responses)
+        return FileResponse(report_out, media_type="application/pdf", filename=report_out.name, headers={"Cache-Control": "no-store"})
+
+    @app.get("/selected_report")
+    def selected_report():
+        report_out = report_file or (base_dir / "review_report.pdf")
+        selected_out = report_out.with_name(f"{report_out.stem}_selected.pdf")
+        write_selected_report(base_dir, selected_out, atlas_name, responses)
+        return FileResponse(selected_out, media_type="application/pdf", filename=selected_out.name, headers={"Cache-Control": "no-store"})
+
+    return app
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Web review app for GridSquare folders")
+    parser.add_argument("grid_dir", type=Path, help="path to GridSquare directory")
+    parser.add_argument("--atlas", type=str, help="atlas image name")
+    parser.add_argument("--report", type=Path, help="output PDF path")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--open", action="store_true", help="automatically open browser")
+    args = parser.parse_args()
+    app = create_app(args.grid_dir, args.atlas, args.report)
+    if args.open:
+        url = f"http://{args.host}:{args.port}"
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
