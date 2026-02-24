@@ -13,10 +13,11 @@ Typical workflow:
    Docker image, converts it into an Apptainer `.sif` on the remote host, and
    copies the `run_epu_mapper_apptainer.sh` wrapper alongside it.
 2. On the cluster, launch the UI with
-   `run_epu_mapper_apptainer.sh --epu-dir /path/to/Images-Disc1 --atlas /path/to/atlas.jpg`.
-   The wrapper binds both the supplied directory and its parent so `Metadata/*.dm`
-   and `EpuSession.dm` remain visible. PDFs, response JSON, and overlay PNGs are
-   generated next to your session data unless `--no-overlay` is supplied.
+   `run_epu_mapper_apptainer.sh --epu-dir /path/to/session_root --atlas /path/to/atlas.jpg`.
+   Point `--epu-dir` at the folder that contains `EpuSession.dm`, `Metadata/`,
+   and your `Images-Disc*` subdirectories. The wrapper binds that root so
+   metadata stays visible and PDFs/JSON/overlays are written next to your data
+   (unless `--no-overlay` is supplied).
 
 Update `requirements.txt` and rerun the build script any time dependencies or
 source files change.

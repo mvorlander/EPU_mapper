@@ -17,11 +17,13 @@ Required:
 
 Common optional:
   --atlas PATH        Path to the atlas screenshot (absolute or relative).
-  --no-overlay        Skip automatic creation/display of foil overlays (on by default).
+  --no-overlay        Skip automatic creation/display of foil overlays (enabled by default).
 
 Less frequently changed:
   --host HOST         Host interface for uvicorn (default: ${DEFAULT_HOST}).
   --port PORT         Port for uvicorn (default: ${DEFAULT_PORT}).
+  --overlay-transform NAME  Force overlay transform (identity, rot90, rot180, rot270, mirror_x,
+                            mirror_y, mirror_diag, mirror_diag_inv, auto). Default: identity.
   --image PATH        Override Apptainer image (default: ${APPTAINER_IMAGE}).
   -h, --help          Show this help.
 
@@ -144,6 +146,7 @@ MISSING_OVERLAY=()
 [[ -d "$METADATA_DIR" ]] || MISSING_OVERLAY+=("Metadata folder")
 if [[ "$OVERLAY" == "1" && ${#MISSING_OVERLAY[@]} -gt 0 ]]; then
   echo "WARNING: Foil overlays disabled because ${MISSING_OVERLAY[*]} not found under '$SESSION_ROOT'." >&2
+  echo "         The app will continue without overlays; supply --no-overlay to silence this warning." >&2
   OVERLAY=0
 fi
 

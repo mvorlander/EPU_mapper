@@ -1,9 +1,20 @@
-# EPU Mapper Review App
+# EPU Screening Review App
 
-The EPU Mapper web app speeds up the review of Thermo Fisher EPU screening
-sessions so you can quickly decide which GridSquares (and FoilHoles inside
-them) are worth collecting high-resolution data on. It renders every square,
-lets you rate or comment, and exports PDF summaries.
+The EPU Mapper web app speeds up the review of Data from Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth on. It renders every square, lets you add per-square rating and comments, and exports PDF summaries.
+
+# UI overview
+The screenshot shows the reviewing app. 
+
+![UI overview](images/UI_overview.png)
+
+**Top left pannel:** 
+- shows the current Gridsquare image by default. If you click on any other image, the last-clicked image is shown there instead. You can adjust the contrast by clicking on the "Show MRC to adjust contrast..." button on the right. 
+
+**Right panel:**
+- Allows you to add comments and a rating of the square. If you click the checkbox on the right, screening images from that square will be included in a final PDF report. A minimal report showing only the user rating and comments next to the atlas will always be created.
+
+**Bottom pannel:**
+- shows FoilHoles next to Data images
 
 ## What You Need
 
@@ -41,7 +52,7 @@ global context and helps align the foil overlay with the overall grid.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 PYTHONPATH=src .venv/bin/python src/review_app.py /path/to/Images-Disc1 \
-    --atlas /path/to/atlas.jpg --overlay --host 127.0.0.1 --port 8000 --open
+    --atlas /path/to/atlas.jpg --host 127.0.0.1 --port 8000 --open
 ```
 
 Open the printed URL in your browser. Remove `--overlay` (or add
@@ -73,8 +84,10 @@ in plain terminals know what to paste into a browser.
 
 ## Foil Overlay Utilities
 
-- The main app writes `foil_overlay.png` beside each grid when `--overlay`
-  (or the wrapper’s default) is enabled.
+- The main app writes `foil_overlay.png` beside each grid automatically (use
+  `--no-overlay` if you prefer to disable this). If the required `Metadata/`
+  or `EpuSession.dm` files are missing, overlays are skipped gracefully and a
+  banner explains why.
 - Overlays default to the `identity` transform (matching EPU’s orientation).
   If you know a specific rotation/flip is needed, supply
   `--overlay-transform rot90` (or `rot180`, `rot270`, `mirror_x`,

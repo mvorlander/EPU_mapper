@@ -1412,7 +1412,7 @@ document.addEventListener('keydown', (e)=>{
             pass
 
     # write final report PDF
-    report_out = report_file or (base_dir / "review_report.pdf")
+    report_out = report_file or (base_dir / "Screening_overview.pdf")
     write_review_report(base_dir, report_out, atlas_name, responses)
     print(f"Wrote review report to {report_out}")
 

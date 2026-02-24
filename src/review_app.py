@@ -366,9 +366,10 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div id=\"selected-image\" class=\"note\">GridSquare</div>
 <div class=\"actions\">
 <button type=\"button\" id=\"show-jpeg\" class=\"btn\">Show JPEG</button>
-<button type=\"button\" id=\"show-mrc\" class=\"btn\">Show MRC</button>
+<button type=\"button\" id=\"show-mrc\" class=\"btn\">Show MRC to adjust contrast of last-clicked image</button>
 </div>
 {grid_mrc_note}
+<div class=\"note\">When viewing MRCs you can fine-tune the current image using the sliders below.</div>
 <div id=\"contrast-panel\" style=\"display:none;margin-bottom:8px;\">
 <div>Low: <span id=\"lowv\">2</span>% <input type=\"range\" id=\"low\" min=\"0\" max=\"99\" value=\"2\"></div>
 <div>High: <span id=\"highv\">98</span>% <input type=\"range\" id=\"high\" min=\"1\" max=\"100\" value=\"98\"></div>
@@ -657,8 +658,16 @@ def main():
     parser.add_argument("--report", type=Path, help="output PDF path")
     parser.add_argument(
         "--overlay",
+        dest="overlay",
         action="store_true",
-        help="display foil_overlay.png images beside each GridSquare and include them in the selected PDF report",
+        default=True,
+        help="display foil_overlay.png images beside each GridSquare and include them in the selected PDF report (default: on)",
+    )
+    parser.add_argument(
+        "--no-overlay",
+        dest="overlay",
+        action="store_false",
+        help="disable foil overlays even if metadata is available",
     )
     parser.add_argument(
         "--overlay-transform",
