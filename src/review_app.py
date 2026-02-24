@@ -3,6 +3,7 @@ import io
 import errno
 import json
 import json
+import os
 import sys
 import urllib.parse
 import time
@@ -51,6 +52,7 @@ def _format_meta(meta: dict) -> list[str]:
 
 
 _OVERLAY_TOOLS: tuple | None = None
+_OVERLAY_TRANSFORM: str | None = None
 
 
 def _overlay_tools():
@@ -62,19 +64,22 @@ def _overlay_tools():
     if str(root) not in sys.path:
         sys.path.append(str(root))
     try:
-        from scripts.plot_foilhole_positions import compute_markers, plot_overlay  # type: ignore
+        from scripts.plot_foilhole_positions import compute_markers, plot_overlay, set_forced_transform  # type: ignore
     except Exception as exc:
         print(f"[overlay] unable to import helper module: {exc}")
         return None
+    if _OVERLAY_TRANSFORM not in (None, "", "auto"):
+        try:
+            set_forced_transform(_OVERLAY_TRANSFORM)
+            print(f"[overlay] forcing transform: {_OVERLAY_TRANSFORM}")
+        except Exception as exc:
+            print(f"[overlay] invalid overlay transform '{_OVERLAY_TRANSFORM}': {exc}")
     _OVERLAY_TOOLS = (compute_markers, plot_overlay)
     return _OVERLAY_TOOLS
 
 
-def _ensure_overlay_image(gdir: Path, base_dir: Path) -> Path | None:
-    """Return an existing overlay PNG or generate one on demand."""
-    existing = _find_overlay_image(gdir, base_dir)
-    if existing:
-        return existing
+def _generate_overlay_image(gdir: Path) -> Path | None:
+    """Generate foil_overlay.png inside `gdir` using the standalone helper."""
     tools = _overlay_tools()
     if not tools:
         return None
@@ -93,12 +98,103 @@ def _ensure_overlay_image(gdir: Path, base_dir: Path) -> Path | None:
     except Exception as exc:
         print(f"[overlay] failed to render overlay for {gdir.name}: {exc}")
         return None
+    return out_path if out_path.is_file() else None
+
+
+def _ensure_overlay_image(gdir: Path, base_dir: Path) -> Path | None:
+    """Return a fresh overlay PNG path if generation succeeds, else fall back to cached copy."""
+    generated = _generate_overlay_image(gdir)
+    if generated:
+        return generated
     return _find_overlay_image(gdir, base_dir)
 
 
-def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path | None = None, overlay: bool = False) -> FastAPI:
+def _has_grid_dirs(path: Path) -> bool:
+    try:
+        for entry in path.iterdir():
+            if entry.is_dir() and entry.name.startswith("GridSquare_"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_grid_root(path: Path, preferred_subdir: str | None = None) -> Path:
+    """Accept a GridSquare folder, Images-Disc*, or session root and return the actual disc directory."""
+    path = path.resolve()
+    if not path.exists():
+        raise RuntimeError(f"Path not found: {path}")
+    if path.name.startswith("GridSquare_") or _has_grid_dirs(path):
+        return path
+    if path.name.startswith("Images-Disc"):
+        return path
+
+    def _select_from_session(session_dir: Path) -> Path:
+        if preferred_subdir:
+            target = session_dir / preferred_subdir
+            if target.is_dir():
+                return _resolve_grid_root(target)
+        disc1 = session_dir / "Images-Disc1"
+        if disc1.is_dir():
+            return disc1
+        candidates = sorted(p for p in session_dir.iterdir() if p.is_dir() and p.name.startswith("Images-Disc"))
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            names = ", ".join(p.name for p in candidates)
+            raise RuntimeError(
+                f"Multiple Images-Disc* directories found in {session_dir}: {names}. "
+                "Use --images-subdir or set IMAGES_SUBDIR to pick one."
+            )
+        raise RuntimeError(
+            f"No GridSquare directories found in {session_dir}. "
+            "Pass the Images-Disc* folder or set --images-subdir when pointing at the session root."
+        )
+
+    return _select_from_session(path)
+
+
+def _find_session_components(grid_dir: Path) -> tuple[Path | None, Path | None]:
+    """Return (session_root, metadata_dir) by scanning parents of `grid_dir`."""
+    session_root = None
+    metadata_dir = None
+    for candidate in [grid_dir] + list(grid_dir.parents):
+        if session_root is None and (candidate / "EpuSession.dm").is_file():
+            session_root = candidate
+        if metadata_dir is None and (candidate / "Metadata").is_dir():
+            metadata_dir = candidate / "Metadata"
+        if session_root and metadata_dir:
+            break
+    return session_root, metadata_dir
+
+
+def create_app(
+    base_dir: Path,
+    atlas_name: str | None = None,
+    report_file: Path | None = None,
+    overlay: bool = False,
+    overlay_transform: str | None = None,
+) -> FastAPI:
+    global _OVERLAY_TRANSFORM
+    if overlay_transform in (None, "", "auto"):
+        _OVERLAY_TRANSFORM = None
+    else:
+        _OVERLAY_TRANSFORM = overlay_transform
     base_dir = base_dir.resolve()
     overlay_enabled = bool(overlay)
+    overlay_notice_html = ""
+    if overlay_enabled:
+        session_root, metadata_dir = _find_session_components(base_dir)
+        missing_bits: list[str] = []
+        if session_root is None:
+            missing_bits.append("EpuSession.dm")
+        if metadata_dir is None:
+            missing_bits.append("Metadata folder")
+        if missing_bits:
+            overlay_enabled = False
+            missing_str = ", ".join(missing_bits)
+            overlay_notice_html = f"<div class=\"note warn\">Foil overlays disabled: missing {missing_str}. Images will still load.</div>"
+            print(f"[overlay] disabled: missing {missing_str} while scanning parents of {base_dir}")
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
@@ -202,6 +298,7 @@ def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path 
             thumb_html = "<div class=\"section-title\">Foil holes and data</div>" + "".join(groups)
         else:
             thumb_html = "<div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div>"
+        overlay_banner = overlay_notice_html or ""
         return f"""<html><head><meta charset=\"utf-8\"><title>Review GridSquare {item['id']}</title>
 <style>
 :root{{color-scheme:light;--img-size:420px;--thumb-size:280px;}}
@@ -243,6 +340,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <body>
 <div class=\"page\">
 <div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div></div><div class=\"progress\">{idx + 1} / {len(items)}</div></div>
+{overlay_banner}
 {nodata_html}
 <div class=\"layout\">
 <div class=\"left\">
@@ -524,29 +622,37 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    def _report_paths() -> tuple[Path, Path]:
+        if report_file:
+            overview = report_file
+            details = report_file.with_name(f"{report_file.stem}_details.pdf")
+        else:
+            overview = base_dir / "Screening_overview.pdf"
+            details = base_dir / "Screening_details.pdf"
+        return overview, details
+
     @app.get("/done")
     def done():
-        return HTMLResponse("<html><body>All GridSquares reviewed. <a id=\"report-link\" href=\"/report\">Download report</a> | <a id=\"selected-link\" href=\"/selected_report\">Download selected report</a><script>document.getElementById('report-link').href = '/report?t=' + Date.now();document.getElementById('selected-link').href = '/selected_report?t=' + Date.now();</script></body></html>")
+        return HTMLResponse("<html><body>All GridSquares reviewed. <a id=\"report-link\" href=\"/report\">Download screening overview</a> | <a id=\"selected-link\" href=\"/selected_report\">Download screening details</a><script>document.getElementById('report-link').href = '/report?t=' + Date.now();document.getElementById('selected-link').href = '/selected_report?t=' + Date.now();</script></body></html>")
 
     @app.get("/report")
     def report():
-        report_out = report_file or (base_dir / "review_report.pdf")
-        write_review_report(base_dir, report_out, atlas_name, responses)
-        return FileResponse(report_out, media_type="application/pdf", filename=report_out.name, headers={"Cache-Control": "no-store"})
+        overview_path, _details_path = _report_paths()
+        write_review_report(base_dir, overview_path, atlas_name, responses)
+        return FileResponse(overview_path, media_type="application/pdf", filename=overview_path.name, headers={"Cache-Control": "no-store"})
 
     @app.get("/selected_report")
     def selected_report():
-        report_out = report_file or (base_dir / "review_report.pdf")
-        selected_out = report_out.with_name(f"{report_out.stem}_selected.pdf")
-        write_selected_report(base_dir, selected_out, atlas_name, responses, overlay=overlay_enabled)
-        return FileResponse(selected_out, media_type="application/pdf", filename=selected_out.name, headers={"Cache-Control": "no-store"})
+        _overview_path, details_path = _report_paths()
+        write_selected_report(base_dir, details_path, atlas_name, responses, overlay=overlay_enabled)
+        return FileResponse(details_path, media_type="application/pdf", filename=details_path.name, headers={"Cache-Control": "no-store"})
 
     return app
 
 
 def main():
     parser = argparse.ArgumentParser(description="Web review app for GridSquare folders")
-    parser.add_argument("grid_dir", type=Path, help="path to GridSquare directory")
+    parser.add_argument("grid_dir", type=Path, help="path to a GridSquare directory, Images-Disc*, or session root")
     parser.add_argument("--atlas", type=str, help="atlas image name")
     parser.add_argument("--report", type=Path, help="output PDF path")
     parser.add_argument(
@@ -554,11 +660,29 @@ def main():
         action="store_true",
         help="display foil_overlay.png images beside each GridSquare and include them in the selected PDF report",
     )
+    parser.add_argument(
+        "--overlay-transform",
+        choices=["auto", "identity", "rot90", "rot180", "rot270", "mirror_x", "mirror_y", "mirror_diag", "mirror_diag_inv"],
+        default="identity",
+        help="Overlay rotation/mirror transform when --overlay is enabled (default: identity; choose 'auto' to detect)",
+    )
+    parser.add_argument(
+        "--images-subdir",
+        type=str,
+        help="Name of the Images-Disc* subdirectory when pointing at a session root (defaults to IMAGES_SUBDIR env or auto-detect)",
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--open", action="store_true", help="automatically open browser")
     args = parser.parse_args()
-    app = create_app(args.grid_dir, args.atlas, args.report, args.overlay)
+    preferred_disc = args.images_subdir or os.environ.get("IMAGES_SUBDIR")
+    try:
+        grid_root = _resolve_grid_root(args.grid_dir, preferred_disc)
+    except RuntimeError as exc:
+        print(f"[review_app] {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    overlay_transform = args.overlay_transform if args.overlay else None
+    app = create_app(grid_root, args.atlas, args.report, args.overlay, overlay_transform)
     if args.open:
         url = f"http://{args.host}:{args.port}"
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

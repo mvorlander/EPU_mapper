@@ -1,147 +1,105 @@
 # EPU Mapper Review App
 
-EPU Mapper is a FastAPI-based web application for reviewing cryo-EM automated
-screening sessions. It converts the folder structure produced by Thermo Fisher
-EPU (e.g. `Images-Disc1`) into an interactive browser workflow that lets you
-score each GridSquare, inspect FoilHole/Data images, and export comprehensive
-PDF reports.
+The EPU Mapper web app speeds up the review of Thermo Fisher EPU screening
+sessions so you can quickly decide which GridSquares (and FoilHoles inside
+them) are worth collecting high-resolution data on. It renders every square,
+lets you rate or comment, and exports PDF summaries.
 
-## Highlights
+## What You Need
 
-- **GridSquare Review UI** – browse grid, foil, and data thumbnails, toggle
-  JPEG/MRC views, record ratings and notes, and mark squares for inclusion.
-- **Metadata-aware PDFs** – generates a one-page roll-up report and a detailed
-  "selected" report containing montage pages for the GridSquares you included.
-- **Foil overlays** – optionally render FoilHole locations directly on each
-  GridSquare using the same DM metadata that EPU records during acquisition.
-- **Atlas integration** – optionally overlay atlas screenshots for consistent
-  navigation.
-- **Portable deployment** – run locally with Python or via the provided
-  container/Apptainer workflow.
+Point the app at the base directory that EPU calls `Images-Disc*`. At minimum
+you should see folders named `GridSquare_<ID>`, each containing the grid JPEG
+plus optional `FoilHoles/` and `Data/` subfolders with JPEG/XML pairs.
+You can also pass the **session root** (the folder that contains `EpuSession.dm`,
+`Metadata/`, and one or more `Images-Disc*` subdirectories); the app will pick
+the first matching disc automatically or you can force it via `--images-subdir`.
 
-## Expected Data Layout
-
-Point the app at an EPU session directory that contains subfolders named
-`GridSquare_<ID>` plus optional `FoilHoles`/`Data` subdirectories. A minimal
-example looks like this:
+To draw foil overlays, keep the session metadata next to the disc:
 
 ```
 Images-Disc1/
-├── GridSquare_16736167/
-│   ├── GridSquare_20260218_014209.jpg
-│   ├── GridSquare_20260218_014209.mrc
-│   ├── FoilHoles/
-│   │   ├── FoilHole_1_....jpg
-│   │   └── ...
-│   └── Data/
-│       ├── FoilHole_1_Data_....jpg
-│       ├── FoilHole_1_Data_....xml
-│       └── ...
-├── GridSquare_16736168/
-│   └── ...
+├── GridSquare_19828383/
+│   ├── GridSquare_20260220_132420.jpg
+│   ├── FoilHoles/FoilHole_19919351_20260220_132420.jpg (+ .xml)
+│   └── Data/FoilHole_19919351_Data_20260220_132420.jpg (+ .xml)
 ├── Metadata/
-│   ├── GridSquare_16736167.dm
-│   └── GridSquare_16736167/TargetLocation_*.dm
-├── EpuSession.dm           # session-level detector/binning info
-├── review_responses.json   # created by the app; optional on startup
-└── review_report.pdf       # generated output (optional)
+│   ├── GridSquare_19828383.dm
+│   └── (optional) TargetLocation_*.dm files when exported by EPU
+├── EpuSession.dm
+└── review_responses.json / PDFs   # written by the app
 ```
 
-Only JPEGs are required; MRC files (for contrast tweaking) and XML metadata are
-used automatically when present. **Foil overlays** additionally need the
-`Metadata/` directory (with the per-grid `.dm` files and TargetLocation DMs) and
-`EpuSession.dm` so detector readout and stage calibration data can be decoded.
-Atlas screenshots can live anywhere as long as
-you pass their path with `--atlas` (or place them alongside each GridSquare).
+The `.dm` files inside `Metadata/` and the top-level `EpuSession.dm` are enough
+for the overlay logic; per-target DM files are nice-to-have but not required.
+Place an atlas JPEG anywhere and pass it with `--atlas` if you want the atlas
+panel filled in—this screenshot is highly recommended because it gives reviewers
+global context and helps align the foil overlay with the overall grid.
 
-## Running Locally (Python)
-
-1. Create a virtual environment and install dependencies:
-   ```bash
-   python3 -m venv .venv
-   .venv/bin/pip install -r requirements.txt
-   ```
-2. Launch the app:
-   ```bash
-   PYTHONPATH=src .venv/bin/python src/review_app.py /path/to/Images-Disc1 \
-       --atlas /path/to/atlas_w_square_numbering.JPG --overlay --host 127.0.0.1 --port 8000 --open
-   ```
-3. Open the printed URL (default `http://127.0.0.1:8000`) in your browser.
-4. When you finish rating all GridSquares, click **Download report** or
-   **Download selected report**.
-
-Pass `--no-overlay` if the session lacks `Metadata/*.dm` or `EpuSession.dm`.
-
-## Running via Apptainer
-
-The repository includes scripts to build and deploy an Apptainer image to the
-Plaschka cluster.
-
-### Build & Deploy (local machine with Docker)
+## Run Locally
 
 ```bash
-./scripts/build_and_copy_epu_mapper.sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+PYTHONPATH=src .venv/bin/python src/review_app.py /path/to/Images-Disc1 \
+    --atlas /path/to/atlas.jpg --overlay --host 127.0.0.1 --port 8000 --open
 ```
 
-This script:
-1. Builds `container/Dockerfile` (python:3.11-slim + project sources).
-2. Saves the image, uploads it to `matthias.vorlaender@cbe.vbc.ac.at`, and
-   converts it into `/groups/plaschka/shared/software/containers/epu_mapper_review.sif`.
-3. Copies the wrapper to `/groups/plaschka/shared/software/containers/wrappers/`.
+Open the printed URL in your browser. Remove `--overlay` (or add
+`--no-overlay`) if the session lacks DM metadata.
 
-The root `.dockerignore` excludes `Example_data/`, cryoFLARE exports, and other
-large artifacts so the container stays lean.
+Tip: you can also point the script at the session root (the folder that holds
+`EpuSession.dm`, `Metadata/`, and multiple `Images-Disc*` directories) and add
+`--images-subdir Images-Disc1` or set `IMAGES_SUBDIR=Images-Disc1` to pick the
+disc you want to review.
 
-### Run on the cluster
+## Run via Apptainer
 
-```bash
-/groups/plaschka/shared/software/containers/wrappers/run_epu_mapper_apptainer.sh \
-    --epu-dir /groups/.../Images-Disc1 \
-    --atlas /groups/.../atlas_w_square_numbering.JPG \
-    --host 0.0.0.0 --port 8010
-```
+1. Build/refresh the container and copy it to the cluster:
+   ```bash
+   ./scripts/build_and_copy_epu_mapper.sh
+   ```
+2. On the cluster, launch the review UI:
+   ```bash
+   /groups/plaschka/shared/software/containers/wrappers/run_epu_mapper_apptainer.sh \
+       --epu-dir /groups/.../SessionRoot --atlas /groups/.../atlas.jpg
+   ```
 
-The wrapper automatically binds the EPU directory (and the atlas directory if
-it lies elsewhere) into the container so that responses and PDFs are saved next
-to your data. The script prints a prominent banner with the URL to paste into a
-browser. Use `--no-open` if you do *not* want the auto-open hint added inside
-containers.
+Pass the *session root* (the folder containing `EpuSession.dm`, `Metadata/`,
+and one or more `Images-Disc*` subdirectories) via `--epu-dir`. The wrapper
+binds that directory so metadata stays visible. Overlays are on by default; add
+`--no-overlay`
+if you only want the raw JPEGs. A big banner with the URL is printed so users
+in plain terminals know what to paste into a browser.
 
-## Foil Overlay Tooling
+## Foil Overlay Utilities
 
-- Run the app with `--overlay` (enabled by default in the Apptainer wrapper) to
-  generate `foil_overlay.png` images inside each `GridSquare_*` folder.
-- The overlay logic relies on the `.dm` metadata mentioned above; if they are
-  missing the app falls back to stage XML math, but accuracy will suffer.
-- For quick validation outside the web app use:
+- The main app writes `foil_overlay.png` beside each grid when `--overlay`
+  (or the wrapper’s default) is enabled.
+- Overlays default to the `identity` transform (matching EPU’s orientation).
+  If you know a specific rotation/flip is needed, supply
+  `--overlay-transform rot90` (or `rot180`, `rot270`, `mirror_x`,
+  `mirror_y`, `mirror_diag`, `mirror_diag_inv`) or use `--overlay-transform auto`
+  to let the tool pick the best match on the fly.
+- To debug mapping logic on a single square:
   ```bash
   PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
-    python scripts/plot_foilhole_positions.py Example_data/prefloated/Images-Disc1/GridSquare_19828383 \
+    python scripts/plot_foilhole_positions.py \
+      Example_data/prefloated/Images-Disc1/GridSquare_19828383 \
       --output /tmp/GridSquare_19828383_overlay.png \
       --dump-transforms /tmp/outdir
   ```
-  This writes `foil_overlay.png` plus a diagnostic panel for every tested
-  rotation/flip in `/tmp/outdir`.
+  That command also saves diagnostic PNGs for each tested rotation/mirror in
+  `/tmp/outdir`.
 
-## Reports & Outputs
+## Outputs
 
-- `review_report.pdf` – single-page overview showing atlas preview, counts, and
-  a table listing each GridSquare, rating, inclusion flag, and reviewer notes.
-- `review_report_selected.pdf` – generated from `/selected_report`; includes a
-  montage page per included GridSquare with atlas/grid/foil/data panels and
-  metadata when available.
-- `review_responses.json` – simple JSON map storing ratings/notes/inclusion
-  flags; placed in the root EPU directory and reloaded automatically.
+- `Screening_overview.pdf` – one-page overview of ratings, selections, and
+  atlas snapshot.
+- `Screening_details.pdf` – montage pages for squares you marked for data
+  collection, including foil/data thumbnails plus metadata.
+- `review_responses.json` – the persisted ratings, comments, and inclusion
+  flags, written next to the disc so you can resume later.
 
-## Development Notes
-
-- Source code lives in `src/`. Key modules:
-  - `review_app.py` – FastAPI routes + HTML front-end served to reviewers.
-  - `build_collage.py` – image handling, PDF generation, metadata parsing.
-- Tests are not yet formalized; use the provided Example data to smoke test the
-  UI and report generation.
-- Container assets reside in `container/`; deployment scripts in `scripts/`.
-
-Pull requests are welcome! Please open an issue if you encounter data layouts
-that the parser doesn’t recognize or if you need support for additional file
-formats.
+Use the web UI to download either report once you finish reviewing. The app’s
+sole goal is to surface the best GridSquares/FoilHoles for downstream data
+collection decisions.

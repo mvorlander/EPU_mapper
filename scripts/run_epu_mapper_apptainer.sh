@@ -7,13 +7,13 @@ DEFAULT_PORT=${PORT_OVERRIDE:-8000}
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") --epu-dir /path/to/Images-Disc1 [--atlas /path/to/atlas.jpg] [options] [-- review_app args]
+Usage: $(basename "$0") --epu-dir /path/to/session_root [--atlas /path/to/atlas.jpg] [options] [-- review_app args]
 
 Required:
-  --epu-dir PATH      Path to the EPU-generated folder (typically "Images-Disc1") that
-                      contains the automated screening session output. The wrapper also
-                      binds its parent directory so Metadata/*.dm and EpuSession.dm files
-                      remain accessible for foil overlays.
+  --epu-dir PATH      Path to the session root that contains EpuSession.dm,
+                      a Metadata/ folder, and one or more Images-Disc* directories.
+                      The wrapper binds this directory so overlays and outputs can
+                      be written next to the EPU data.
 
 Common optional:
   --atlas PATH        Path to the atlas screenshot (absolute or relative).
@@ -29,17 +29,18 @@ Arguments after "--" are forwarded directly to review_app.py.
 USAGE
 }
 
-EPU_DIR=""
+SESSION_DIR=""
 ATLAS_PATH=""
 HOST="$DEFAULT_HOST"
 PORT="$DEFAULT_PORT"
 EXTRA_ARGS=()
 OVERLAY=1
+OVERLAY_TRANSFORM="identity"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --epu-dir)
-      EPU_DIR="$2"
+      SESSION_DIR="$2"
       shift 2
       ;;
     --atlas)
@@ -53,6 +54,10 @@ while [[ $# -gt 0 ]]; do
     --no-overlay)
       OVERLAY=0
       shift
+      ;;
+    --overlay-transform)
+      OVERLAY_TRANSFORM="$2"
+      shift 2
       ;;
     --host)
       HOST="$2"
@@ -83,27 +88,68 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$EPU_DIR" ]]; then
+if [[ -z "$SESSION_DIR" ]]; then
   echo "--epu-dir is required." >&2
   usage
   exit 1
 fi
 
-if [[ ! -d "$EPU_DIR" ]]; then
-  echo "Grid directory '$EPU_DIR' does not exist." >&2
+if [[ ! -d "$SESSION_DIR" ]]; then
+  echo "Session directory '$SESSION_DIR' does not exist." >&2
   exit 1
 fi
-EPU_DIR="$(cd "$EPU_DIR" && pwd)"
+SESSION_DIR="$(cd "$SESSION_DIR" && pwd)"
 
 if [[ ! -f "$APPTAINER_IMAGE" ]]; then
   echo "Cannot find Apptainer image: $APPTAINER_IMAGE" >&2
   exit 1
 fi
 
-SESSION_ROOT="$(cd "$(dirname "$EPU_DIR")" && pwd)"
-BIND_ARGS=(--bind "$EPU_DIR:$EPU_DIR")
-if [[ "$SESSION_ROOT" != "$EPU_DIR" ]]; then
-  BIND_ARGS+=(--bind "$SESSION_ROOT:$SESSION_ROOT")
+resolve_images_dir() {
+  local base="$1"
+  if [[ -n "${IMAGES_SUBDIR:-}" && -d "$base/$IMAGES_SUBDIR" ]]; then
+    printf '%s\n' "$(cd "$base/$IMAGES_SUBDIR" && pwd)"
+    return 0
+  fi
+  if [[ -d "$base/Images-Disc1" ]]; then
+    printf '%s\n' "$(cd "$base/Images-Disc1" && pwd)"
+    return 0
+  fi
+  shopt -s nullglob
+  local matches=("$base"/Images-Disc*)
+  shopt -u nullglob
+  if (( ${#matches[@]} == 1 )); then
+    printf '%s\n' "$(cd "${matches[0]}" && pwd)"
+    return 0
+  fi
+  return 1
+}
+
+if [[ "$(basename "$SESSION_DIR")" == Images-Disc* ]]; then
+  GRID_DIR="$SESSION_DIR"
+  SESSION_ROOT="$(cd "$(dirname "$SESSION_DIR")" && pwd)"
+else
+  SESSION_ROOT="$SESSION_DIR"
+  if ! GRID_DIR=$(resolve_images_dir "$SESSION_ROOT"); then
+    echo "Unable to locate an Images-Disc* directory inside '$SESSION_ROOT'." >&2
+    echo "Set IMAGES_SUBDIR or pass the Images-Disc* directory directly." >&2
+    exit 1
+  fi
+fi
+
+SESSION_DM="$SESSION_ROOT/EpuSession.dm"
+METADATA_DIR="$SESSION_ROOT/Metadata"
+MISSING_OVERLAY=()
+[[ -f "$SESSION_DM" ]] || MISSING_OVERLAY+=("EpuSession.dm")
+[[ -d "$METADATA_DIR" ]] || MISSING_OVERLAY+=("Metadata folder")
+if [[ "$OVERLAY" == "1" && ${#MISSING_OVERLAY[@]} -gt 0 ]]; then
+  echo "WARNING: Foil overlays disabled because ${MISSING_OVERLAY[*]} not found under '$SESSION_ROOT'." >&2
+  OVERLAY=0
+fi
+
+BIND_ARGS=(--bind "$SESSION_ROOT:$SESSION_ROOT")
+if [[ "$GRID_DIR" != "$SESSION_ROOT" ]]; then
+  BIND_ARGS+=(--bind "$GRID_DIR:$GRID_DIR")
 fi
 if [[ -n "$ATLAS_PATH" ]]; then
   if [[ ! -f "$ATLAS_PATH" ]]; then
@@ -112,24 +158,20 @@ if [[ -n "$ATLAS_PATH" ]]; then
   fi
   ATLAS_PATH="$(cd "$(dirname "$ATLAS_PATH")" && pwd)/$(basename "$ATLAS_PATH")"
   atlas_dir=$(cd "$(dirname "$ATLAS_PATH")" && pwd)
-  if [[ "$atlas_dir" != "$EPU_DIR" ]]; then
+  if [[ "$atlas_dir" != "$SESSION_ROOT" && "$atlas_dir" != "$GRID_DIR" ]]; then
     BIND_ARGS+=(--bind "$atlas_dir:$atlas_dir")
   fi
 fi
 
-if [[ "$OVERLAY" == "1" ]]; then
-  if [[ ! -d "$EPU_DIR/Metadata" && ! -d "$SESSION_ROOT/Metadata" ]]; then
-    echo "Warning: overlay rendering is enabled but no Metadata directory was found near '$EPU_DIR'." >&2
-    echo "         Foil overlays need Metadata/*.dm files plus EpuSession.dm for accurate mapping." >&2
-  fi
-fi
-
-CMD=(apptainer exec "${BIND_ARGS[@]}" "$APPTAINER_IMAGE" start-review-app "$EPU_DIR" --host "$HOST" --port "$PORT")
+CMD=(apptainer exec "${BIND_ARGS[@]}" "$APPTAINER_IMAGE" start-review-app "$SESSION_ROOT" --host "$HOST" --port "$PORT")
 if [[ -n "$ATLAS_PATH" ]]; then
   CMD+=(--atlas "$ATLAS_PATH")
 fi
 if [[ "$OVERLAY" == "1" ]]; then
   CMD+=(--overlay)
+  if [[ -n "$OVERLAY_TRANSFORM" ]]; then
+    CMD+=(--overlay-transform "$OVERLAY_TRANSFORM")
+  fi
 else
   CMD+=(--no-overlay)
 fi

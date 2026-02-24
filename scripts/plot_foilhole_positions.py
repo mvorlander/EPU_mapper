@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 import textwrap
 from typing import Callable, Iterable
@@ -25,12 +26,10 @@ try:
     import matplotlib  # type: ignore
     matplotlib.use("Agg")  # type: ignore[attr-defined]
     import matplotlib.pyplot as plt  # type: ignore
-    import matplotlib.patches as mpatches  # type: ignore
     from matplotlib.patches import Circle  # type: ignore
 except Exception:  # matplotlib is optional at import time
     matplotlib = None
     plt = None
-    mpatches = None
     Circle = None
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -69,6 +68,9 @@ def _find_metadata_root(grid_dir: Path) -> Path | None:
 
 _PIXEL_CENTER_CACHE: dict[Path, dict[str, tuple[float, float]]] = {}
 _SESSION_INFO_CACHE: dict[Path, dict[str, float]] = {}
+
+_OVERLAY_DEBUG = bool(os.environ.get("OVERLAY_DEBUG"))
+_FORCED_TRANSFORM: str | None = os.environ.get("OVERLAY_FORCE_TRANSFORM")
 
 
 def _find_session_root(grid_dir: Path) -> Path | None:
@@ -357,6 +359,17 @@ _TRANSFORM_FUNCS: dict[str, Callable[[float, float], tuple[float, float]]] = {
 }
 
 
+def set_forced_transform(name: str | None) -> None:
+    """Force overlays to use a specific transform name or reset to auto."""
+    global _FORCED_TRANSFORM
+    if not name or name == "auto":
+        _FORCED_TRANSFORM = None
+        return
+    if name not in _TRANSFORM_FUNCS:
+        raise ValueError(f"unknown transform '{name}'")
+    _FORCED_TRANSFORM = name
+
+
 def _select_best_pixel_center_transform(
     norm_centers: dict[str, tuple[float, float]],
     fallback_coords: dict[str, tuple[float, float, bool]],
@@ -418,6 +431,19 @@ def _select_best_pixel_center_transform(
                 best_choice = candidate
     if best_choice is None:
         return None, {}, candidates_info
+    if _FORCED_TRANSFORM:
+        forced = next((c for c in candidates_info if c["name"] == _FORCED_TRANSFORM), None)
+        if forced:
+            best_choice = forced
+    if _OVERLAY_DEBUG:
+        print(f"[overlay] candidate scores ({len(norm_centers)} centers, {len(fallback_coords)} fallbacks):")
+        for cand in candidates_info:
+            print(
+                f"  - {cand['name']}: matches={cand['matches']} "
+                f"score={cand['score']:.3f} in_bounds={cand['in_bounds']} "
+                f"count={len(cand['transformed'])}"
+            )
+        print(f"[overlay] using transform: {best_choice['name']}")
     return best_choice["name"], best_choice["transformed"], candidates_info
 
 
@@ -779,6 +805,7 @@ def plot_overlay(
     title: str = "",
     output: Path | None = None,
     dpi: int = 150,
+    include_panel: bool = False,
 ) -> None:
     w, h = grid_img.size
     radius = max(8, int(min(w, h) * 0.012))
@@ -787,22 +814,28 @@ def plot_overlay(
     n_in = sum(1 for _, _, ib, _, _ in markers if ib)
     n_out = len(markers) - n_in
 
-    panel_img = _build_thumbnail_panel(markers)
-    panel_h, panel_w = panel_img.size[1], panel_img.size[0]
-    if panel_h != h:
-        new_panel_w = max(1, int(panel_w * (h / panel_h)))
-        panel_img = panel_img.resize((new_panel_w, h))
-        panel_w = new_panel_w
-        panel_h = h
-    panel_arr = np.array(panel_img)
+    panel_arr = None
+    panel_w = 0
+    if include_panel and markers:
+        panel_img = _build_thumbnail_panel(markers)
+        panel_h, panel_w = panel_img.size[1], panel_img.size[0]
+        if panel_h != h:
+            new_panel_w = max(1, int(panel_w * (h / panel_h)))
+            panel_img = panel_img.resize((new_panel_w, h))
+            panel_w = new_panel_w
+        panel_arr = np.array(panel_img)
 
     total_w = w + panel_w
     total_h = h
     fig = plt.figure(figsize=(total_w / dpi, total_h / dpi), dpi=dpi)
-    left_w = w / total_w
-    right_w = panel_w / total_w
-    ax = fig.add_axes([0, 0, left_w, 1])
-    ax_panel = fig.add_axes([left_w, 0, right_w, 1])
+    if panel_arr is not None:
+        left_w = w / total_w
+        right_w = panel_w / total_w
+        ax = fig.add_axes([0, 0, left_w, 1])
+        ax_panel = fig.add_axes([left_w, 0, right_w, 1])
+    else:
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax_panel = None
 
     # render the underlying GridSquare image in true grayscale so marker colors stay distinct
     display_img = np.array(grid_img.convert("L"))
@@ -811,8 +844,9 @@ def plot_overlay(
     ax.set_ylim(h, 0)
     ax.axis("off")
 
-    ax_panel.imshow(panel_arr, origin="upper", aspect="equal")
-    ax_panel.axis("off")
+    if ax_panel is not None and panel_arr is not None:
+        ax_panel.imshow(panel_arr, origin="upper", aspect="equal")
+        ax_panel.axis("off")
 
     COLOR_IN = "#2ecc71"
     COLOR_OUT = "#e74c3c"
@@ -840,18 +874,6 @@ def plot_overlay(
             ha="left",
         )
 
-    legend_handles = [
-        mpatches.Patch(facecolor="none", edgecolor=COLOR_IN, label=f"In bounds ({n_in})"),
-        mpatches.Patch(facecolor="none", edgecolor=COLOR_OUT, label=f"Out of bounds ({n_out})"),
-    ]
-    ax.legend(
-        handles=legend_handles,
-        loc="lower right",
-        fontsize=9,
-        framealpha=0.75,
-        edgecolor="white",
-    )
-
     heading = title or "FoilHole positions"
     ax.set_title(heading, fontsize=13, fontweight="bold", pad=6)
     if output:
@@ -871,6 +893,13 @@ def main() -> None:
     parser.add_argument("grid_dir", type=Path, help="GridSquare_* directory or parent disc directory")
     parser.add_argument("--output", type=Path, default=None, help="Output PNG path (default: <grid_dir>/foil_overlay.png)")
     parser.add_argument("--dpi", type=int, default=150, help="Output DPI (default: 150)")
+    parser.add_argument("--include-panel", action="store_true", help="Include FoilHole thumbnails beside the overlay (default: off)")
+    parser.add_argument(
+        "--transform",
+        choices=["auto"] + sorted(_TRANSFORM_FUNCS.keys()),
+        default="identity",
+        help="Rotation/mirror transform to use (default: identity; pick 'auto' to let the tool choose).",
+    )
     parser.add_argument(
         "--dump-transforms",
         type=Path,
@@ -880,6 +909,9 @@ def main() -> None:
     args = parser.parse_args()
 
     grid_dir = args.grid_dir.resolve()
+    if args.transform:
+        set_forced_transform(args.transform)
+
     if not grid_dir.is_dir():
         raise SystemExit(f"Directory not found: {grid_dir}")
 
@@ -910,7 +942,7 @@ def main() -> None:
         else:
             out = gdir / "foil_overlay.png"
 
-        plot_overlay(grid_img, markers, title=gdir.name, output=out, dpi=args.dpi)
+        plot_overlay(grid_img, markers, title=gdir.name, output=out, dpi=args.dpi, include_panel=args.include_panel)
 
 
 if __name__ == "__main__":
