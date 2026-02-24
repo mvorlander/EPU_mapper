@@ -11,10 +11,13 @@ Usage: $(basename "$0") --epu-dir /path/to/Images-Disc1 [--atlas /path/to/atlas.
 
 Required:
   --epu-dir PATH      Path to the EPU-generated folder (typically "Images-Disc1") that
-                      contains the automated screening session output.
+                      contains the automated screening session output. The wrapper also
+                      binds its parent directory so Metadata/*.dm and EpuSession.dm files
+                      remain accessible for foil overlays.
 
 Common optional:
   --atlas PATH        Path to the atlas screenshot (absolute or relative).
+  --no-overlay        Skip automatic creation/display of foil overlays (on by default).
 
 Less frequently changed:
   --host HOST         Host interface for uvicorn (default: ${DEFAULT_HOST}).
@@ -31,6 +34,7 @@ ATLAS_PATH=""
 HOST="$DEFAULT_HOST"
 PORT="$DEFAULT_PORT"
 EXTRA_ARGS=()
+OVERLAY=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +45,14 @@ while [[ $# -gt 0 ]]; do
     --atlas)
       ATLAS_PATH="$2"
       shift 2
+      ;;
+    --overlay)
+      OVERLAY=1
+      shift
+      ;;
+    --no-overlay)
+      OVERLAY=0
+      shift
       ;;
     --host)
       HOST="$2"
@@ -88,7 +100,11 @@ if [[ ! -f "$APPTAINER_IMAGE" ]]; then
   exit 1
 fi
 
+SESSION_ROOT="$(cd "$(dirname "$EPU_DIR")" && pwd)"
 BIND_ARGS=(--bind "$EPU_DIR:$EPU_DIR")
+if [[ "$SESSION_ROOT" != "$EPU_DIR" ]]; then
+  BIND_ARGS+=(--bind "$SESSION_ROOT:$SESSION_ROOT")
+fi
 if [[ -n "$ATLAS_PATH" ]]; then
   if [[ ! -f "$ATLAS_PATH" ]]; then
     echo "Atlas file '$ATLAS_PATH' not found." >&2
@@ -101,9 +117,21 @@ if [[ -n "$ATLAS_PATH" ]]; then
   fi
 fi
 
+if [[ "$OVERLAY" == "1" ]]; then
+  if [[ ! -d "$EPU_DIR/Metadata" && ! -d "$SESSION_ROOT/Metadata" ]]; then
+    echo "Warning: overlay rendering is enabled but no Metadata directory was found near '$EPU_DIR'." >&2
+    echo "         Foil overlays need Metadata/*.dm files plus EpuSession.dm for accurate mapping." >&2
+  fi
+fi
+
 CMD=(apptainer exec "${BIND_ARGS[@]}" "$APPTAINER_IMAGE" start-review-app "$EPU_DIR" --host "$HOST" --port "$PORT")
 if [[ -n "$ATLAS_PATH" ]]; then
   CMD+=(--atlas "$ATLAS_PATH")
+fi
+if [[ "$OVERLAY" == "1" ]]; then
+  CMD+=(--overlay)
+else
+  CMD+=(--no-overlay)
 fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=(-- "${EXTRA_ARGS[@]}")

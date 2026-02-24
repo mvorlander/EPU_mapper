@@ -108,9 +108,9 @@ def _overlay_prefixes(grid_dir: Path) -> list[str]:
 
 
 def _find_overlay_image(grid_dir: Path, base_dir: Path | None = None) -> Path | None:
-    """Locate an overlay PNG for `grid_dir`, optionally matching prefixed outputs."""
-    overlay_names = ("foil_overlay.png", "metadata_overlay.png")
-    overlay_patterns = ("*overlay*.png", "*Overlay*.png")
+    """Locate a foil overlay PNG for `grid_dir`, optionally matching prefixed outputs."""
+    overlay_names = ("foil_overlay.png",)
+    overlay_patterns = ("*foil_overlay*.png", "*FoilOverlay*.png")
 
     for name in overlay_names:
         candidate = grid_dir / name

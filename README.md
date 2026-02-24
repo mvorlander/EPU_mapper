@@ -12,6 +12,8 @@ PDF reports.
   JPEG/MRC views, record ratings and notes, and mark squares for inclusion.
 - **Metadata-aware PDFs** – generates a one-page roll-up report and a detailed
   "selected" report containing montage pages for the GridSquares you included.
+- **Foil overlays** – optionally render FoilHole locations directly on each
+  GridSquare using the same DM metadata that EPU records during acquisition.
 - **Atlas integration** – optionally overlay atlas screenshots for consistent
   navigation.
 - **Portable deployment** – run locally with Python or via the provided
@@ -37,12 +39,19 @@ Images-Disc1/
 │       └── ...
 ├── GridSquare_16736168/
 │   └── ...
+├── Metadata/
+│   ├── GridSquare_16736167.dm
+│   └── GridSquare_16736167/TargetLocation_*.dm
+├── EpuSession.dm           # session-level detector/binning info
 ├── review_responses.json   # created by the app; optional on startup
 └── review_report.pdf       # generated output (optional)
 ```
 
 Only JPEGs are required; MRC files (for contrast tweaking) and XML metadata are
-used automatically when present. Atlas screenshots can live anywhere as long as
+used automatically when present. **Foil overlays** additionally need the
+`Metadata/` directory (with the per-grid `.dm` files and TargetLocation DMs) and
+`EpuSession.dm` so detector readout and stage calibration data can be decoded.
+Atlas screenshots can live anywhere as long as
 you pass their path with `--atlas` (or place them alongside each GridSquare).
 
 ## Running Locally (Python)
@@ -55,11 +64,13 @@ you pass their path with `--atlas` (or place them alongside each GridSquare).
 2. Launch the app:
    ```bash
    PYTHONPATH=src .venv/bin/python src/review_app.py /path/to/Images-Disc1 \
-       --atlas /path/to/atlas_w_square_numbering.JPG --host 127.0.0.1 --port 8000
+       --atlas /path/to/atlas_w_square_numbering.JPG --overlay --host 127.0.0.1 --port 8000 --open
    ```
 3. Open the printed URL (default `http://127.0.0.1:8000`) in your browser.
 4. When you finish rating all GridSquares, click **Download report** or
    **Download selected report**.
+
+Pass `--no-overlay` if the session lacks `Metadata/*.dm` or `EpuSession.dm`.
 
 ## Running via Apptainer
 
@@ -78,6 +89,9 @@ This script:
    converts it into `/groups/plaschka/shared/software/containers/epu_mapper_review.sif`.
 3. Copies the wrapper to `/groups/plaschka/shared/software/containers/wrappers/`.
 
+The root `.dockerignore` excludes `Example_data/`, cryoFLARE exports, and other
+large artifacts so the container stays lean.
+
 ### Run on the cluster
 
 ```bash
@@ -92,6 +106,22 @@ it lies elsewhere) into the container so that responses and PDFs are saved next
 to your data. The script prints a prominent banner with the URL to paste into a
 browser. Use `--no-open` if you do *not* want the auto-open hint added inside
 containers.
+
+## Foil Overlay Tooling
+
+- Run the app with `--overlay` (enabled by default in the Apptainer wrapper) to
+  generate `foil_overlay.png` images inside each `GridSquare_*` folder.
+- The overlay logic relies on the `.dm` metadata mentioned above; if they are
+  missing the app falls back to stage XML math, but accuracy will suffer.
+- For quick validation outside the web app use:
+  ```bash
+  PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
+    python scripts/plot_foilhole_positions.py Example_data/prefloated/Images-Disc1/GridSquare_19828383 \
+      --output /tmp/GridSquare_19828383_overlay.png \
+      --dump-transforms /tmp/outdir
+  ```
+  This writes `foil_overlay.png` plus a diagnostic panel for every tested
+  rotation/flip in `/tmp/outdir`.
 
 ## Reports & Outputs
 
