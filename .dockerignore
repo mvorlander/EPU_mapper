@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+__pycache__/
+.venv/
+Example_data/
+data/
+cryoFLARE/
+epubrowser/
+tests/
+*.tar
+*.sif
+*.log
+*.tmp

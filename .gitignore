@@ -1,3 +1,37 @@
-# container artifacts
+# OS / editor cruft
+.DS_Store
+*/.DS_Store
+Thumbs.db
+
+# Python caches / virtual envs
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.env/
+
+# Large example / external data
+Example_data/
+data/
+cryoFLARE/
+epubrowser/
+
+# Analysis notebooks and exports
+EPUwrangling*.ipynb
+EPUwrangling_extracted.py
+.ipynb_checkpoints/
+
+# Generated overlays and debug renders
+*overlay*.png
+metadata_overlay.png
+foil_overlay.png
+
+# Container artifacts / archives
 container/*.tar
 container/*.sif
+*.tar
+*.sif
+epu_mapper_review.tar
+
+# Misc build stamps
+*.log

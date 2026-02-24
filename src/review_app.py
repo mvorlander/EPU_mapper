@@ -1,8 +1,11 @@
 import argparse
 import io
+import errno
 import json
 import json
+import sys
 import urllib.parse
+import time
 import webbrowser
 import threading
 from pathlib import Path
@@ -11,7 +14,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, JSONResponse
 import uvicorn
 
-from build_collage import _collect_grids, find_grid_image, find_grid_mrc, gather_foil_and_data, _mrc_to_image, write_review_report, write_selected_report, _resolve_atlas_path, parse_metadata
+from build_collage import (
+    _collect_grids,
+    find_grid_image,
+    find_grid_mrc,
+    gather_foil_and_data,
+    _find_overlay_image,
+    _latest_only,
+    _mrc_to_image,
+    write_review_report,
+    write_selected_report,
+    _resolve_atlas_path,
+    parse_metadata,
+)
 
 
 def _find_mrc_for_jpg(path: Path) -> Path | None:
@@ -35,8 +50,55 @@ def _format_meta(meta: dict) -> list[str]:
     return lines
 
 
-def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path | None = None) -> FastAPI:
+_OVERLAY_TOOLS: tuple | None = None
+
+
+def _overlay_tools():
+    """Lazy import of overlay helper utilities."""
+    global _OVERLAY_TOOLS
+    if _OVERLAY_TOOLS is not None:
+        return _OVERLAY_TOOLS
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.append(str(root))
+    try:
+        from scripts.plot_foilhole_positions import compute_markers, plot_overlay  # type: ignore
+    except Exception as exc:
+        print(f"[overlay] unable to import helper module: {exc}")
+        return None
+    _OVERLAY_TOOLS = (compute_markers, plot_overlay)
+    return _OVERLAY_TOOLS
+
+
+def _ensure_overlay_image(gdir: Path, base_dir: Path) -> Path | None:
+    """Return an existing overlay PNG or generate one on demand."""
+    existing = _find_overlay_image(gdir, base_dir)
+    if existing:
+        return existing
+    tools = _overlay_tools()
+    if not tools:
+        return None
+    compute_markers, plot_overlay = tools
+    try:
+        grid_img, markers = compute_markers(gdir)
+    except Exception as exc:
+        print(f"[overlay] skipping {gdir.name}: {exc}")
+        return None
+    if not markers:
+        print(f"[overlay] no FoilHole markers for {gdir.name}")
+        return None
+    out_path = gdir / "foil_overlay.png"
+    try:
+        plot_overlay(grid_img, markers, title=gdir.name, output=out_path, dpi=180)
+    except Exception as exc:
+        print(f"[overlay] failed to render overlay for {gdir.name}: {exc}")
+        return None
+    return _find_overlay_image(gdir, base_dir)
+
+
+def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path | None = None, overlay: bool = False) -> FastAPI:
     base_dir = base_dir.resolve()
+    overlay_enabled = bool(overlay)
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
@@ -46,18 +108,37 @@ def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path 
         mrc_path = find_grid_mrc(gdir)
         atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir) if atlas_name else None
         foils, datas = gather_foil_and_data(gdir)
+        foils = _latest_only(foils)
+        datas = _latest_only(datas)
         foil_list = []
-        for foil_id, p in sorted(foils.items(), key=lambda x: x[0]):
-            foil_list.append({"id": foil_id, "path": p, "mrc": _find_mrc_for_jpg(p)})
+        for foil_id in sorted(foils.keys()):
+            for foil_path in foils[foil_id]:
+                foil_list.append({"id": foil_id, "path": foil_path, "mrc": _find_mrc_for_jpg(foil_path)})
         data_list = []
-        for data_id, p in sorted(datas.items(), key=lambda x: x[0]):
-            if data_id in foils:
-                meta_lines = []
-                xml_path = p.with_suffix(".xml")
-                if xml_path.is_file():
-                    meta_lines = _format_meta(parse_metadata(xml_path))
-                data_list.append({"id": data_id, "path": p, "mrc": _find_mrc_for_jpg(p), "meta": meta_lines})
-        items.append({"id": _gid, "dir": gdir, "grid_img": grid_img, "name": grid_img.name, "mrc": mrc_path, "atlas": atlas_path, "foils": foil_list, "data": data_list})
+        for data_id in sorted(datas.keys()):
+            for data_path in datas[data_id]:
+                if data_id in foils:
+                    meta_lines = []
+                    xml_path = data_path.with_suffix(".xml")
+                    if xml_path.is_file():
+                        meta_lines = _format_meta(parse_metadata(xml_path))
+                    data_list.append(
+                        {"id": data_id, "path": data_path, "mrc": _find_mrc_for_jpg(data_path), "meta": meta_lines}
+                    )
+        overlay_path = _ensure_overlay_image(gdir, base_dir) if overlay_enabled else None
+        items.append(
+            {
+                "id": _gid,
+                "dir": gdir,
+                "grid_img": grid_img,
+                "name": grid_img.name,
+                "mrc": mrc_path,
+                "atlas": atlas_path,
+                "overlay": overlay_path,
+                "foils": foil_list,
+                "data": data_list,
+            }
+        )
 
     responses_file = base_dir / "review_responses.json"
 
@@ -86,7 +167,23 @@ def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path 
         grid_has_mrc = bool(item["mrc"])
         grid_mrc_json = "true" if grid_has_mrc else "false"
         grid_mrc_note = "" if grid_has_mrc else "<div class=\"note\">No grid MRC available.</div>"
-        atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}\" class=\"atlas-img\"/>" if item["atlas"] else "<div class=\"note\">No atlas found.</div>"
+        ts = int(time.time() * 1000)
+        atlas_html = (
+            f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\"/>"
+            if item["atlas"]
+            else "<div class=\"note\">No atlas found.</div>"
+        )
+        grid_frame_html = (
+            f"<div class=\"image-frame\"><div class=\"image-caption\">GridSquare view</div>"
+            f"<img id=\"gridimg\" src=\"/grid?idx={idx}&t={ts}\"/></div>"
+        )
+        overlay_html = ""
+        if item.get("overlay"):
+            overlay_html = (
+                f"<div class=\"image-frame\"><div class=\"image-caption\">Foil overlay</div>"
+                f"<img id=\"overlayimg\" src=\"/overlay?idx={idx}&t={ts}\"/></div>"
+            )
+        grid_section_html = f"<div class=\"grid-panel\">{grid_frame_html}{overlay_html}</div>"
         data_by_id = {}
         for d in item["data"]:
             data_by_id.setdefault(d["id"], []).append(d)
@@ -107,7 +204,7 @@ def create_app(base_dir: Path, atlas_name: str | None = None, report_file: Path 
             thumb_html = "<div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div>"
         return f"""<html><head><meta charset=\"utf-8\"><title>Review GridSquare {item['id']}</title>
 <style>
-:root{{color-scheme:light;--img-size:380px;--thumb-size:280px;}}
+:root{{color-scheme:light;--img-size:420px;--thumb-size:280px;}}
 body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}}
 .page{{max-width:1300px;margin:0 auto;padding:24px;}}
 .header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}}
@@ -116,8 +213,10 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .progress{{color:#666;}}
 .layout{{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start;}}
 .card{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:14px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}
-.image-frame{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:10px;display:inline-block;}}
-.image-frame img{{width:var(--img-size);height:var(--img-size);object-fit:contain;display:block;}}
+.grid-panel{{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:16px;}}
+.image-frame{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;flex:1 1 360px;max-width:100%;}}
+.image-caption{{font-size:13px;font-weight:600;color:#222;}}
+.image-frame img{{width:100%;max-width:var(--img-size);max-height:var(--img-size);height:auto;object-fit:contain;display:block;}}
 .atlas-img{{max-width:100%;height:auto;display:block;}}
 .actions{{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;}}
 .btn{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;}}
@@ -147,7 +246,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 {nodata_html}
 <div class=\"layout\">
 <div class=\"left\">
-<div class=\"image-frame\"><img id=\"gridimg\" src=\"/grid?idx={idx}\"/></div>
+{grid_section_html}
 <div class=\"card\">{thumb_html}</div>
 </div>
 <div class=\"right\">
@@ -325,6 +424,15 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
             raise HTTPException(status_code=404)
         return FileResponse(atlas_path)
 
+    @app.get("/overlay")
+    def overlay(idx: int):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        overlay_path = items[idx].get("overlay")
+        if not overlay_path or not overlay_path.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(overlay_path, media_type="image/png")
+
     @app.get("/data")
     def data(idx: int, name: str):
         if idx < 0 or idx >= len(items):
@@ -430,7 +538,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
     def selected_report():
         report_out = report_file or (base_dir / "review_report.pdf")
         selected_out = report_out.with_name(f"{report_out.stem}_selected.pdf")
-        write_selected_report(base_dir, selected_out, atlas_name, responses)
+        write_selected_report(base_dir, selected_out, atlas_name, responses, overlay=overlay_enabled)
         return FileResponse(selected_out, media_type="application/pdf", filename=selected_out.name, headers={"Cache-Control": "no-store"})
 
     return app
@@ -441,15 +549,30 @@ def main():
     parser.add_argument("grid_dir", type=Path, help="path to GridSquare directory")
     parser.add_argument("--atlas", type=str, help="atlas image name")
     parser.add_argument("--report", type=Path, help="output PDF path")
+    parser.add_argument(
+        "--overlay",
+        action="store_true",
+        help="display foil_overlay.png images beside each GridSquare and include them in the selected PDF report",
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--open", action="store_true", help="automatically open browser")
     args = parser.parse_args()
-    app = create_app(args.grid_dir, args.atlas, args.report)
+    app = create_app(args.grid_dir, args.atlas, args.report, args.overlay)
     if args.open:
         url = f"http://{args.host}:{args.port}"
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(
+                f"[review_app] Cannot start server: {args.host}:{args.port} is already in use. "
+                "Use --port to choose a free port or stop the other process.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from exc
+        raise
 
 
 if __name__ == "__main__":

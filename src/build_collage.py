@@ -27,6 +27,7 @@ import threading
 import urllib.parse
 import webbrowser
 import textwrap
+from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 
@@ -85,37 +86,101 @@ def _timestamp_from_filename(path: Path) -> str:
     return ""
 
 
-def gather_foil_and_data(grid_dir: Path):
+def _overlay_prefixes(grid_dir: Path) -> list[str]:
+    """Return filename prefixes commonly used for this GridSquare."""
+    prefixes: list[str] = []
+    name = grid_dir.name
+    prefixes.append(name)
+    if name.lower().startswith("gridsquare_"):
+        suffix = name.split("_", 1)[1]
+        if suffix:
+            prefixes.append(suffix)
+    digits = "".join(ch for ch in name if ch.isdigit())
+    if digits:
+        prefixes.append(digits)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for prefix in prefixes:
+        if prefix and prefix not in seen:
+            seen.add(prefix)
+            ordered.append(prefix)
+    return ordered
+
+
+def _find_overlay_image(grid_dir: Path, base_dir: Path | None = None) -> Path | None:
+    """Locate an overlay PNG for `grid_dir`, optionally matching prefixed outputs."""
+    overlay_names = ("foil_overlay.png", "metadata_overlay.png")
+    overlay_patterns = ("*overlay*.png", "*Overlay*.png")
+
+    for name in overlay_names:
+        candidate = grid_dir / name
+        if candidate.is_file():
+            return candidate
+    for pattern in overlay_patterns:
+        for candidate in sorted(grid_dir.glob(pattern)):
+            if candidate.is_file():
+                return candidate
+
+    search_dirs: list[Path] = []
+    if base_dir and base_dir not in search_dirs:
+        search_dirs.append(base_dir)
+    parent = grid_dir.parent
+    if parent not in search_dirs:
+        search_dirs.append(parent)
+
+    prefixes = _overlay_prefixes(grid_dir)
+    for directory in search_dirs:
+        if not directory or not directory.is_dir():
+            continue
+        for prefix in prefixes:
+            for name in overlay_names:
+                for suffix in (f"{prefix}_{name}", f"{prefix}{name}"):
+                    candidate = directory / suffix
+                    if candidate.is_file():
+                        return candidate
+        for prefix in prefixes:
+            for pattern in overlay_patterns:
+                combined_pattern = f"{prefix}{pattern}"
+                for candidate in sorted(directory.glob(combined_pattern)):
+                    if candidate.is_file():
+                        return candidate
+    return None
+
+
+def gather_foil_and_data(grid_dir: Path) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
     foil_dir = grid_dir / "FoilHoles"
     data_dir = grid_dir / "Data"
-    foils: dict[str, Path] = {}
-    datas: dict[str, Path] = {}
+    foils: dict[str, list[Path]] = defaultdict(list)
+    datas: dict[str, list[Path]] = defaultdict(list)
 
     if foil_dir.is_dir():
         for f in foil_dir.glob("*.jpg"):
             parts = f.stem.split("_")
             if len(parts) >= 2 and parts[0] == "FoilHole":
                 foil_id = parts[1]
-                ts = _timestamp_from_filename(f)
-                if foil_id in foils:
-                    old_ts = _timestamp_from_filename(foils[foil_id])
-                    if ts > old_ts:
-                        foils[foil_id] = f
-                else:
-                    foils[foil_id] = f
+                foils[foil_id].append(f)
     if data_dir.is_dir():
         for f in data_dir.glob("*.jpg"):
             parts = f.stem.split("_")
             if len(parts) >= 3 and parts[0] == "FoilHole" and parts[2] == "Data":
                 foil_id = parts[1]
-                ts = _timestamp_from_filename(f)
-                if foil_id in datas:
-                    old_ts = _timestamp_from_filename(datas[foil_id])
-                    if ts > old_ts:
-                        datas[foil_id] = f
-                else:
-                    datas[foil_id] = f
-    return foils, datas
+                datas[foil_id].append(f)
+
+    def _sort_entries(d: dict[str, list[Path]]) -> dict[str, list[Path]]:
+        sorted_dict: dict[str, list[Path]] = {}
+        for foil_id, paths in d.items():
+            sorted_dict[foil_id] = sorted(paths, key=lambda path: (_timestamp_from_filename(path), path.name))
+        return sorted_dict
+
+    return _sort_entries(foils), _sort_entries(datas)
+
+
+def _latest_only(d: dict[str, list[Path]]) -> dict[str, list[Path]]:
+    latest: dict[str, list[Path]] = {}
+    for key, paths in d.items():
+        if paths:
+            latest[key] = [paths[-1]]
+    return latest
 
 
 def _collect_grids(base_dir: Path):
@@ -261,7 +326,7 @@ def make_section_page(title: str, subtitle: str | None = None, size=(1700, 2200)
     return img
 
 
-def make_grid_summary_page(
+def make_grid_summary_pages(
     grid_img: Image.Image,
     atlas_img: Image.Image | None,
     foils: dict[str, Path],
@@ -269,30 +334,49 @@ def make_grid_summary_page(
     resp: dict | None,
     heading: str,
     grid_image_name: str,
-) -> Image.Image:
-    """Create an illustrated summary page for a single GridSquare."""
+    overlay_img: Image.Image | None = None,
+) -> list[Image.Image]:
+    """Create illustrated summary page(s) for a single GridSquare."""
     page_w, page_h = 1700, 2200
     margin = 50
     gap = 32
-    page = Image.new("RGB", (page_w, page_h), color=(255, 255, 255))
-    draw = ImageDraw.Draw(page)
     title_font = _get_font(72)
     body_font = _get_font(30)
     small_font = _get_font(22)
-    y = margin
-    draw.text((margin, y), heading, fill=0, font=title_font)
-    y += (title_font.size if hasattr(title_font, "size") else 74) + 4
-    rating = "—" if not resp else str(resp.get("rating", "—"))
-    include_flag = "Yes" if resp and resp.get("include") else "No"
-    comment = "" if not resp else str(resp.get("comment", "")).strip()
-    draw.text((margin, y), f"Rating: {rating}    Included in selected report: {include_flag}", fill=0, font=body_font)
-    y += body_font.size + 6 if hasattr(body_font, "size") else 34
-    if comment:
-        draw.text((margin, y), f"Reviewer notes: {comment}", fill=0, font=body_font)
-        y += body_font.size + 4 if hasattr(body_font, "size") else 30
-    y += 16
+    small_line = (small_font.size if hasattr(small_font, "size") else 22)
+    body_line = (body_font.size + 6) if hasattr(body_font, "size") else 34
+
+    def start_page(page_idx: int) -> tuple[Image.Image, ImageDraw.ImageDraw, int, bool]:
+        img = Image.new("RGB", (page_w, page_h), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        heading_text = heading if page_idx == 0 else f"{heading} (continued)"
+        y = margin
+        draw.text((margin, y), heading_text, fill=0, font=title_font)
+        y += (title_font.size if hasattr(title_font, "size") else 74) + 4
+        include_atlas_block = page_idx == 0
+        if page_idx == 0:
+            rating = "—" if not resp else str(resp.get("rating", "—"))
+            include_flag = "Yes" if resp and resp.get("include") else "No"
+            comment = "" if not resp else str(resp.get("comment", "")).strip()
+            draw.text(
+                (margin, y),
+                f"Rating: {rating}    Included in selected report: {include_flag}",
+                fill=0,
+                font=body_font,
+            )
+            y += body_line
+            if comment:
+                draw.text((margin, y), f"Reviewer notes: {comment}", fill=0, font=body_font)
+                y += body_line - 2
+            y += 16
+        else:
+            y += 12
+        return img, draw, y, include_atlas_block
+
+    pages: list[Image.Image] = []
+    page_idx = 0
+    page, draw, y, include_atlas = start_page(page_idx)
     top_h = 640
-    box_w = (page_w - 2 * margin - gap) // 2
 
     def _fit(img: Image.Image | None, w: int, h: int, mode: str = "RGB") -> Image.Image:
         if img is None:
@@ -305,13 +389,21 @@ def make_grid_summary_page(
         canvas.paste(copy, (ox, oy))
         return canvas
 
-    atlas_box = _fit(atlas_img, box_w, top_h, "RGB")
-    grid_box = _fit(grid_img, box_w, top_h, "RGB")
-    atlas_box = _label_image(atlas_box, "Atlas overview" if atlas_img else "Atlas missing")
-    grid_box = _label_image(grid_box, grid_image_name)
-    page.paste(atlas_box, (margin, y))
-    page.paste(grid_box, (margin + box_w + gap, y))
-    y += top_h + gap
+    if include_atlas:
+        panels: list[tuple[Image.Image | None, str]] = [
+            (atlas_img, "Atlas overview" if atlas_img else "Atlas missing"),
+            (grid_img, grid_image_name),
+        ]
+        if overlay_img is not None:
+            panels.append((overlay_img, "Foil overlay"))
+        panel_count = max(len(panels), 1)
+        box_w = (page_w - 2 * margin - gap * (panel_count - 1)) // panel_count
+        for idx_panel, (panel_image, panel_label) in enumerate(panels):
+            panel_box = _fit(panel_image, box_w, top_h, "RGB")
+            panel_box = _label_image(panel_box, panel_label)
+            x = margin + idx_panel * (box_w + gap)
+            page.paste(panel_box, (x, y))
+        y += top_h + gap
 
     thumb_w = (page_w - 2 * margin - gap) // 2
     thumb_h = thumb_w
@@ -319,37 +411,52 @@ def make_grid_summary_page(
         note = "No FoilHole imagery is available for this GridSquare."
         draw.text((margin, y), note, fill=0, font=body_font)
     else:
-        for foil_id, foil_path in sorted(foils.items()):
-            foil_img = _load_image(foil_path, "L")
-            data_path = datas.get(foil_id)
-            data_img = _load_image(data_path, "L") if data_path else None
-            foil_box = _fit(foil_img, thumb_w, thumb_h, "L").convert("RGB")
-            data_box = _fit(data_img, thumb_w, thumb_h, "L").convert("RGB")
-            foil_box = _label_image(foil_box, f"FoilHole {foil_id}")
-            data_label = data_path.name if data_path else "No screening data"
-            data_box = _label_image(data_box, data_label)
-            page.paste(foil_box, (margin, y))
-            page.paste(data_box, (margin + thumb_w + gap, y))
-            meta_lines: list[str] = []
-            if data_path:
-                xml_path = data_path.with_suffix(".xml")
-                if xml_path.is_file():
-                    meta = parse_metadata(xml_path)
-                    for key in ("pixel_size", "exposure", "dose", "defocus"):
-                        if key in meta:
-                            txt = meta[key]
-                            if key == "dose":
-                                txt += " e-/Å²"
-                            meta_lines.append(f"{key.replace('_', ' ')}: {txt}")
-            if meta_lines:
-                meta_y = y + thumb_h + 10
-                for line in meta_lines:
-                    draw.text((margin + thumb_w + gap, meta_y), line, fill=0, font=small_font)
-                    meta_y += (small_font.size if hasattr(small_font, "size") else 22)
-            y += thumb_h + gap + (small_font.size if hasattr(small_font, "size") else 20)
-            if y + thumb_h + margin > page_h:
-                break
-    return page
+        for foil_id in sorted(foils.keys()):
+            foil_paths = foils[foil_id]
+            data_paths = datas.get(foil_id, [])
+            rows = max(len(foil_paths), len(data_paths), 1)
+            for row_idx in range(rows):
+                foil_path = foil_paths[row_idx] if row_idx < len(foil_paths) else None
+                data_path = data_paths[row_idx] if row_idx < len(data_paths) else None
+                foil_img = _load_image(foil_path, "L") if foil_path else None
+                data_img = _load_image(data_path, "L") if data_path else None
+                foil_label = f"FoilHole {foil_id}"
+                if foil_path and len(foil_paths) > 1:
+                    foil_label += f" #{row_idx + 1}"
+                elif not foil_path:
+                    foil_label += " (no image)"
+                data_label = data_path.name if data_path else "No screening data"
+                meta_lines: list[str] = []
+                if data_path:
+                    xml_path = data_path.with_suffix(".xml")
+                    if xml_path.is_file():
+                        meta = parse_metadata(xml_path)
+                        for key in ("pixel_size", "exposure", "dose", "defocus"):
+                            if key in meta:
+                                txt = meta[key]
+                                if key == "dose":
+                                    txt += " e-/Å²"
+                                meta_lines.append(f"{key.replace('_', ' ')}: {txt}")
+                extra_height = small_line * len(meta_lines) if meta_lines else 0
+                needed_height = thumb_h + gap + extra_height
+                if y + needed_height + margin > page_h:
+                    pages.append(page)
+                    page_idx += 1
+                    page, draw, y, _ = start_page(page_idx)
+                foil_box = _fit(foil_img, thumb_w, thumb_h, "L").convert("RGB")
+                foil_box = _label_image(foil_box, foil_label)
+                data_box = _fit(data_img, thumb_w, thumb_h, "L").convert("RGB")
+                data_box = _label_image(data_box, data_label)
+                page.paste(foil_box, (margin, y))
+                page.paste(data_box, (margin + thumb_w + gap, y))
+                if meta_lines:
+                    meta_y = y + thumb_h + 10
+                    for line in meta_lines:
+                        draw.text((margin + thumb_w + gap, meta_y), line, fill=0, font=small_font)
+                        meta_y += small_line
+                y += thumb_h + gap + extra_height + (small_font.size if hasattr(small_font, "size") else 20)
+    pages.append(page)
+    return pages
 
 
 def make_grid_page(grid_img: Image.Image, label: str, atlas_img: Image.Image | None = None, markers: list[tuple] | None = None) -> Image.Image:
@@ -613,6 +720,23 @@ def parse_grid_info(xml_path: Path) -> dict:
         for e in root.iter():
             if e.tag.lower().endswith(tagname.lower()):
                 yield e
+    for e in iter_tags("readoutarea"):
+        dims = {}
+        for c in e.iter():
+            tag = c.tag.lower()
+            if tag.endswith("width") and c.text:
+                try:
+                    dims["readout_width"] = int(float(c.text))
+                except Exception:
+                    pass
+            if tag.endswith("height") and c.text:
+                try:
+                    dims["readout_height"] = int(float(c.text))
+                except Exception:
+                    pass
+        if dims:
+            info.update(dims)
+            break
     for e in iter_tags("pixelsize"):
         for child in e.iter():
             if child.tag.lower().endswith("numericvalue") and child.text:
@@ -620,19 +744,53 @@ def parse_grid_info(xml_path: Path) -> dict:
                 break
         if "pixel_size" in info:
             break
-    # stage position
-    for e in iter_tags("position"):
-        # look for X and Y children
-        coords = {}
+    stage_coords = None
+    for e in root.iter():
+        if e.tag.lower().endswith("stage"):
+            for c in e.iter():
+                if c.tag.lower().endswith("position"):
+                    coords = {}
+                    for cc in c:
+                        tag = cc.tag.lower()
+                        if tag.endswith("x") and cc.text:
+                            coords["x"] = float(cc.text)
+                        if tag.endswith("y") and cc.text:
+                            coords["y"] = float(cc.text)
+                    if "x" in coords and "y" in coords:
+                        stage_coords = coords
+                        break
+            if stage_coords:
+                break
+    if stage_coords:
+        info["stage_x"] = stage_coords["x"]
+        info["stage_y"] = stage_coords["y"]
+    else:
+        for e in iter_tags("position"):
+            coords = {}
+            for c in e:
+                tag = c.tag.lower()
+                if tag.endswith("x") and c.text:
+                    coords["x"] = float(c.text)
+                if tag.endswith("y") and c.text:
+                    coords["y"] = float(c.text)
+            if "x" in coords and "y" in coords:
+                info["stage_x"] = coords["x"]
+                info["stage_y"] = coords["y"]
+                break
+    for e in iter_tags("matrix"):
+        vals = {}
         for c in e:
             tag = c.tag.lower()
-            if tag.endswith("x") and c.text:
-                coords["x"] = float(c.text)
-            if tag.endswith("y") and c.text:
-                coords["y"] = float(c.text)
-        if "x" in coords and "y" in coords:
-            info["stage_x"] = coords["x"]
-            info["stage_y"] = coords["y"]
+            if tag.endswith("_m11") and c.text:
+                vals["m11"] = float(c.text)
+            if tag.endswith("_m12") and c.text:
+                vals["m12"] = float(c.text)
+            if tag.endswith("_m21") and c.text:
+                vals["m21"] = float(c.text)
+            if tag.endswith("_m22") and c.text:
+                vals["m22"] = float(c.text)
+        if all(k in vals for k in ("m11", "m12", "m21", "m22")):
+            info["ref_matrix"] = (vals["m11"], vals["m12"], vals["m21"], vals["m22"])
             break
     return info
 
@@ -706,12 +864,17 @@ def build_pdf(base_dir: Path, output_file: Path, atlas_name: str | None, no_mark
         if grid_xml.is_file():
             grid_meta = parse_grid_info(grid_xml)
         foils, datas = gather_foil_and_data(grid_dir)
+        foil_entries = [
+            (fid, path)
+            for fid in sorted(foils.keys())
+            for path in foils[fid]
+        ]
         foil_label_map = {}
         markers = None
         if (not no_markers) and grid_meta.get('pixel_size') and grid_meta.get('stage_x'):
             markers = []
             marker_idx = 1
-            for foil_id, foil_path in sorted(foils.items()):
+            for foil_id, foil_path in foil_entries:
                 xml_path = foil_path.with_suffix('.xml')
                 if not xml_path.is_file():
                     continue
@@ -761,7 +924,7 @@ def build_pdf(base_dir: Path, output_file: Path, atlas_name: str | None, no_mark
                 in_bounds = (0 <= px < grid_image.width) and (0 <= py < grid_image.height)
                 labels_this = marker_idx
                 markers.append((px, py, in_bounds, labels_this))
-                foil_label_map[foil_id] = labels_this
+                foil_label_map[(foil_id, foil_path.name)] = labels_this
                 marker_idx += 1
                 status = "in" if in_bounds else "out"
                 print(f"computed marker for foil {foil_id} at px={px:.1f}, py={py:.1f} ({status}-of-bounds) label={labels_this}")
@@ -773,23 +936,26 @@ def build_pdf(base_dir: Path, output_file: Path, atlas_name: str | None, no_mark
         grid_label = f"GridSquare {_gid}: {grid_image_path.name}"
         pages.append(make_grid_page(grid_image, grid_label, atlas_img, markers))
 
-        if not foils:
+        if not foil_entries:
             pages.append(make_text_page("no screening data available for this square"))
         else:
-            for foil_id, foil_path in sorted(foils.items()):
+            data_remaining = {fid: list(paths) for fid, paths in datas.items()}
+            for foil_id, foil_path in foil_entries:
                 foil_image = _load_image(foil_path, "L")
                 if foil_image is None:
                     continue
-                data_path = datas.get(foil_id)
-                data_image = _load_image(data_path, "L") if data_path else None
+                data_candidate = None
+                if foil_id in data_remaining and data_remaining[foil_id]:
+                    data_candidate = data_remaining[foil_id].pop(0)
+                data_image = _load_image(data_candidate, "L") if data_candidate else None
                 foil_lbl = foil_path.name
-                data_lbl = data_path.name if data_path else None
+                data_lbl = data_candidate.name if data_candidate else None
                 meta = {}
-                if data_path:
-                    xml_path = data_path.with_suffix(".xml")
+                if data_candidate:
+                    xml_path = data_candidate.with_suffix(".xml")
                     if xml_path.is_file():
                         meta = parse_metadata(xml_path)
-                index_label = foil_label_map.get(foil_id)
+                index_label = foil_label_map.get((foil_id, foil_path.name))
                 pages.append(make_foil_page(foil_image, data_image, foil_lbl, data_lbl, meta, index_label))
     if pages:
         first, rest = pages[0], pages[1:]
@@ -999,7 +1165,15 @@ def run_interactive_review(base_dir: Path, atlas_name: str | None = None, report
 
             grid_page = make_grid_page(grid_image, f"GridSquare {_gid}: {grid_image_path.name}", atlas_img, markers=None)
             _, datas = gather_foil_and_data(grid_dir)
-            data_paths = [datas[k] for k in sorted(datas.keys()) if datas[k].is_file()][:36]
+            data_paths: list[Path] = []
+            for data_id in sorted(datas.keys()):
+                for path in datas[data_id]:
+                    if path.is_file():
+                        data_paths.append(path)
+                    if len(data_paths) >= 36:
+                        break
+                if len(data_paths) >= 36:
+                    break
             montage = _make_data_montage(data_paths)
             has_data = bool(data_paths)
             mrc_path = find_grid_mrc(grid_dir)
@@ -1359,7 +1533,7 @@ def write_review_report(base_dir: Path, report_file: Path, atlas_name: str | Non
     page.save(report_file, "PDF", resolution=150)
 
 
-def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | None, responses: dict):
+def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | None, responses: dict, overlay: bool = False):
     """Generate a PDF with only the included GridSquares."""
     grids = _collect_grids(base_dir)
     if not grids:
@@ -1392,11 +1566,18 @@ def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | N
                 atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir)
                 if atlas_path:
                     atlas_img_local = _load_image(atlas_path, "RGB")
+            overlay_img_local = None
+            if overlay:
+                overlay_path = _find_overlay_image(gdir, base_dir)
+                if overlay_path:
+                    overlay_img_local = _load_image(overlay_path, "RGB")
             heading = f"GridSquare {idx}: {grid_image_path.name}"
             foils, datas = gather_foil_and_data(gdir)
+            foils = _latest_only(foils)
+            datas = _latest_only(datas)
             try:
-                pages.append(
-                    make_grid_summary_page(
+                pages.extend(
+                    make_grid_summary_pages(
                         grid_image,
                         atlas_img_local,
                         foils,
@@ -1404,6 +1585,7 @@ def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | N
                         resp,
                         heading,
                         grid_image_path.name,
+                        overlay_img_local,
                     )
                 )
             except Exception as exc:
