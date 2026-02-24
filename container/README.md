@@ -11,9 +11,9 @@ Typical workflow:
 
 1. Run `scripts/build_and_copy_epu_mapper.sh` locally. The script builds the
    Docker image, converts it into an Apptainer `.sif` on the remote host, and
-   copies the `run_epu_mapper_apptainer.sh` wrapper alongside it.
+   copies the `epu_review.sh` wrapper alongside it.
 2. On the cluster, launch the UI with
-   `run_epu_mapper_apptainer.sh --epu-dir /path/to/session_root --atlas /path/to/atlas.jpg`.
+   `epu_review.sh --epu-dir /path/to/session_root --atlas /path/to/atlas.jpg`.
    Point `--epu-dir` at the folder that contains `EpuSession.dm`, `Metadata/`,
    and your `Images-Disc*` subdirectories. The wrapper binds that root so
    metadata stays visible and PDFs/JSON/overlays are written next to your data

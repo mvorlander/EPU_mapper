@@ -71,7 +71,7 @@ disc you want to review.
    ```
 2. On the cluster, launch the review UI:
    ```bash
-   /groups/plaschka/shared/software/containers/wrappers/run_epu_mapper_apptainer.sh \
+   /groups/plaschka/shared/software/containers/wrappers/epu_review.sh \
        --epu-dir /groups/.../SessionRoot --atlas /groups/.../atlas.jpg
    ```
 
