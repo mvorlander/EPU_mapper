@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.parse
 import time
+import tempfile
 import webbrowser
 import threading
 from pathlib import Path
@@ -632,6 +633,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
             details = base_dir / "Screening_details.pdf"
         return overview, details
 
+    def _temp_report_path(filename: str) -> Path:
+        temp_root = Path(tempfile.gettempdir()) / "EPUMapperReview"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        return temp_root / filename
+
     @app.get("/done")
     def done():
         return HTMLResponse("<html><body>All GridSquares reviewed. <a id=\"report-link\" href=\"/report\">Download screening overview</a> | <a id=\"selected-link\" href=\"/selected_report\">Download screening details</a><script>document.getElementById('report-link').href = '/report?t=' + Date.now();document.getElementById('selected-link').href = '/selected_report?t=' + Date.now();</script></body></html>")
@@ -639,14 +645,30 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
     @app.get("/report")
     def report():
         overview_path, _details_path = _report_paths()
-        write_review_report(base_dir, overview_path, atlas_name, responses)
-        return FileResponse(overview_path, media_type="application/pdf", filename=overview_path.name, headers={"Cache-Control": "no-store"})
+        target_path = overview_path
+        try:
+            write_review_report(base_dir, target_path, atlas_name, responses)
+        except (PermissionError, OSError):
+            # Common on read-only/network session folders; fall back to a writable temp directory.
+            target_path = _temp_report_path(overview_path.name)
+            write_review_report(base_dir, target_path, atlas_name, responses)
+        except Exception as exc:
+            return JSONResponse({"error": f"failed to generate overview report: {exc}"}, status_code=500)
+        return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
 
     @app.get("/selected_report")
     def selected_report():
         _overview_path, details_path = _report_paths()
-        write_selected_report(base_dir, details_path, atlas_name, responses, overlay=overlay_enabled)
-        return FileResponse(details_path, media_type="application/pdf", filename=details_path.name, headers={"Cache-Control": "no-store"})
+        target_path = details_path
+        try:
+            write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay_enabled)
+        except (PermissionError, OSError):
+            # Common on read-only/network session folders; fall back to a writable temp directory.
+            target_path = _temp_report_path(details_path.name)
+            write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay_enabled)
+        except Exception as exc:
+            return JSONResponse({"error": f"failed to generate selected report: {exc}"}, status_code=500)
+        return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
 
     return app
 
