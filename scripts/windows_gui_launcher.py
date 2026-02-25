@@ -2,6 +2,7 @@
 """Simple Tkinter launcher for the EPU Mapper review app on Windows."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -32,6 +33,9 @@ TRANSFORM_OPTIONS = [
     ("Mirror diag", "mirror_diag"),
     ("Mirror diag inv", "mirror_diag_inv"),
 ]
+def _history_file() -> Path:
+    base = Path(os.environ.get("APPDATA", str(Path.home())))
+    return base / "EPUMapperReview" / "launcher_history.json"
 
 
 def _default_python() -> str:
@@ -106,6 +110,8 @@ class ReviewLauncher:
                 "Use the packaged Windows installer/exe, or install Tk support."
             )
         self.proc: subprocess.Popen[str] | None = None
+        self.preferences = self._load_preferences()
+        self.session_history = list(self.preferences.get("sessions", []))
         self.root = tk.Tk()
         self.root.title("EPU Mapper Review Launcher")
         self._build_form()
@@ -118,38 +124,44 @@ class ReviewLauncher:
         self.root.rowconfigure(1, weight=1)
 
         ttk.Label(frm, text="Session root or Images-Disc folder:").grid(row=0, column=0, sticky="w")
-        self.session_var = tk.StringVar()
+        self.session_var = tk.StringVar(value=self.preferences.get("last_session", ""))
         session_entry = ttk.Entry(frm, textvariable=self.session_var, width=70)
         session_entry.grid(row=1, column=0, sticky="we")
         ttk.Button(frm, text="Browse", command=self.browse_session).grid(row=1, column=1, padx=(6, 0))
 
-        ttk.Label(frm, text="Atlas screenshot (optional but recommended):").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        self.atlas_var = tk.StringVar()
+        ttk.Label(frm, text="Recent sessions:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.recent_var = tk.StringVar()
+        self.recent_combo = ttk.Combobox(frm, textvariable=self.recent_var, state="readonly", values=self.session_history)
+        self.recent_combo.grid(row=3, column=0, sticky="we")
+        self.recent_combo.bind("<<ComboboxSelected>>", self._select_recent_session)
+
+        ttk.Label(frm, text="Atlas screenshot (optional but recommended):").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.atlas_var = tk.StringVar(value=self.preferences.get("last_atlas", ""))
         atlas_entry = ttk.Entry(frm, textvariable=self.atlas_var, width=70)
-        atlas_entry.grid(row=3, column=0, sticky="we")
-        ttk.Button(frm, text="Browse", command=self.browse_atlas).grid(row=3, column=1, padx=(6, 0))
+        atlas_entry.grid(row=5, column=0, sticky="we")
+        ttk.Button(frm, text="Browse", command=self.browse_atlas).grid(row=5, column=1, padx=(6, 0))
 
         options_row = ttk.Frame(frm)
-        options_row.grid(row=4, column=0, columnspan=2, pady=(10, 0), sticky="we")
+        options_row.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky="we")
         ttk.Label(options_row, text="Host:").grid(row=0, column=0, sticky="w")
-        self.host_var = tk.StringVar(value=DEFAULT_HOST)
+        self.host_var = tk.StringVar(value=self.preferences.get("host", DEFAULT_HOST))
         ttk.Entry(options_row, textvariable=self.host_var, width=12).grid(row=0, column=1, padx=(4, 12))
         ttk.Label(options_row, text="Port:").grid(row=0, column=2, sticky="w")
-        self.port_var = tk.StringVar(value=DEFAULT_PORT)
+        self.port_var = tk.StringVar(value=self.preferences.get("port", DEFAULT_PORT))
         ttk.Entry(options_row, textvariable=self.port_var, width=8).grid(row=0, column=3, padx=(4, 12))
-        self.overlay_var = tk.BooleanVar(value=True)
+        self.overlay_var = tk.BooleanVar(value=self.preferences.get("overlay", True))
         ttk.Checkbutton(options_row, text="Generate foil overlays", variable=self.overlay_var).grid(row=0, column=4)
 
-        ttk.Label(frm, text="Overlay transform:").grid(row=5, column=0, sticky="w", pady=(10, 0))
-        self.transform_var = tk.StringVar(value="identity")
+        ttk.Label(frm, text="Overlay transform:").grid(row=7, column=0, sticky="w", pady=(10, 0))
+        self.transform_var = tk.StringVar(value=self._transform_label(self.preferences.get("transform", "identity")))
         transform_box = ttk.Combobox(frm, textvariable=self.transform_var, state="readonly")
         transform_box["values"] = [label for label, _ in TRANSFORM_OPTIONS]
         transform_box.current(0)
-        transform_box.grid(row=6, column=0, sticky="we")
+        transform_box.grid(row=8, column=0, sticky="we")
 
         self.launch_btn = ttk.Button(frm, text="Start review", command=self.start_server)
-        self.launch_btn.grid(row=7, column=0, pady=(12, 0), sticky="w")
-        ttk.Button(frm, text="Stop", command=self.stop_server).grid(row=7, column=1, pady=(12, 0), sticky="e")
+        self.launch_btn.grid(row=9, column=0, pady=(12, 0), sticky="w")
+        ttk.Button(frm, text="Stop", command=self.stop_server).grid(row=9, column=1, pady=(12, 0), sticky="e")
 
         output_frame = ttk.LabelFrame(self.root, text="Server log", padding=6)
         output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
@@ -183,7 +195,7 @@ class ReviewLauncher:
         host = self.host_var.get().strip() or DEFAULT_HOST
         port = self.port_var.get().strip() or DEFAULT_PORT
         transform_value = self.transform_var.get()
-        transform = next((value for label, value in TRANSFORM_OPTIONS if label == transform_value), "identity")
+        transform = self._transform_value(transform_value)
 
         cmd = _review_command(session_path, host, port, atlas_path, self.overlay_var.get(), transform)
 
@@ -208,6 +220,8 @@ class ReviewLauncher:
         except Exception as exc:
             messagebox.showerror("Failed to launch", f"Could not start review_app: {exc}")
             return
+        self._remember_session(session_path)
+        self._persist_preferences(transform, atlas_path)
         self.launch_btn.configure(state="disabled")
         threading.Thread(target=self._stream_output, daemon=True).start()
         self._log(f"Started server on {host}:{port}. Close the browser tab when finished.\n")
@@ -218,6 +232,55 @@ class ReviewLauncher:
             self._log("Stopping server...\n")
         self.proc = None
         self.launch_btn.configure(state="normal")
+
+    def _transform_value(self, label: str) -> str:
+        for text, value in TRANSFORM_OPTIONS:
+            if text == label:
+                return value
+        return "identity"
+
+    def _transform_label(self, value: str) -> str:
+        for text, val in TRANSFORM_OPTIONS:
+            if val == value:
+                return text
+        return TRANSFORM_OPTIONS[0][0]
+
+    def _select_recent_session(self, _event: tk.Event) -> None:
+        val = self.recent_var.get()
+        if val:
+            self.session_var.set(val)
+
+    def _prefs_path(self) -> Path:
+        return _history_file()
+
+    def _load_preferences(self) -> dict:
+        path = self._prefs_path()
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return {}
+
+    def _remember_session(self, session_path: str) -> None:
+        norm = str(Path(session_path))
+        if norm in self.session_history:
+            self.session_history.remove(norm)
+        self.session_history.insert(0, norm)
+        self.session_history = self.session_history[:5]
+        self.recent_combo["values"] = self.session_history
+
+    def _persist_preferences(self, transform: str, atlas_path: str) -> None:
+        prefs = {
+            "sessions": self.session_history,
+            "host": self.host_var.get().strip() or DEFAULT_HOST,
+            "port": self.port_var.get().strip() or DEFAULT_PORT,
+            "transform": transform,
+            "overlay": bool(self.overlay_var.get()),
+            "last_session": self.session_var.get().strip(),
+            "last_atlas": atlas_path,
+        }
+        path = self._prefs_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(prefs, indent=2))
 
     def _stream_output(self) -> None:
         assert self.proc and self.proc.stdout

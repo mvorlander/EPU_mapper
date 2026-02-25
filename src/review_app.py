@@ -10,6 +10,7 @@ import time
 import tempfile
 import webbrowser
 import threading
+from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -54,6 +55,13 @@ def _format_meta(meta: dict) -> list[str]:
 
 _OVERLAY_TOOLS: tuple | None = None
 _OVERLAY_TRANSFORM: str | None = None
+_OVERLAY_EVENTS: deque = deque(maxlen=200)
+
+
+def _record_status(message: str) -> None:
+    timestamp = time.time()
+    print(message, flush=True)
+    _OVERLAY_EVENTS.appendleft({"ts": timestamp, "message": message})
 
 
 def _overlay_tools():
@@ -85,29 +93,37 @@ def _generate_overlay_image(gdir: Path) -> Path | None:
     if not tools:
         return None
     compute_markers, plot_overlay = tools
+    _record_status(f"[overlay] Generating overlay for {gdir.name}...")
     try:
         grid_img, markers = compute_markers(gdir)
     except Exception as exc:
-        print(f"[overlay] skipping {gdir.name}: {exc}")
+        _record_status(f"[overlay] skipping {gdir.name}: {exc}")
         return None
     if not markers:
-        print(f"[overlay] no FoilHole markers for {gdir.name}")
+        _record_status(f"[overlay] no FoilHole markers for {gdir.name}")
         return None
     out_path = gdir / "foil_overlay.png"
     try:
         plot_overlay(grid_img, markers, title=gdir.name, output=out_path, dpi=180)
     except Exception as exc:
-        print(f"[overlay] failed to render overlay for {gdir.name}: {exc}")
+        _record_status(f"[overlay] failed to render overlay for {gdir.name}: {exc}")
         return None
-    return out_path if out_path.is_file() else None
+    if out_path.is_file():
+        _record_status(f"[overlay] Finished {gdir.name}")
+        return out_path
+    _record_status(f"[overlay] Overlay file missing for {gdir.name}")
+    return None
 
 
-def _ensure_overlay_image(gdir: Path, base_dir: Path) -> Path | None:
+def _ensure_overlay_image(gdir: Path, base_dir: Path) -> tuple[Path | None, str | None]:
     """Return a fresh overlay PNG path if generation succeeds, else fall back to cached copy."""
     generated = _generate_overlay_image(gdir)
     if generated:
-        return generated
-    return _find_overlay_image(gdir, base_dir)
+        return generated, None
+    cached = _find_overlay_image(gdir, base_dir)
+    if cached:
+        return cached, "Using cached overlay image (new generation failed)."
+    return None, "Overlay unavailable for this GridSquare (missing metadata or generation failed)."
 
 
 def _has_grid_dirs(path: Path) -> bool:
@@ -202,7 +218,10 @@ def create_app(
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
     items = []
-    for _gid, gdir in grids:
+    total_grids = len(grids)
+    status_state = {"total": total_grids, "loaded": 0}
+    for idx_item, (_gid, gdir) in enumerate(grids, start=1):
+        _record_status(f"[review_app] Preparing GridSquare {_gid} ({idx_item}/{total_grids})")
         grid_img = find_grid_image(gdir)
         mrc_path = find_grid_mrc(gdir)
         atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir) if atlas_name else None
@@ -224,7 +243,10 @@ def create_app(
                     data_list.append(
                         {"id": data_id, "path": data_path, "mrc": _find_mrc_for_jpg(data_path), "meta": meta_lines}
                     )
-        overlay_path = _ensure_overlay_image(gdir, base_dir) if overlay_enabled else None
+        overlay_path = None
+        overlay_message = None
+        if overlay_enabled:
+            overlay_path, overlay_message = _ensure_overlay_image(gdir, base_dir)
         items.append(
             {
                 "id": _gid,
@@ -234,10 +256,12 @@ def create_app(
                 "mrc": mrc_path,
                 "atlas": atlas_path,
                 "overlay": overlay_path,
+                "overlay_message": overlay_message,
                 "foils": foil_list,
                 "data": data_list,
             }
         )
+        status_state["loaded"] = idx_item
 
     responses_file = base_dir / "review_responses.json"
 
@@ -267,22 +291,24 @@ def create_app(
         grid_mrc_json = "true" if grid_has_mrc else "false"
         grid_mrc_note = "" if grid_has_mrc else "<div class=\"note\">No grid MRC available.</div>"
         ts = int(time.time() * 1000)
-        atlas_html = (
-            f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\"/>"
-            if item["atlas"]
-            else "<div class=\"note\">No atlas found.</div>"
-        )
+        if item["atlas"]:
+            atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\"/>"
+        else:
+            atlas_html = "<div class=\"atlas-placeholder\"><div class=\"placeholder-title\">Atlas not provided</div><div class=\"placeholder-note\">Add an atlas JPEG/PNG and launch with <code>--atlas atlas.jpg</code> (or the launcher field) so reviewers can align squares quickly.</div></div>"
         grid_frame_html = (
             f"<div class=\"image-frame\"><div class=\"image-caption\">GridSquare view</div>"
             f"<img id=\"gridimg\" src=\"/grid?idx={idx}&t={ts}\"/></div>"
         )
         overlay_html = ""
+        overlay_inline_notice = ""
         if item.get("overlay"):
             overlay_html = (
                 f"<div class=\"image-frame\"><div class=\"image-caption\">Foil overlay</div>"
                 f"<img id=\"overlayimg\" src=\"/overlay?idx={idx}&t={ts}\"/></div>"
             )
-        grid_section_html = f"<div class=\"grid-panel\">{grid_frame_html}{overlay_html}</div>"
+        elif item.get("overlay_message"):
+            overlay_inline_notice = f"<div class=\"note warn\">{item['overlay_message']}</div>"
+        grid_section_html = f"<div class=\"grid-panel\">{grid_frame_html}{overlay_html}</div>{overlay_inline_notice}"
         data_by_id = {}
         for d in item["data"]:
             data_by_id.setdefault(d["id"], []).append(d)
@@ -302,6 +328,9 @@ def create_app(
         else:
             thumb_html = "<div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div>"
         overlay_banner = overlay_notice_html or ""
+        next_idx_val = idx + 1 if idx + 1 < len(items) else "null"
+        prev_idx_val = idx - 1 if idx - 1 >= 0 else "null"
+        total_len = len(items)
         return f"""<html><head><meta charset=\"utf-8\"><title>Review GridSquare {item['id']}</title>
 <style>
 :root{{color-scheme:light;--img-size:420px;--thumb-size:280px;}}
@@ -327,6 +356,10 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .rate.active{{background:#1b6ef3;color:#fff;border-color:#1b6ef3;}}
 .note{{color:#555;font-size:13px;margin:6px 0;}}
 .note.warn{{color:#b00020;}}
+.status-card{{margin-top:16px;}}
+.status-log{{max-height:180px;overflow:auto;font-size:12px;color:#333;background:#fafafa;border-radius:8px;padding:8px;border:1px solid #e1e4e8;}}
+.status-log div{{padding:2px 0;border-bottom:1px solid #eceff3;}}
+.status-log div:last-child{{border-bottom:0;}}
 .section-title{{font-size:14px;font-weight:600;margin:10px 0 6px;}}
 .thumb-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--thumb-size),1fr));gap:10px;}}
 .thumb{{width:var(--thumb-size);height:var(--thumb-size);object-fit:contain;border-radius:6px;border:1px solid #e1e4e8;display:block;background:#fff;cursor:pointer;}}
@@ -338,11 +371,19 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .data-block{{flex:1;}}
 textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;padding:8px;font-size:14px;}}
 .submit-row{{margin-top:10px;}}
+.atlas-placeholder{{border:1px dashed #cfd6e4;border-radius:10px;padding:10px;background:#fdfdfd;color:#445;}}
+.atlas-placeholder .placeholder-title{{font-weight:600;margin-bottom:4px;}}
+.atlas-placeholder code{{background:#eef1f6;padding:2px 4px;border-radius:4px;}}
+#loading-overlay{{position:fixed;inset:0;background:rgba(245,246,248,0.96);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:18px;color:#111;z-index:9999;transition:opacity 0.3s;}}
+#loading-overlay.hidden{{opacity:0;pointer-events:none;}}
+.spinner{{width:40px;height:40px;border:4px solid #d0d7e7;border-top-color:#1b6ef3;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:12px;}}
+@keyframes spin{{to{{transform:rotate(360deg);}}}}
 </style>
 </head>
 <body>
+<div id=\"loading-overlay\"><div class=\"spinner\"></div><div>Loading images…</div></div>
 <div class=\"page\">
-<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div></div><div class=\"progress\">{idx + 1} / {len(items)}</div></div>
+<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div></div><div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div></div>
 {overlay_banner}
 {nodata_html}
 <div class=\"layout\">
@@ -354,6 +395,10 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div class=\"card\">
 <div class=\"section-title\">Atlas</div>
 {atlas_html}
+</div>
+<div class=\"card status-card\">
+<div class=\"section-title\">Background tasks</div>
+<div id=\"status-log\" class=\"status-log\"><div>Gathering status…</div></div>
 </div>
 <div class=\"card\">
 <div class=\"section-title\">Rating</div>
@@ -389,15 +434,27 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 </div>
 <script>
 const IDX = {idx};
+const TOTAL_GRIDS = {total_len};
+const NEXT_IDX = {next_idx_val};
+const PREV_IDX = {prev_idx_val};
 const GRID_HAS_MRC = {grid_mrc_json};
+const STORAGE_KEY = 'review_state_' + IDX;
+localStorage.setItem('last_idx', IDX);
 let rating = 3;
 let selectedKind = 'grid';
 let selectedName = '';
 let selectedHasMrc = GRID_HAS_MRC;
+function hideLoading(){{
+  const overlay = document.getElementById('loading-overlay');
+  overlay.classList.add('hidden');
+  setTimeout(()=>overlay.remove(),300);
+}}
+window.addEventListener('load', hideLoading);
 function setRating(v){{
   rating = v;
   document.getElementById('selected').textContent = String(v);
   document.querySelectorAll('.rate').forEach(b=>b.classList.toggle('active', parseInt(b.dataset.v) === v));
+  persistState();
 }}
 async function submitReview(){{
   const statusEl = document.getElementById('submit-status');
@@ -419,6 +476,7 @@ async function submitReview(){{
       alert(text);
       return;
     }}
+    localStorage.removeItem(STORAGE_KEY);
     if (data.next === null) {{ window.location = '/done'; }}
     else {{ window.location = '/review/' + data.next; }}
   }} catch (e) {{
@@ -478,6 +536,29 @@ document.getElementById('show-mrc').onclick = () => {{
 document.getElementById('show-jpeg').onclick = () => {{
   document.getElementById('gridimg').src = jpgUrl(selectedKind, selectedName);
 }};
+const commentEl = document.getElementById('comment');
+const includeEl = document.getElementById('include-report');
+function persistState(){{
+  const data = {{
+    rating,
+    comment: commentEl.value,
+    include: includeEl.checked
+  }};
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+}}
+function restoreState(){{
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (!saved) return;
+  try {{
+    const data = JSON.parse(saved);
+    if (typeof data.comment === 'string') commentEl.value = data.comment;
+    if (typeof data.include === 'boolean') includeEl.checked = data.include;
+    if (typeof data.rating === 'number' && data.rating >=1 && data.rating <=5) setRating(data.rating);
+  }} catch (e) {{}}
+}}
+restoreState();
+commentEl.addEventListener('input', persistState);
+includeEl.addEventListener('change', persistState);
 document.getElementById('low').oninput = updateContrast;
 document.getElementById('high').oninput = updateContrast;
 updateButtons();
@@ -485,7 +566,27 @@ document.getElementById('submit').onclick = submitReview;
 document.addEventListener('keydown', (e)=>{{
   if (e.key >= '1' && e.key <= '5') {{ setRating(parseInt(e.key)); }}
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ submitReview(); }}
+  if (e.key === 'ArrowRight' && NEXT_IDX !== null) {{ window.location = '/review/' + NEXT_IDX; }}
+  if (e.key === 'ArrowLeft' && PREV_IDX !== null) {{ window.location = '/review/' + PREV_IDX; }}
 }});
+async function refreshStatus(){{
+  try {{
+    const res = await fetch('/status?t=' + Date.now());
+    if (!res.ok) return;
+    const data = await res.json();
+    const logEl = document.getElementById('status-log');
+    if (data.events && data.events.length) {{
+      logEl.innerHTML = data.events.map(ev => '<div>' + new Date(ev.ts * 1000).toLocaleTimeString() + ' — ' + ev.message + '</div>').join('');
+    }} else {{
+      logEl.innerHTML = '<div>Idle</div>';
+    }}
+    if (typeof data.total === 'number' && typeof data.loaded === 'number') {{
+      document.getElementById('progress').textContent = (IDX + 1) + ' / ' + data.total;
+    }}
+  }} catch (e) {{}}
+}}
+refreshStatus();
+setInterval(refreshStatus, 5000);
 </script>
 </body></html>"""
 
@@ -497,13 +598,26 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
 .page{max-width:900px;margin:0 auto;padding:32px;}
 .card{background:#fff;border:1px solid #e1e4e8;border-radius:12px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}
 .title{font-size:22px;font-weight:600;margin-bottom:8px;}
-.note{color:#555;font-size:14px;line-height:1.4;}
-.btn{display:inline-block;margin-top:14px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;}
+.note{color:#555;font-size:14px;line-height:1.4;margin-bottom:10px;}
+.btn{display:inline-block;margin-top:14px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;margin-right:8px;}
+.btn.secondary{background:#fff;color:#1b6ef3;}
 </style>
 </head><body><div class=\"page\"><div class=\"card\"><div class=\"title\">Grid review</div>
 <div class=\"note\">Review GridSquare, FoilHole, and Data images. Click any thumbnail to inspect it. Use "Show MRC" to adjust contrast when available. Rate each GridSquare and leave comments. A PDF report is generated at the end.</div>
-<a class=\"btn\" href=\"/review/0\">Start review</a>
-</div></div></body></html>""")
+<a class=\"btn\" id=\"start-btn\" href=\"/review/0\">Start review</a>
+<a class=\"btn secondary\" id=\"resume-btn\" style=\"display:none;\" href=\"#\">Resume last visited</a>
+</div></div>
+<script>
+const resumeBtn = document.getElementById('resume-btn');
+const startBtn = document.getElementById('start-btn');
+const lastIdx = localStorage.getItem('last_idx');
+if (lastIdx !== null){{
+  resumeBtn.style.display = 'inline-block';
+  resumeBtn.href = '/review/' + lastIdx;
+  resumeBtn.onclick = () => {{ window.location = '/review/' + lastIdx; return false; }};
+}}
+</script>
+</body></html>""")
 
     @app.get("/review/{idx}")
     def review(idx: int):
@@ -579,6 +693,16 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
         img.save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
 
+    @app.get("/status")
+    def status():
+        return JSONResponse(
+            {
+                "total": status_state["total"],
+                "loaded": status_state["loaded"],
+                "events": list(_OVERLAY_EVENTS)[:20],
+            }
+        )
+
     @app.get("/mrc")
     def mrc(idx: int, low: float = 2.0, high: float = 98.0):
         if idx < 0 or idx >= len(items):
@@ -642,7 +766,38 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
 
     @app.get("/done")
     def done():
-        return HTMLResponse("<html><body>All GridSquares reviewed. <a id=\"report-link\" href=\"/report\">Download screening overview</a> | <a id=\"selected-link\" href=\"/selected_report\">Download screening details</a><script>document.getElementById('report-link').href = '/report?t=' + Date.now();document.getElementById('selected-link').href = '/selected_report?t=' + Date.now();</script></body></html>")
+        return HTMLResponse(
+            """<html><head><meta charset="utf-8"><title>Review complete</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}
+.page{max-width:600px;margin:0 auto;padding:36px;}
+.card{background:#fff;border:1px solid #e1e4e8;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
+.title{font-size:22px;font-weight:600;margin-bottom:8px;}
+.note{color:#555;font-size:14px;margin-bottom:12px;}
+.btn{display:inline-block;margin-top:10px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;margin-right:8px;}
+#done-status{margin-top:12px;font-size:13px;color:#1b6ef3;}
+</style>
+</head><body><div class="page"><div class="card">
+<div class="title">All GridSquares reviewed</div>
+<div class="note">Download the PDF summaries below. You can reopen this session later to continue editing notes or regenerate the reports.</div>
+<a class="btn" id="report-link" href="/report">Download overview</a>
+<a class="btn" id="selected-link" href="/selected_report">Download details</a>
+<div id="done-status"></div>
+</div></div>
+<script>
+function prepLink(id,url,msg){
+  const link=document.getElementById(id);
+  link.href=url + '?t=' + Date.now();
+  link.addEventListener('click',()=>{
+    document.getElementById('done-status').textContent=msg;
+  });
+}
+prepLink('report-link','/report','Generating overview PDF…');
+prepLink('selected-link','/selected_report','Generating selected-report PDF…');
+localStorage.removeItem('last_idx');
+</script>
+</body></html>"""
+        )
 
     @app.get("/report")
     def report():
