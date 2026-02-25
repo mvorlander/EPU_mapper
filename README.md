@@ -70,7 +70,8 @@ so colleagues only double-click and run.
 
 Quick start from GitHub:
 
-1. Download `dist\EPUMapperReview_portable_<version>.zip` from this repository.
+1. Download the latest `EPUMapperReview_portable_<version>.zip` from the
+   [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
 2. Unzip it to any folder on your Windows machine.
 3. Open the unzipped `EPUMapperReview` folder.
 4. Double-click `EPUMapperReview.exe`.
@@ -82,13 +83,12 @@ Option A: installer (recommended for most users)
 3. Browse to the EPU session root (or `Images-Disc*`) and atlas screenshot, then
    click **Start review**.
 
-Option B: portable folder (`dist\EPUMapperReview`)
+Option B: portable folder (manual copy)
 
-1. Copy the entire `dist\EPUMapperReview\` folder to the target Windows machine.
+1. Copy the entire `EPUMapperReview\` folder from the extracted ZIP to the target Windows machine.
 2. Keep `EPUMapperReview.exe` and the `_internal\` folder together in that folder.
 3. Double-click `EPUMapperReview.exe` to launch.
-4. For GitHub distribution, prefer the generated ZIP:
-   `dist\EPUMapperReview_portable_<version>.zip`.
+4. For GitHub distribution, always share the ZIP attached to the Release rather than tracking binaries in the repo.
 
 Maintainer build workflow (run on a Windows machine):
 
