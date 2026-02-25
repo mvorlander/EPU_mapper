@@ -440,10 +440,13 @@ const PREV_IDX = {prev_idx_val};
 const GRID_HAS_MRC = {grid_mrc_json};
 const STORAGE_KEY = 'review_state_' + IDX;
 localStorage.setItem('last_idx', IDX);
+const commentEl = document.getElementById('comment');
+const includeEl = document.getElementById('include-report');
 let rating = 3;
 let selectedKind = 'grid';
 let selectedName = '';
 let selectedHasMrc = GRID_HAS_MRC;
+let allowPersist = false;
 function hideLoading(){{
   const overlay = document.getElementById('loading-overlay');
   overlay.classList.add('hidden');
@@ -454,7 +457,7 @@ function setRating(v){{
   rating = v;
   document.getElementById('selected').textContent = String(v);
   document.querySelectorAll('.rate').forEach(b=>b.classList.toggle('active', parseInt(b.dataset.v) === v));
-  persistState();
+  if (allowPersist) persistState();
 }}
 async function submitReview(){{
   const statusEl = document.getElementById('submit-status');
@@ -536,8 +539,6 @@ document.getElementById('show-mrc').onclick = () => {{
 document.getElementById('show-jpeg').onclick = () => {{
   document.getElementById('gridimg').src = jpgUrl(selectedKind, selectedName);
 }};
-const commentEl = document.getElementById('comment');
-const includeEl = document.getElementById('include-report');
 function persistState(){{
   const data = {{
     rating,
@@ -557,6 +558,7 @@ function restoreState(){{
   }} catch (e) {{}}
 }}
 restoreState();
+allowPersist = true;
 commentEl.addEventListener('input', persistState);
 includeEl.addEventListener('change', persistState);
 document.getElementById('low').oninput = updateContrast;
