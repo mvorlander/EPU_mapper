@@ -4,7 +4,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $IsWindows) {
+$runningOnWindows = $IsWindows
+if ($null -eq $runningOnWindows) {
+    $runningOnWindows = ($env:OS -eq "Windows_NT")
+}
+
+if (-not $runningOnWindows) {
     throw "This script must be run on Windows."
 }
 
@@ -17,17 +22,39 @@ if (-not (Test-Path $entryScript)) {
     throw "Entry script not found: $entryScript"
 }
 
-$pythonCmd = Get-Command py -ErrorAction SilentlyContinue
-if ($pythonCmd) {
-    $pythonArgs = @("-3")
-    $python = "py"
-} else {
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $pythonCmd) {
-        throw "Python was not found on PATH. Install Python 3.11+ and retry."
+function Test-PythonCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+        [string[]]$Args = @()
+    )
+
+    try {
+        & $Command @Args -c "import sys; print(sys.version)" *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
     }
-    $pythonArgs = @()
+}
+
+$python = $null
+$pythonArgs = @()
+
+if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Command "py" -Args @("-3"))) {
+    $python = "py"
+    $pythonArgs = @("-3")
+} elseif ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Command "python")) {
     $python = "python"
+    $pythonArgs = @()
+} else {
+    $pythonCandidates = Get-ChildItem -Path (Join-Path $env:LocalAppData "Programs\Python") -Directory -Filter "Python*" -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        ForEach-Object { Join-Path $_.FullName "python.exe" }
+    $pythonFromInstall = $pythonCandidates | Where-Object { (Test-Path $_) -and (Test-PythonCommand -Command $_) } | Select-Object -First 1
+    if (-not $pythonFromInstall) {
+        throw "Python was not found. Install Python 3.11+ and retry."
+    }
+    $python = $pythonFromInstall
 }
 
 if ($Clean) {

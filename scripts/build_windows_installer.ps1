@@ -5,7 +5,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $IsWindows) {
+$runningOnWindows = $IsWindows
+if ($null -eq $runningOnWindows) {
+    $runningOnWindows = ($env:OS -eq "Windows_NT")
+}
+
+if (-not $runningOnWindows) {
     throw "This script must be run on Windows."
 }
 
@@ -28,10 +33,20 @@ if (-not (Test-Path $issPath)) {
 
 $iscc = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $iscc) {
-    $defaultIscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-    if (Test-Path $defaultIscc) {
-        $isccPath = $defaultIscc
-    } else {
+    $isccCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:LocalAppData "Programs\Inno Setup 6\ISCC.exe")
+    )
+
+    $isccPath = $null
+    foreach ($candidate in $isccCandidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            $isccPath = $candidate
+            break
+        }
+    }
+
+    if (-not $isccPath) {
         throw "Inno Setup Compiler (ISCC.exe) not found. Install Inno Setup 6 and retry."
     }
 } else {
