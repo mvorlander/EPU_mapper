@@ -63,17 +63,23 @@ Tip: you can also point the script at the session root (the folder that holds
 `--images-subdir Images-Disc1` or set `IMAGES_SUBDIR=Images-Disc1` to pick the
 disc you want to review.
 
-### Windows installer (Option 2: no Python needed by end users)
+### Windows install (no Python needed by end users)
 
 You can package the launcher as a native Windows app (`.exe`) and an installer
 so colleagues only double-click and run.
 
-End-user workflow:
+Option A: installer (recommended for most users)
 
 1. Install `EPUMapperReviewInstaller_<version>.exe` once.
 2. Start **EPU Mapper Review** from Start Menu/Desktop shortcut.
 3. Browse to the EPU session root (or `Images-Disc*`) and atlas screenshot, then
    click **Start review**.
+
+Option B: portable folder (`dist\EPUMapperReview`)
+
+1. Copy the entire `dist\EPUMapperReview\` folder to the target Windows machine.
+2. Keep `EPUMapperReview.exe` and the `_internal\` folder together in that folder.
+3. Double-click `EPUMapperReview.exe` to launch.
 
 Maintainer build workflow (run on a Windows machine):
 
@@ -91,6 +97,9 @@ If you only need the portable `.exe` folder (no installer):
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_exe.ps1
 ```
+
+Important: do not copy only the `.exe` file. The app needs the bundled runtime
+files in `_internal\` (including `python312.dll`) to start.
 
 Requirements for the maintainer machine: Python 3.11+ and Inno Setup 6.
 Existing CLI/conda/docker/apptainer workflows are unchanged.
