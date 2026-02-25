@@ -129,7 +129,34 @@ if (Test-Path $portableZip) {
 }
 
 Write-Host "Creating portable ZIP..."
-Compress-Archive -Path (Join-Path $repoRoot "dist\EPUMapperReview\*") -DestinationPath $portableZip -CompressionLevel Optimal
+$sourcePattern = Join-Path $repoRoot "dist\EPUMapperReview\*"
+$zipAttempts = 4
+$zipOk = $false
+$lastZipError = $null
+for ($attempt = 1; $attempt -le $zipAttempts; $attempt++) {
+    try {
+        if ($attempt -gt 1) {
+            Write-Host "Retrying ZIP creation ($attempt/$zipAttempts)..."
+        }
+        Compress-Archive -Path $sourcePattern -DestinationPath $portableZip -CompressionLevel Optimal -Force
+        $zipOk = $true
+        break
+    } catch {
+        $lastZipError = $_
+        Start-Sleep -Seconds 2
+    }
+}
+
+if (-not $zipOk) {
+    $runningApp = Get-Process -Name "EPUMapperReview" -ErrorAction SilentlyContinue
+    if ($runningApp) {
+        Write-Warning "EPUMapperReview.exe appears to still be running. Close it and retry."
+    }
+    if ($lastZipError) {
+        throw "Failed to create portable ZIP. A file in dist\EPUMapperReview is likely locked by another process (for example EPUMapperReview.exe). Last error: $($lastZipError.Exception.Message)"
+    }
+    throw "Failed to create portable ZIP. Files in dist\EPUMapperReview may be locked by another process."
+}
 
 Write-Host ""
 Write-Host "Build complete:"
