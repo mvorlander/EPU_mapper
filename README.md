@@ -68,6 +68,13 @@ disc you want to review.
 You can package the launcher as a native Windows app (`.exe`) and an installer
 so colleagues only double-click and run.
 
+Quick start from GitHub:
+
+1. Download `dist\EPUMapperReview_portable_<version>.zip` from this repository.
+2. Unzip it to any folder on your Windows machine.
+3. Open the unzipped `EPUMapperReview` folder.
+4. Double-click `EPUMapperReview.exe`.
+
 Option A: installer (recommended for most users)
 
 1. Install `EPUMapperReviewInstaller_<version>.exe` once.
