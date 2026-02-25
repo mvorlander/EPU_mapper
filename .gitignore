@@ -35,3 +35,8 @@ epu_mapper_review.tar
 
 # Misc build stamps
 *.log
+
+# Windows packaging artifacts
+build/
+dist/
+*.spec

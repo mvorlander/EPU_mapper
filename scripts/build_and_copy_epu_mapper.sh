@@ -8,7 +8,7 @@ REMOTE_CONTAINER_DIR="/groups/plaschka/shared/software/containers"
 REMOTE_WRAPPER_DIR="${REMOTE_CONTAINER_DIR}/wrappers"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKERFILE_PATH="$ROOT_DIR/container/Dockerfile"
-WRAPPER_SCRIPT_LOCAL="$ROOT_DIR/scripts/run_epu_mapper_apptainer.sh"
+WRAPPER_SCRIPT_LOCAL="$ROOT_DIR/scripts/epu_review.sh"
 
 cd "$ROOT_DIR"
 
