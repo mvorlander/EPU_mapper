@@ -80,6 +80,8 @@ Option B: portable folder (`dist\EPUMapperReview`)
 1. Copy the entire `dist\EPUMapperReview\` folder to the target Windows machine.
 2. Keep `EPUMapperReview.exe` and the `_internal\` folder together in that folder.
 3. Double-click `EPUMapperReview.exe` to launch.
+4. For GitHub distribution, prefer the generated ZIP:
+   `dist\EPUMapperReview_portable_<version>.zip`.
 
 Maintainer build workflow (run on a Windows machine):
 
@@ -95,7 +97,7 @@ That script:
 If you only need the portable `.exe` folder (no installer):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_exe.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_exe.ps1 -Version 0.1.0
 ```
 
 Important: do not copy only the `.exe` file. The app needs the bundled runtime

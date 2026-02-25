@@ -1,5 +1,6 @@
 param(
-    [switch]$Clean = $true
+    [switch]$Clean = $true,
+    [string]$Version = "dev"
 )
 
 $ErrorActionPreference = "Stop"
@@ -122,6 +123,15 @@ if (-not (Test-Path $exePath)) {
     throw "Build did not produce executable at $exePath"
 }
 
+$portableZip = Join-Path $repoRoot ("dist\EPUMapperReview_portable_{0}.zip" -f $Version)
+if (Test-Path $portableZip) {
+    Remove-Item -Force $portableZip
+}
+
+Write-Host "Creating portable ZIP..."
+Compress-Archive -Path (Join-Path $repoRoot "dist\EPUMapperReview\*") -DestinationPath $portableZip -CompressionLevel Optimal
+
 Write-Host ""
 Write-Host "Build complete:"
 Write-Host "  $exePath"
+Write-Host "  $portableZip"
