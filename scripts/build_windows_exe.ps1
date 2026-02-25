@@ -17,9 +17,13 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
 $entryScript = Join-Path $repoRoot "scripts\windows_gui_launcher.py"
 $srcPath = Join-Path $repoRoot "src"
+$requirementsPath = Join-Path $repoRoot "requirements.txt"
 
 if (-not (Test-Path $entryScript)) {
     throw "Entry script not found: $entryScript"
+}
+if (-not (Test-Path $requirementsPath)) {
+    throw "Requirements file not found: $requirementsPath"
 }
 
 function Test-PythonCommand {
@@ -64,8 +68,32 @@ if ($Clean) {
     if (Test-Path $distDir) { Remove-Item -Recurse -Force $distDir }
 }
 
+Write-Host "Installing/updating project dependencies..."
+& $python @pythonArgs -m pip install --upgrade -r $requirementsPath
+
+Write-Host "Verifying required imports..."
+& $python @pythonArgs -c "import fastapi, uvicorn, numpy, PIL, mrcfile, matplotlib" *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "Dependency verification failed. Ensure requirements install successfully, then retry."
+}
+
 Write-Host "Installing/updating PyInstaller..."
 & $python @pythonArgs -m pip install --upgrade pyinstaller
+
+$pythonExePath = (& $python @pythonArgs -c "import sys; print(sys.executable)").Trim()
+$pythonHome = Split-Path -Parent $pythonExePath
+$runtimeDllCandidates = @(
+    "VCRUNTIME140_1.dll",
+    "MSVCP140.dll"
+)
+$extraBinaryArgs = @()
+foreach ($dllName in $runtimeDllCandidates) {
+    $dllPath = Join-Path $pythonHome $dllName
+    if (Test-Path $dllPath) {
+        # Bundle runtime sidecars with the app to avoid LoadLibrary failures on clean hosts.
+        $extraBinaryArgs += @("--add-binary", "$dllPath;.")
+    }
+}
 
 $pyiArgs = @(
     "-m", "PyInstaller",
@@ -82,6 +110,9 @@ $pyiArgs = @(
     "--collect-submodules", "matplotlib",
     $entryScript
 )
+if ($extraBinaryArgs.Count -gt 0) {
+    $pyiArgs += $extraBinaryArgs
+}
 
 Write-Host "Building Windows executable..."
 & $python @pythonArgs @pyiArgs
