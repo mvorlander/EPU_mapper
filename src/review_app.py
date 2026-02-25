@@ -174,11 +174,13 @@ def create_app(
     atlas_name: str | None = None,
     report_file: Path | None = None,
     overlay: bool = False,
-    overlay_transform: str | None = None,
+    overlay_transform: str | None = "identity",
 ) -> FastAPI:
     global _OVERLAY_TRANSFORM
-    if overlay_transform in (None, "", "auto"):
+    if overlay_transform == "auto":
         _OVERLAY_TRANSFORM = None
+    elif overlay_transform in (None, ""):
+        _OVERLAY_TRANSFORM = "identity"
     else:
         _OVERLAY_TRANSFORM = overlay_transform
     base_dir = base_dir.resolve()
