@@ -8,22 +8,32 @@ The screenshot shows the reviewing app.
 ![UI overview](images/UI_overview.png)
 
 **Top left pannel:** 
-- shows the current Gridsquare image by default. If you click on any other image, the last-clicked image is shown there instead. You can adjust the contrast by clicking on the "Show MRC to adjust contrast..." button on the right. 
+- Shows the current Gridsquare image by default. If you click on any other image, the last-clicked image is shown there instead. You can adjust the contrast by clicking on the "Show MRC to adjust contrast..." button on the right. 
 
 **Right panel:**
 - Allows you to add comments and a rating of the square. If you click the checkbox on the right, screening images from that square will be included in a final PDF report. A minimal report showing only the user rating and comments next to the atlas will always be created.
 
 **Bottom pannel:**
-- shows FoilHoles next to Data images
+- Shows FoilHoles next to Data images
 
 ## What You Need
 
-Point the app at the base directory that EPU calls `Images-Disc*`. At minimum
-you should see folders named `GridSquare_<ID>`, each containing the grid JPEG
-plus optional `FoilHoles/` and `Data/` subfolders with JPEG/XML pairs.
-You can also pass the **session root** (the folder that contains `EpuSession.dm`,
-`Metadata/`, and one or more `Images-Disc*` subdirectories); the app will pick
-the first matching disc automatically or you can force it via `--images-subdir`.
+- Point the app at the **session root** (the directory that contains `EpuSession.dm`,
+`Metadata/`, and one or more `Images-Disc*` subfolders).
+- A **screenshot of the Atlas** showing the GridSquares you selected for screening: 
+optional but strongly recommended so you know which gridsquare you are looking at 
+
+<details>
+<summary>Advanced path options</summary>
+
+- The app picks the first disc automatically; override it with
+  `--images-subdir Images-Disc2` or `IMAGES_SUBDIR=Images-Disc2`.
+- Power users can still point directly at an `Images-Disc*` folder (or even a
+  single `GridSquare_<ID>` directory) when debugging individual squares, but
+  the session root keeps all metadata together and remains the recommended
+  default.
+
+</details>
 
 To draw foil overlays, keep the session metadata next to the disc:
 
@@ -39,11 +49,9 @@ Images-Disc1/
 └── review_responses.json / PDFs   # written by the app
 ```
 
-The `.dm` files inside `Metadata/` and the top-level `EpuSession.dm` are enough
-for the overlay logic—per-target `TargetLocation_*.dm` files are not required.
-Place an atlas JPEG anywhere and pass it with `--atlas` if you want the atlas
-panel filled in—this screenshot is highly recommended because it gives reviewers
-global context and helps align the foil overlay with the overall grid.
+The `.dm` files inside `Metadata/` plus the top-level `EpuSession.dm` are used to plot the FoilHole positions onto the GridSquare images.
+Store the atlas JPEG anywhere that is readable by the machine running the app
+so the `--atlas` (or `ATLAS_JPEG`) flag can pick it up quickly.
 
 ## Windows Installer
 
@@ -60,21 +68,44 @@ Advanced packaging details for maintainers are documented separately in
 
 ## Run Locally (conda)
 
-Use the provided `environment.yml` to create a reproducible Conda environment:
+Use the provided `environment.yml` to create a reproducible Conda environment.
+
+**Installation**
 
 ```bash
 conda env create -f environment.yml          # first time only
 conda activate epu-mapper
 # pull in dependency updates later with: conda env update -f environment.yml
-PYTHONPATH=src python src/review_app.py /path/to/Images-Disc1 \
-    --atlas /path/to/atlas.jpg --host 127.0.0.1 --port 8000 --open
 ```
 
-Point the script either at the `Images-Disc*` folder or at the session root
-(the folder that holds `EpuSession.dm`, `Metadata/`, and your discs). Add
-`--images-subdir Images-Disc1` or set `IMAGES_SUBDIR=Images-Disc1` if you pass
-the session root and want to choose a specific disc. Remove `--overlay` (or add
-`--no-overlay`) if the metadata files are missing or you only want raw JPEGs.
+**Usage**
+
+```bash
+./scripts/run_review_app.sh /path/to/session_root --atlas /path/to/atlas.jpg --host 127.0.0.1 --port 8000 --open
+```
+<details>
+If you prefer to target a specific disc directly, replace `/path/to/session_root`
+with `/path/to/Images-Disc1` (or another disc) and drop `--images-subdir`. When
+the session root contains multiple discs, add `--images-subdir Images-Disc2` (or
+set `IMAGES_SUBDIR=Images-Disc2`) to pick one explicitly. Remove `--overlay` (or
+add `--no-overlay`) if the metadata files are missing or you only want raw JPEGs.
+
+Prefer running through `scripts/run_review_app.sh` whenever possible—it keeps
+`PYTHONPATH` pointed at `src/` and mirrors the exact invocation the container
+and Windows builds use.
+</details>
+
+
+### Troubleshooting (ports)
+
+- If the app fails to start with “Address already in use,” the port is occupied.
+  Either change the port (`./scripts/run_review_app.sh ... --port 8010`) or stop
+  the other instance.
+- On macOS/Linux run `lsof -i :8000` to find the owning process and terminate it
+  (e.g., `kill <PID>`). On Windows run `netstat -ano | find "8000"` or use Task
+  Manager to close the conflicting app.
+- The Windows launcher also exposes the port field, so you can bump it to an
+  unused value without leaving the GUI.
 
 ## Container Workflow (VBC only)
 
@@ -89,21 +120,29 @@ Most users outside VBC can ignore this section.
   `--no-overlay` if you prefer to disable this). If the required `Metadata/`
   or `EpuSession.dm` files are missing, overlays are skipped gracefully and a
   banner explains why.
-- Overlays default to the `identity` transform (matching EPU’s orientation).
-  If you know a specific rotation/flip is needed, supply
+- Overlays default to the `identity` transform (matching EPU’s orientation). In case you find the plotted positions don't match, there are options to force rotating the GridSquare image.
+
+<details>
+<summary>GridSquare rotation options</summary>
+
+- If you know a specific rotation/flip is needed, supply
   `--overlay-transform rot90` (or `rot180`, `rot270`, `mirror_x`,
   `mirror_y`, `mirror_diag`, `mirror_diag_inv`) or use `--overlay-transform auto`
   to let the tool pick the best match on the fly.
 - To debug mapping logic on a single square:
-  ```bash
-  PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
-    python scripts/plot_foilhole_positions.py \
-      Example_data/prefloated/Images-Disc1/GridSquare_19828383 \
-      --output /tmp/GridSquare_19828383_overlay.png \
-      --dump-transforms /tmp/outdir
-  ```
+
+```bash
+PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
+  python scripts/plot_foilhole_positions.py \
+    Example_data/prefloated/Images-Disc1/GridSquare_19828383 \
+    --output /tmp/GridSquare_19828383_overlay.png \
+    --dump-transforms /tmp/outdir
+```
+
   That command also saves diagnostic PNGs for each tested rotation/mirror in
   `/tmp/outdir`.
+
+</details>
 
 ## Outputs
 
