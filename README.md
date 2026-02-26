@@ -34,103 +34,54 @@ Images-Disc1/
 │   ├── FoilHoles/FoilHole_19919351_20260220_132420.jpg (+ .xml)
 │   └── Data/FoilHole_19919351_Data_20260220_132420.jpg (+ .xml)
 ├── Metadata/
-│   ├── GridSquare_19828383.dm
-│   └── (optional) TargetLocation_*.dm files when exported by EPU
+│   └── GridSquare_19828383.dm
 ├── EpuSession.dm
 └── review_responses.json / PDFs   # written by the app
 ```
 
 The `.dm` files inside `Metadata/` and the top-level `EpuSession.dm` are enough
-for the overlay logic; per-target DM files are nice-to-have but not required.
+for the overlay logic—per-target `TargetLocation_*.dm` files are not required.
 Place an atlas JPEG anywhere and pass it with `--atlas` if you want the atlas
 panel filled in—this screenshot is highly recommended because it gives reviewers
 global context and helps align the foil overlay with the overall grid.
 
-## Run Locally
+## Windows Installer
+
+1. Download the latest `EPUMapperReviewInstaller_<version>.exe` from the
+   [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
+2. Double-click the installer and accept the defaults (the installer bundles
+   Python, so no extra dependencies are needed).
+3. Launch **EPU Mapper Review** from the Start Menu desktop shortcut, choose
+   your session root (or `Images-Disc*` folder) plus an atlas JPEG, and click
+   **Start review**.
+
+Advanced packaging details for maintainers are documented separately in
+`windows/README.md`.
+
+## Run Locally (conda)
+
+Use the provided `environment.yml` to create a reproducible Conda environment:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-PYTHONPATH=src .venv/bin/python src/review_app.py /path/to/Images-Disc1 \
+conda env create -f environment.yml          # first time only
+conda activate epu-mapper
+# pull in dependency updates later with: conda env update -f environment.yml
+PYTHONPATH=src python src/review_app.py /path/to/Images-Disc1 \
     --atlas /path/to/atlas.jpg --host 127.0.0.1 --port 8000 --open
 ```
 
-Open the printed URL in your browser. Remove `--overlay` (or add
-`--no-overlay`) if the session lacks DM metadata.
+Point the script either at the `Images-Disc*` folder or at the session root
+(the folder that holds `EpuSession.dm`, `Metadata/`, and your discs). Add
+`--images-subdir Images-Disc1` or set `IMAGES_SUBDIR=Images-Disc1` if you pass
+the session root and want to choose a specific disc. Remove `--overlay` (or add
+`--no-overlay`) if the metadata files are missing or you only want raw JPEGs.
 
-Tip: you can also point the script at the session root (the folder that holds
-`EpuSession.dm`, `Metadata/`, and multiple `Images-Disc*` directories) and add
-`--images-subdir Images-Disc1` or set `IMAGES_SUBDIR=Images-Disc1` to pick the
-disc you want to review.
+## Container Workflow (VBC only)
 
-### Windows install (no Python needed by end users)
-
-You can package the launcher as a native Windows app (`.exe`) and an installer
-so colleagues only double-click and run.
-
-Quick start from GitHub:
-
-1. Download the latest `EPUMapperReview_portable_<version>.zip` from the
-   [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
-2. Unzip it to any folder on your Windows machine.
-3. Open the unzipped `EPUMapperReview` folder.
-4. Double-click `EPUMapperReview.exe`.
-
-Option A: installer (recommended for most users)
-
-1. Install `EPUMapperReviewInstaller_<version>.exe` once.
-2. Start **EPU Mapper Review** from Start Menu/Desktop shortcut.
-3. Browse to the EPU session root (or `Images-Disc*`) and atlas screenshot, then
-   click **Start review**.
-
-Option B: portable folder (manual copy)
-
-1. Copy the entire `EPUMapperReview\` folder from the extracted ZIP to the target Windows machine.
-2. Keep `EPUMapperReview.exe` and the `_internal\` folder together in that folder.
-3. Double-click `EPUMapperReview.exe` to launch.
-4. For GitHub distribution, always share the ZIP attached to the Release rather than tracking binaries in the repo.
-
-Maintainer build workflow (run on a Windows machine):
-
-```powershell
-cd C:\path\to\EPU_mapper
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -Version 0.1.0
-```
-
-That script:
-- builds `dist\EPUMapperReview\EPUMapperReview.exe` with PyInstaller
-- builds `dist\installer\EPUMapperReviewInstaller_0.1.0.exe` with Inno Setup
-
-If you only need the portable `.exe` folder (no installer):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_exe.ps1 -Version 0.1.0
-```
-
-Important: do not copy only the `.exe` file. The app needs the bundled runtime
-files in `_internal\` (including `python312.dll`) to start.
-
-Requirements for the maintainer machine: Python 3.11+ and Inno Setup 6.
-Existing CLI/conda/docker/apptainer workflows are unchanged.
-
-## Run via Apptainer
-
-1. Build/refresh the container and copy it to the cluster:
-   ```bash
-   ./scripts/build_and_copy_epu_mapper.sh
-   ```
-2. On the cluster, launch the review UI:
-   ```bash
-   /groups/plaschka/shared/software/containers/wrappers/epu_review.sh \
-       --epu-dir /groups/.../SessionRoot --atlas /groups/.../atlas.jpg
-   ```
-
-Pass the *session root* (the folder containing `EpuSession.dm`, `Metadata/`,
-and one or more `Images-Disc*` subdirectories) via `--epu-dir`. The wrapper
-binds that directory so metadata stays visible. Overlays are on by default; add
-`--no-overlay`
-if you only want the raw JPEGs. A big banner with the URL is printed so users
-in plain terminals know what to paste into a browser.
+The Apptainer workflow used on the VBC cluster is documented in
+`container/README.md`. It covers building/copying the `.sif` via
+`scripts/build_and_copy_epu_mapper.sh` and running the `epu_review.sh` wrapper.
+Most users outside VBC can ignore this section.
 
 ## Foil Overlay Utilities
 

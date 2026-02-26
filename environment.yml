@@ -1,0 +1,13 @@
+name: epu-mapper
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pillow
+  - matplotlib
+  - fastapi
+  - uvicorn
+  - jinja2
+  - python-multipart
+  - mrcfile

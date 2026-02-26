@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="epu_mapper_review"
-TAR_NAME="${IMAGE_NAME}.tar"
-TARGET_HOST="matthias.vorlaender@cbe.vbc.ac.at"
-REMOTE_CONTAINER_DIR="/groups/plaschka/shared/software/containers"
-REMOTE_WRAPPER_DIR="${REMOTE_CONTAINER_DIR}/wrappers"
+# Builds the Docker image for the review app, copies it to the Plaschka cluster,
+# converts it into an Apptainer .sif, and refreshes the wrapper script.
+# Customize the variables below (or export environment overrides before invoking)
+# if you need to target a different host or directory layout.
+
+IMAGE_NAME="${IMAGE_NAME:-epu_mapper_review}"
+TAR_NAME="${TAR_NAME:-${IMAGE_NAME}.tar}"
+TARGET_HOST="${TARGET_HOST:-matthias.vorlaender@cbe.vbc.ac.at}"
+REMOTE_CONTAINER_DIR="${REMOTE_CONTAINER_DIR:-/groups/plaschka/shared/software/containers}"
+REMOTE_WRAPPER_DIR="${REMOTE_WRAPPER_DIR:-${REMOTE_CONTAINER_DIR}/wrappers}"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKERFILE_PATH="$ROOT_DIR/container/Dockerfile"
 WRAPPER_SCRIPT_LOCAL="$ROOT_DIR/scripts/epu_review.sh"
+# Common platform values: linux/amd64 (default cluster), linux/arm64/v8 (Apple Silicon builders).
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 
 cd "$ROOT_DIR"
 
@@ -17,8 +24,8 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Building Docker image ${IMAGE_NAME}..."
-docker build --platform linux/amd64 -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .
+echo "Building Docker image ${IMAGE_NAME} for platform ${DOCKER_PLATFORM}..."
+docker build --platform "${DOCKER_PLATFORM}" -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .
 
 echo "Saving Docker image to ${TAR_NAME}..."
 docker save -o "$TAR_NAME" "$IMAGE_NAME":latest
@@ -36,3 +43,4 @@ echo "Copying wrapper script to remote host..."
 scp "$WRAPPER_SCRIPT_LOCAL" "$TARGET_HOST:${REMOTE_WRAPPER_DIR}/"
 
 echo "Done. Apptainer image stored at ${REMOTE_CONTAINER_DIR}/${IMAGE_NAME}.sif"
+echo "Launch via ${REMOTE_WRAPPER_DIR}/epu_review.sh --epu-dir <session_root> --atlas <atlas.jpg>"

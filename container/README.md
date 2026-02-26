@@ -7,17 +7,31 @@ Apptainer image deployed on the Plaschka cluster.
 - `start_review_app.sh`: entrypoint executed both inside Docker and from the
   Apptainer wrapper.
 
-Typical workflow:
+## Build and copy workflow (VBC maintainers)
 
-1. Run `scripts/build_and_copy_epu_mapper.sh` locally. The script builds the
-   Docker image, converts it into an Apptainer `.sif` on the remote host, and
-   copies the `epu_review.sh` wrapper alongside it.
-2. On the cluster, launch the UI with
-   `epu_review.sh --epu-dir /path/to/session_root --atlas /path/to/atlas.jpg`.
-   Point `--epu-dir` at the folder that contains `EpuSession.dm`, `Metadata/`,
-   and your `Images-Disc*` subdirectories. The wrapper binds that root so
-   metadata stays visible and PDFs/JSON/overlays are written next to your data
-   (unless `--no-overlay` is supplied).
+1. From the repo root, run `./scripts/build_and_copy_epu_mapper.sh`.
+   - Set `DOCKER_PLATFORM=linux/arm64/v8` if you are on Apple Silicon but still
+     need to produce an `amd64` image for the cluster (default is
+     `linux/amd64`).
+   - The script builds the Docker image, saves it to a tarball, copies it to
+     `${REMOTE_CONTAINER_DIR}` on the cluster, converts it into
+     `${IMAGE_NAME}.sif`, and copies the `epu_review.sh` wrapper into the
+     `${REMOTE_WRAPPER_DIR}` alongside the container.
+   - Customize `TARGET_HOST`, `REMOTE_CONTAINER_DIR`, or `REMOTE_WRAPPER_DIR`
+     in the script if your environment differs from the shared defaults.
+2. Whenever you change `requirements.txt` or source files that ship inside the
+   container, rerun the script so the `.sif` stays current.
 
-Update `requirements.txt` and rerun the build script any time dependencies or
-source files change.
+## Launching Apptainer on the cluster
+
+Use the copied wrapper to start the UI for a specific session:
+
+```bash
+/groups/plaschka/shared/software/containers/wrappers/epu_review.sh \
+    --epu-dir /groups/.../SessionRoot --atlas /groups/.../atlas.jpg
+```
+
+Pass the *session root* (the folder containing `EpuSession.dm`, `Metadata/`,
+and one or more `Images-Disc*` subdirectories) via `--epu-dir`. The wrapper
+binds that directory so metadata stays visible and the resulting PDFs/JSON and
+overlay PNGs are written next to your data (unless you add `--no-overlay`).
