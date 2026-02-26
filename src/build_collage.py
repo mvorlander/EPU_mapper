@@ -35,10 +35,90 @@ import numpy as np
 import mrcfile
 import tempfile
 from PIL import Image, ImageDraw, ImageFont
+from reportlab.pdfgen import canvas as pdf_canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # cryo-EM grid JPEGs can easily exceed Pillow's protective pixel limit;
 # disable it so we can safely load very large images from trusted sources.
 Image.MAX_IMAGE_PIXELS = None
+
+_PDF_PAGE_WIDTH = 2550
+_PDF_MIN_HEIGHT = 2000
+_PDF_FONTS_READY = False
+_PDF_FONT_REGULAR = "Helvetica"
+_PDF_FONT_BOLD = "Helvetica-Bold"
+_PDF_FONT_SMALL = "Helvetica"
+
+
+def _first_existing(paths):
+    for candidate in paths:
+        try:
+            if candidate and candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_pdf_fonts():
+    """Register TTF fonts for ReportLab output if available."""
+    global _PDF_FONTS_READY, _PDF_FONT_REGULAR, _PDF_FONT_BOLD, _PDF_FONT_SMALL
+    if _PDF_FONTS_READY:
+        return
+    script_dir = Path(__file__).resolve().parent
+    candidates_regular = [
+        script_dir / "DejaVuSans.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+        Path.home() / "Library/Fonts/Arial.ttf",
+    ]
+    candidates_bold = [
+        script_dir / "DejaVuSans-Bold.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        Path.home() / "Library/Fonts/Arial Bold.ttf",
+    ]
+    regular_path = _first_existing(candidates_regular)
+    bold_path = _first_existing(candidates_bold)
+    if regular_path:
+        try:
+            pdfmetrics.registerFont(TTFont("EPUMapperSans", str(regular_path)))
+            _PDF_FONT_REGULAR = "EPUMapperSans"
+            _PDF_FONT_SMALL = "EPUMapperSans"
+            if bold_path:
+                pdfmetrics.registerFont(TTFont("EPUMapperSansBold", str(bold_path)))
+                _PDF_FONT_BOLD = "EPUMapperSansBold"
+            else:
+                _PDF_FONT_BOLD = _PDF_FONT_REGULAR
+        except Exception:
+            _PDF_FONT_REGULAR = "Helvetica"
+            _PDF_FONT_BOLD = "Helvetica-Bold"
+            _PDF_FONT_SMALL = "Helvetica"
+    _PDF_FONTS_READY = True
+
+
+def _pdf_color(r: int, g: int, b: int, alpha: float = 1.0):
+    return colors.Color(r / 255.0, g / 255.0, b / 255.0, alpha=alpha)
+
+
+def _pil_to_reader(img: Image.Image | None) -> ImageReader | None:
+    if img is None:
+        return None
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    return ImageReader(img)
+
+
+def _wrap_text_lines(text: str, font_size: float, max_width: float, min_chars: int = 6) -> list[str]:
+    """Return wrapped text approximating ReportLab string width."""
+    if not text:
+        return []
+    approx_chars = max(min_chars, int(max_width / (font_size * 0.55)))
+    return textwrap.wrap(text, width=approx_chars) or [text]
 
 
 def find_grid_image(grid_dir: Path) -> Path:
@@ -326,7 +406,8 @@ def make_section_page(title: str, subtitle: str | None = None, size=(1700, 2200)
     return img
 
 
-def make_grid_summary_pages(
+def _draw_grid_summary_page(
+    c: pdf_canvas.Canvas,
     grid_img: Image.Image,
     atlas_img: Image.Image | None,
     foils: dict[str, Path],
@@ -335,128 +416,226 @@ def make_grid_summary_pages(
     heading: str,
     grid_image_name: str,
     overlay_img: Image.Image | None = None,
-) -> list[Image.Image]:
-    """Create illustrated summary page(s) for a single GridSquare."""
-    page_w, page_h = 1700, 2200
-    margin = 50
-    gap = 32
-    title_font = _get_font(72)
-    body_font = _get_font(30)
-    small_font = _get_font(22)
-    small_line = (small_font.size if hasattr(small_font, "size") else 22)
-    body_line = (body_font.size + 6) if hasattr(body_font, "size") else 34
+) -> None:
+    """Render a GridSquare summary directly onto a ReportLab canvas."""
+    _ensure_pdf_fonts()
+    base_margin = 90
+    section_gap = 60
+    card_inner_pad = 56
+    hero_panel_gap = 56
+    row_gap = 52
+    hero_panel_h = 1100
+    thumb_h = 1050
+    thumb_gap = 64
+    bg_color = _pdf_color(244, 246, 251)
+    card_color = _pdf_color(255, 255, 255)
+    muted_color = _pdf_color(110, 120, 148)
+    text_color = _pdf_color(20, 28, 44)
 
-    def start_page(page_idx: int) -> tuple[Image.Image, ImageDraw.ImageDraw, int, bool]:
-        img = Image.new("RGB", (page_w, page_h), color=(255, 255, 255))
-        draw = ImageDraw.Draw(img)
-        heading_text = heading if page_idx == 0 else f"{heading} (continued)"
-        y = margin
-        draw.text((margin, y), heading_text, fill=0, font=title_font)
-        y += (title_font.size if hasattr(title_font, "size") else 74) + 4
-        include_atlas_block = page_idx == 0
-        if page_idx == 0:
-            rating = "—" if not resp else str(resp.get("rating", "—"))
-            include_flag = "Yes" if resp and resp.get("include") else "No"
-            comment = "" if not resp else str(resp.get("comment", "")).strip()
-            draw.text(
-                (margin, y),
-                f"Rating: {rating}    Included in selected report: {include_flag}",
-                fill=0,
-                font=body_font,
-            )
-            y += body_line
-            if comment:
-                draw.text((margin, y), f"Reviewer notes: {comment}", fill=0, font=body_font)
-                y += body_line - 2
-            y += 16
-        else:
-            y += 12
-        return img, draw, y, include_atlas_block
-
-    pages: list[Image.Image] = []
-    page_idx = 0
-    page, draw, y, include_atlas = start_page(page_idx)
-    top_h = 640
-
-    def _fit(img: Image.Image | None, w: int, h: int, mode: str = "RGB") -> Image.Image:
-        if img is None:
-            return Image.new(mode, (w, h), color=(240, 240, 240) if mode == "RGB" else 240)
-        copy = img.convert(mode).copy()
-        copy.thumbnail((w, h), Image.LANCZOS)
-        canvas = Image.new(mode, (w, h), color=(255, 255, 255) if mode == "RGB" else 255)
-        ox = (w - copy.width) // 2
-        oy = (h - copy.height) // 2
-        canvas.paste(copy, (ox, oy))
-        return canvas
-
-    if include_atlas:
-        panels: list[tuple[Image.Image | None, str]] = [
-            (atlas_img, "Atlas overview" if atlas_img else "Atlas missing"),
-            (grid_img, grid_image_name),
-        ]
-        if overlay_img is not None:
-            panels.append((overlay_img, "Foil overlay"))
-        panel_count = max(len(panels), 1)
-        box_w = (page_w - 2 * margin - gap * (panel_count - 1)) // panel_count
-        for idx_panel, (panel_image, panel_label) in enumerate(panels):
-            panel_box = _fit(panel_image, box_w, top_h, "RGB")
-            panel_box = _label_image(panel_box, panel_label)
-            x = margin + idx_panel * (box_w + gap)
-            page.paste(panel_box, (x, y))
-        y += top_h + gap
-
-    thumb_w = (page_w - 2 * margin - gap) // 2
-    thumb_h = thumb_w
-    if not foils:
-        note = "No FoilHole imagery is available for this GridSquare."
-        draw.text((margin, y), note, fill=0, font=body_font)
-    else:
+    def _rows() -> list[dict]:
+        rows: list[dict] = []
+        hole_indices = {fid: idx + 1 for idx, fid in enumerate(sorted(foils.keys()))}
         for foil_id in sorted(foils.keys()):
             foil_paths = foils[foil_id]
             data_paths = datas.get(foil_id, [])
-            rows = max(len(foil_paths), len(data_paths), 1)
-            for row_idx in range(rows):
-                foil_path = foil_paths[row_idx] if row_idx < len(foil_paths) else None
-                data_path = data_paths[row_idx] if row_idx < len(data_paths) else None
-                foil_img = _load_image(foil_path, "L") if foil_path else None
-                data_img = _load_image(data_path, "L") if data_path else None
-                foil_label = f"FoilHole {foil_id}"
-                if foil_path and len(foil_paths) > 1:
-                    foil_label += f" #{row_idx + 1}"
-                elif not foil_path:
-                    foil_label += " (no image)"
-                data_label = data_path.name if data_path else "No screening data"
+            slots = max(len(foil_paths), len(data_paths), 1)
+            for idx_row in range(slots):
+                foil_path = foil_paths[idx_row] if idx_row < len(foil_paths) else None
+                data_path = data_paths[idx_row] if idx_row < len(data_paths) else None
                 meta_lines: list[str] = []
                 if data_path:
-                    xml_path = data_path.with_suffix(".xml")
+                    xml_path = data_path.with_suffix('.xml')
                     if xml_path.is_file():
                         meta = parse_metadata(xml_path)
-                        for key in ("pixel_size", "exposure", "dose", "defocus"):
+                        for key in ('pixel_size', 'exposure', 'dose', 'defocus'):
                             if key in meta:
-                                txt = meta[key]
-                                if key == "dose":
-                                    txt += " e-/Å²"
-                                meta_lines.append(f"{key.replace('_', ' ')}: {txt}")
-                extra_height = small_line * len(meta_lines) if meta_lines else 0
-                needed_height = thumb_h + gap + extra_height
-                if y + needed_height + margin > page_h:
-                    pages.append(page)
-                    page_idx += 1
-                    page, draw, y, _ = start_page(page_idx)
-                foil_box = _fit(foil_img, thumb_w, thumb_h, "L").convert("RGB")
-                foil_box = _label_image(foil_box, foil_label)
-                data_box = _fit(data_img, thumb_w, thumb_h, "L").convert("RGB")
-                data_box = _label_image(data_box, data_label)
-                page.paste(foil_box, (margin, y))
-                page.paste(data_box, (margin + thumb_w + gap, y))
-                if meta_lines:
-                    meta_y = y + thumb_h + 10
-                    for line in meta_lines:
-                        draw.text((margin + thumb_w + gap, meta_y), line, fill=0, font=small_font)
-                        meta_y += small_line
-                y += thumb_h + gap + extra_height + (small_font.size if hasattr(small_font, "size") else 20)
-    pages.append(page)
-    return pages
+                                meta_lines.append(f"{key.replace('_', ' ').title()}: {meta[key]}")
+                rows.append(
+                    {
+                        'foil_reader': _pil_to_reader(_load_image(foil_path, 'L')) if foil_path else None,
+                        'data_reader': _pil_to_reader(_load_image(data_path, 'L')) if data_path else None,
+                        'hole_index': hole_indices.get(foil_id),
+                        'shot_index': idx_row + 1 if len(foil_paths) > 1 else None,
+                        'data_path': data_path,
+                        'foil_name': foil_path.name if foil_path else None,
+                        'data_name': data_path.name if data_path else None,
+                        'meta_lines': meta_lines,
+                    }
+                )
+        return rows
+
+    row_entries = _rows()
+
+    def _row_height(entry: dict) -> float:
+        meta_block = len(entry['meta_lines']) * 36
+        return card_inner_pad * 2 + 60 + thumb_h + meta_block
+
+    rows_height = (
+        sum((_row_height(entry) + row_gap) for entry in row_entries) - (row_gap if row_entries else 0)
+    )
+    if rows_height < 0:
+        rows_height = 0
+
+    rating = '—' if not resp else str(resp.get('rating', '—'))
+    include_flag = 'Yes' if resp and resp.get('include') else 'No'
+    comment_raw = '' if not resp else str(resp.get('comment', '')).strip()
+    comment_lines = textwrap.wrap(comment_raw, width=110) if comment_raw else []
+    info_card_height = max(260, card_inner_pad * 2 + 120 + len(comment_lines) * 34)
+    hero_card_height = hero_panel_h + card_inner_pad * 2 + 80
+    total_height = (
+        base_margin
+        + 210
+        + section_gap
+        + info_card_height
+        + section_gap
+        + hero_card_height
+        + section_gap
+        + (rows_height if row_entries else 320)
+        + base_margin
+    )
+    page_height = max(total_height, _PDF_MIN_HEIGHT)
+    c.setPageSize((_PDF_PAGE_WIDTH, page_height))
+    c.setFillColor(bg_color)
+    c.rect(0, 0, _PDF_PAGE_WIDTH, page_height, fill=1, stroke=0)
+
+    y = page_height - base_margin
+    # Separate GridSquare label and file name for better emphasis.
+    square_label, _, file_name = heading.partition(":")
+    c.setFont(_PDF_FONT_BOLD, 96)
+    c.setFillColor(text_color)
+    c.drawString(base_margin, y - 96, square_label.strip())
+    c.setFont(_PDF_FONT_REGULAR, 48)
+    c.setFillColor(muted_color)
+    c.drawString(base_margin, y - 160, file_name.strip() or grid_image_name)
+    y -= 210
+
+    card_width = _PDF_PAGE_WIDTH - 2 * base_margin
+    c.setFillColor(card_color)
+    c.roundRect(base_margin, y - info_card_height, card_width, info_card_height, 32, stroke=0, fill=1)
+    c.setFont(_PDF_FONT_REGULAR, 46)
+    c.setFillColor(text_color)
+    c.drawString(base_margin + card_inner_pad, y - card_inner_pad - 46, f"Rating: {rating}")
+    text_y = y - card_inner_pad - 120
+    c.setFillColor(muted_color)
+    c.setFont(_PDF_FONT_REGULAR, 34)
+    if comment_lines:
+        c.drawString(base_margin + card_inner_pad, text_y, 'Reviewer notes:')
+        text_y -= 38
+        c.setFillColor(text_color)
+        for line in comment_lines:
+            c.drawString(base_margin + card_inner_pad, text_y, line)
+            text_y -= 34
+    else:
+        c.drawString(base_margin + card_inner_pad, text_y, 'No reviewer notes provided.')
+    y -= info_card_height + section_gap
+
+    c.setFillColor(card_color)
+    c.roundRect(base_margin, y - hero_card_height, card_width, hero_card_height, 34, stroke=0, fill=1)
+    panels: list[tuple[ImageReader | None, str]] = [(_pil_to_reader(grid_img), grid_image_name)]
+    if atlas_img:
+        panels.insert(0, (_pil_to_reader(atlas_img), 'Atlas overview'))
+    if overlay_img is not None:
+        panels.append((_pil_to_reader(overlay_img), 'Foil overlay'))
+    inner_width = card_width - 2 * card_inner_pad
+    panel_width = (inner_width - hero_panel_gap * (len(panels) - 1)) / max(len(panels), 1)
+    img_y = y - hero_card_height + card_inner_pad
+    for idx, (reader, label) in enumerate(panels):
+        x = base_margin + card_inner_pad + idx * (panel_width + hero_panel_gap)
+        if reader:
+            c.drawImage(reader, x, img_y + 60, width=panel_width, height=hero_panel_h, preserveAspectRatio=True, mask='auto')
+        else:
+            c.setFillColor(_pdf_color(230, 233, 241))
+            c.rect(x, img_y + 60, panel_width, hero_panel_h, fill=1, stroke=0)
+        c.setFillColor(muted_color)
+        c.setFont(_PDF_FONT_REGULAR, 32)
+        c.drawString(x, img_y + 30, label)
+    y -= hero_card_height + section_gap
+
+    thumb_w = (card_width - 2 * card_inner_pad - thumb_gap) / 2
+    if not row_entries:
+        c.setFillColor(card_color)
+        c.roundRect(base_margin, y - 280, card_width, 280, 30, stroke=0, fill=1)
+        c.setFillColor(text_color)
+        c.setFont(_PDF_FONT_REGULAR, 42)
+        c.drawString(base_margin + card_inner_pad, y - 180, 'No FoilHole imagery available for this GridSquare.')
+        y -= 280 + row_gap
+    else:
+        for entry in row_entries:
+            card_height = _row_height(entry)
+            c.setFillColor(card_color)
+            c.roundRect(base_margin, y - card_height, card_width, card_height, 34, stroke=0, fill=1)
+            label_y = y - card_inner_pad - 60
+            c.setFont(_PDF_FONT_BOLD, 46)
+            c.setFillColor(text_color)
+            hole_idx = entry['hole_index']
+            shot_idx = entry['shot_index']
+            foil_caption = f"Hole #{hole_idx}" if hole_idx else 'FoilHole'
+            if shot_idx:
+                foil_caption += f" · shot {shot_idx}"
+            data_caption = f"Data · hole #{hole_idx}" if hole_idx else 'Screening data'
+            foil_x = base_margin + card_inner_pad
+            data_x = base_margin + card_inner_pad + thumb_w + thumb_gap
+            c.drawString(foil_x, label_y, foil_caption)
+            c.drawString(data_x, label_y, data_caption)
+            img_y = y - card_inner_pad - 80 - thumb_h
+            placeholder_color = _pdf_color(233, 236, 244)
+            if entry['foil_reader']:
+                c.drawImage(entry['foil_reader'], foil_x, img_y, width=thumb_w, height=thumb_h, preserveAspectRatio=True, mask='auto')
+            else:
+                c.setFillColor(placeholder_color)
+                c.rect(foil_x, img_y, thumb_w, thumb_h, fill=1, stroke=0)
+                c.setFillColor(muted_color)
+                c.setFont(_PDF_FONT_SMALL, 32)
+                c.drawCentredString(foil_x + thumb_w / 2, img_y + thumb_h / 2, "Foil image missing")
+            if entry['data_reader']:
+                c.drawImage(entry['data_reader'], data_x, img_y, width=thumb_w, height=thumb_h, preserveAspectRatio=True, mask='auto')
+            else:
+                c.setFillColor(placeholder_color)
+                c.rect(data_x, img_y, thumb_w, thumb_h, fill=1, stroke=0)
+                c.setFillColor(muted_color)
+                c.setFont(_PDF_FONT_SMALL, 32)
+                c.drawCentredString(data_x + thumb_w / 2, img_y + thumb_h / 2, "Data image missing")
+            c.setFillColor(muted_color)
+            c.setFont(_PDF_FONT_SMALL, 30)
+            foil_label_lines = _wrap_text_lines(entry.get('foil_name', '') or '', 30, thumb_w)
+            data_label_lines = _wrap_text_lines(entry.get('data_name', '') or '', 30, thumb_w)
+            label_spacing = 32
+            offset = 22
+            for idx, line in enumerate(foil_label_lines):
+                c.drawString(foil_x, img_y - offset - idx * label_spacing, line)
+            for idx, line in enumerate(data_label_lines):
+                c.drawString(data_x, img_y - offset - idx * label_spacing, line)
+            extra_offset = offset + max(len(foil_label_lines), len(data_label_lines)) * label_spacing + 10
+            if entry['meta_lines']:
+                meta_y = img_y - extra_offset
+                c.setFont(_PDF_FONT_SMALL, 32)
+                for line in entry['meta_lines']:
+                    c.drawString(data_x, meta_y, line)
+                    meta_y -= 34
+            y -= card_height + row_gap
+
+    c.showPage()
+
+
+def _draw_pdf_message_page(c: pdf_canvas.Canvas, lines: list[str], title: str = "Notice") -> None:
+    _ensure_pdf_fonts()
+    base_margin = 120
+    line_height = 48
+    body_height = max(200, len(lines) * line_height)
+    page_height = base_margin * 2 + 120 + body_height
+    page_height = max(page_height, _PDF_MIN_HEIGHT // 2)
+    c.setPageSize((_PDF_PAGE_WIDTH, page_height))
+    c.setFillColor(_pdf_color(244, 246, 251))
+    c.rect(0, 0, _PDF_PAGE_WIDTH, page_height, fill=1, stroke=0)
+    c.setFillColor(_pdf_color(20, 28, 44))
+    c.setFont(_PDF_FONT_BOLD, 80)
+    c.drawString(base_margin, page_height - base_margin - 20, title)
+    c.setFont(_PDF_FONT_REGULAR, 40)
+    text_y = page_height - base_margin - 120
+    for line in lines:
+        c.drawString(base_margin, text_y, line)
+        text_y -= line_height
+    c.showPage()
 
 
 def make_grid_page(grid_img: Image.Image, label: str, atlas_img: Image.Image | None = None, markers: list[tuple] | None = None) -> Image.Image:
@@ -585,12 +764,33 @@ def parse_metadata(xml_path: Path) -> dict[str, str]:
     except Exception:
         return {}
     info: dict[str, str] = {}
+    parent_map = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
+
+    def _local(tag: str | None) -> str:
+        if not tag:
+            return ""
+        if "}" in tag:
+            return tag.rsplit("}", 1)[-1].lower()
+        return tag.lower()
+
+    def _as_float(text: str | None) -> float | None:
+        if text is None:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+
     # helper to iterate ignoring namespace
     def iter_tags(tagname):
         for e in root.iter():
             if e.tag.lower().endswith(tagname.lower()):
                 yield e
     # pixel size (numericValue underneath pixelSize)
+    pixel_size_angstrom: float | None = None
     for ps in iter_tags("pixelsize"):
         nv = None
         for child in ps.iter():
@@ -598,14 +798,26 @@ def parse_metadata(xml_path: Path) -> dict[str, str]:
                 nv = child
                 break
         if nv is not None and nv.text:
-            info["pixel_size"] = nv.text
-            break
-    # exposure time
+            size_m = _as_float(nv.text)
+            if size_m is not None:
+                pixel_size_angstrom = size_m * 1e10
+                break
+    if pixel_size_angstrom is not None:
+        info["pixel_size"] = f"{pixel_size_angstrom:.2f} Å"
+    # exposure time – prefer the <camera> node, fall back to any exposure
+    exposure_val: float | None = None
     for e in iter_tags("exposuretime"):
-        if e.text:
-            info["exposure"] = e.text
+        val = _as_float(e.text)
+        if val is None:
+            continue
+        parent = parent_map.get(e)
+        parent_name = _local(parent.tag if parent is not None else None)
+        if parent_name == "camera":
+            exposure_val = val
             break
-    # look for dose in custom data key/value pairs
+        if exposure_val is None:
+            exposure_val = val
+    # look for exposure in CustomData key/value pairs if still missing
     for kv in root.findall('.//{http://schemas.microsoft.com/2003/10/Serialization/Arrays}KeyValueOfstringanyType'):
         key = kv.find('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}Key')
         val = kv.find('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}Value')
@@ -615,12 +827,17 @@ def parse_metadata(xml_path: Path) -> dict[str, str]:
                 info['dose'] = val.text
             if 'doseoncamera' in k and val is not None and val.text:
                 info['dose_on_camera'] = val.text
+            if 'exposuretime' in k and exposure_val is None and val is not None and val.text:
+                maybe = _as_float(val.text)
+                if maybe is not None:
+                    exposure_val = maybe
+    if exposure_val is not None:
+        info['exposure'] = f"{exposure_val:.2f} s"
     # if explicit dose missing and we have rate+exposure, compute
-    if 'dose' not in info and 'dose_on_camera' in info and 'exposure' in info:
+    if 'dose' not in info and 'dose_on_camera' in info and exposure_val is not None:
         try:
             rate = float(info['dose_on_camera'])
-            exp = float(info['exposure'])
-            info['dose'] = str(rate * exp)
+            info['dose'] = str(rate * exposure_val)
         except Exception:
             pass
     # convert dose to e-/Å^2 if necessary
@@ -635,11 +852,24 @@ def parse_metadata(xml_path: Path) -> dict[str, str]:
                 info['dose'] = f"{d:.2f}"
         except Exception:
             pass
-    # defocus (choose first defocus value encountered)
-    for d in iter_tags('defocus'):
-        if d.text:
-            info['defocus'] = d.text
-            break
+    # defocus – prefer AppliedDefocus custom data, fall back to optics/defocus
+    defocus_val: float | None = None
+    for kv in root.findall('.//{http://schemas.microsoft.com/2003/10/Serialization/Arrays}KeyValueOfstringanyType'):
+        key = kv.find('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}Key')
+        val = kv.find('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}Value')
+        if key is not None and key.text and 'applieddefocus' in key.text.lower() and val is not None and val.text:
+            maybe = _as_float(val.text)
+            if maybe is not None:
+                defocus_val = maybe
+                break
+    if defocus_val is None:
+        for d in iter_tags('defocus'):
+            val = _as_float(d.text)
+            if val is not None:
+                defocus_val = val
+                break
+    if defocus_val is not None:
+        info['defocus'] = f"{defocus_val * 1e6:.2f} µm"
     return info
 
 
@@ -959,7 +1189,7 @@ def build_pdf(base_dir: Path, output_file: Path, atlas_name: str | None, no_mark
                 pages.append(make_foil_page(foil_image, data_image, foil_lbl, data_lbl, meta, index_label))
     if pages:
         first, rest = pages[0], pages[1:]
-        first.save(output_file, "PDF", save_all=True, append_images=rest, resolution=150)
+        first.save(output_file, "PDF", save_all=True, append_images=rest, resolution=300)
         print(f"wrote PDF to {output_file}")
 
 
@@ -1530,7 +1760,7 @@ def write_review_report(base_dir: Path, report_file: Path, atlas_name: str | Non
             comment_y += row_height
         y_offset = max(y_offset + row_height, comment_y)
 
-    page.save(report_file, "PDF", resolution=150)
+    page.save(report_file, "PDF", resolution=300)
 
 
 def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | None, responses: dict, overlay: bool = False):
@@ -1541,12 +1771,13 @@ def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | N
     include_list = []
     for idx, (_gid, gdir) in enumerate(grids, start=1):
         resp = responses.get(gdir.name)
-        if resp and bool(resp.get('include')):
+        if resp and bool(resp.get("include")):
             include_list.append((idx, gdir, resp))
-    pages: list[Image.Image] = []
     failed: list[tuple[str, str]] = []
+    _ensure_pdf_fonts()
+    pdf = pdf_canvas.Canvas(str(report_file))
     if not include_list:
-        pages.append(make_text_page("no GridSquares selected for this report"))
+        _draw_pdf_message_page(pdf, ["No GridSquares selected for this report."])
     else:
         for idx, gdir, resp in include_list:
             grid_name = gdir.name
@@ -1576,42 +1807,29 @@ def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | N
             foils = _latest_only(foils)
             datas = _latest_only(datas)
             try:
-                pages.extend(
-                    make_grid_summary_pages(
-                        grid_image,
-                        atlas_img_local,
-                        foils,
-                        datas,
-                        resp,
-                        heading,
-                        grid_image_path.name,
-                        overlay_img_local,
-                    )
+                _draw_grid_summary_page(
+                    pdf,
+                    grid_image,
+                    atlas_img_local,
+                    foils,
+                    datas,
+                    resp,
+                    heading,
+                    grid_image_path.name,
+                    overlay_img_local,
                 )
             except Exception as exc:
                 failed.append((grid_name, f"render error: {exc}"))
                 print(f"[selected_report] skipping {grid_name}: {exc}")
                 continue
-    if not pages:
-        if include_list:
-            lines = ["failed to render the selected GridSquares."]
-            if failed:
-                for name, reason in failed[:12]:
-                    lines.append(f"- {name}: {reason}")
-                if len(failed) > 12:
-                    lines.append("...")
-            pages.append(make_text_page("\n".join(lines)))
-        else:
-            pages.append(make_text_page("no GridSquares selected for this report"))
-    elif failed:
-        lines = ["some selected GridSquares were skipped:"]
+    if failed:
+        lines = ["Some selected GridSquares were skipped:"]
         for name, reason in failed[:12]:
             lines.append(f"- {name}: {reason}")
         if len(failed) > 12:
             lines.append("... see console for the full list")
-        pages.append(make_text_page("\n".join(lines)))
-    first, rest = pages[0], pages[1:]
-    first.save(report_file, "PDF", save_all=True, append_images=rest, resolution=150)
+        _draw_pdf_message_page(pdf, lines)
+    pdf.save()
 
 
 def _make_report_grid_page(grid_img: Image.Image, label: str, resp: dict | None) -> Image.Image:

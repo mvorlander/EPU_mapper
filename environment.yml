@@ -11,3 +11,4 @@ dependencies:
   - jinja2
   - python-multipart
   - mrcfile
+  - reportlab

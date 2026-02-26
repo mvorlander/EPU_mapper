@@ -6,3 +6,4 @@ jinja2
 python-multipart
 pillow
 matplotlib
+reportlab

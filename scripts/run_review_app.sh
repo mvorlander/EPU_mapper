@@ -25,4 +25,17 @@ if ! command -v python >/dev/null 2>&1; then
 fi
 
 export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-exec python -m review_app "$@"
+
+args=("$@")
+want_open=true
+for arg in "$@"; do
+  if [[ "$arg" == "--open" || "$arg" == "--no-open" ]]; then
+    want_open=false
+    break
+  fi
+done
+if $want_open; then
+  args+=("--open")
+fi
+
+exec python -m review_app "${args[@]}"
