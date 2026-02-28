@@ -22,6 +22,7 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8000"
+DEFAULT_LABEL = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX") or ""
 TRANSFORM_OPTIONS = [
     ("Identity (default)", "identity"),
     ("Auto detect", "auto"),
@@ -65,6 +66,11 @@ def _review_command(
     atlas_path: str,
     overlay_enabled: bool,
     transform: str,
+    *,
+    session_label: str | None = None,
+    details_only: bool = False,
+    details_output: str | None = None,
+    open_browser: bool = True,
 ) -> list[str]:
     if _is_frozen():
         cmd = [sys.executable, "--run-review", session_path]
@@ -77,7 +83,14 @@ def _review_command(
         cmd.append("--overlay")
     else:
         cmd.append("--no-overlay")
-    cmd.append("--open")
+    if session_label:
+        cmd.extend(["--session-label", session_label])
+    if details_only:
+        cmd.append("--details-only")
+        if details_output:
+            cmd.extend(["--details-output", details_output])
+    elif open_browser:
+        cmd.append("--open")
     return cmd
 
 
@@ -112,6 +125,7 @@ class ReviewLauncher:
         self.proc: subprocess.Popen[str] | None = None
         self.preferences = self._load_preferences()
         self.session_history = list(self.preferences.get("sessions", []))
+        self._details_running = False
         self.root = tk.Tk()
         self.root.title("EPU Mapper Review Launcher")
         self._build_form()
@@ -141,8 +155,12 @@ class ReviewLauncher:
         atlas_entry.grid(row=5, column=0, sticky="we")
         ttk.Button(frm, text="Browse", command=self.browse_atlas).grid(row=5, column=1, padx=(6, 0))
 
+        ttk.Label(frm, text="Session/Grid label (optional):").grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.label_var = tk.StringVar(value=self.preferences.get("session_label", DEFAULT_LABEL))
+        ttk.Entry(frm, textvariable=self.label_var, width=40).grid(row=7, column=0, sticky="we")
+
         options_row = ttk.Frame(frm)
-        options_row.grid(row=6, column=0, columnspan=2, pady=(10, 0), sticky="we")
+        options_row.grid(row=8, column=0, columnspan=2, pady=(10, 0), sticky="we")
         ttk.Label(options_row, text="Host:").grid(row=0, column=0, sticky="w")
         self.host_var = tk.StringVar(value=self.preferences.get("host", DEFAULT_HOST))
         ttk.Entry(options_row, textvariable=self.host_var, width=12).grid(row=0, column=1, padx=(4, 12))
@@ -152,16 +170,20 @@ class ReviewLauncher:
         self.overlay_var = tk.BooleanVar(value=self.preferences.get("overlay", True))
         ttk.Checkbutton(options_row, text="Generate foil overlays", variable=self.overlay_var).grid(row=0, column=4)
 
-        ttk.Label(frm, text="Overlay transform:").grid(row=7, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(frm, text="Overlay transform:").grid(row=9, column=0, sticky="w", pady=(10, 0))
         self.transform_var = tk.StringVar(value=self._transform_label(self.preferences.get("transform", "identity")))
         transform_box = ttk.Combobox(frm, textvariable=self.transform_var, state="readonly")
         transform_box["values"] = [label for label, _ in TRANSFORM_OPTIONS]
         transform_box.current(0)
-        transform_box.grid(row=8, column=0, sticky="we")
+        transform_box.grid(row=10, column=0, sticky="we")
 
-        self.launch_btn = ttk.Button(frm, text="Start review", command=self.start_server)
-        self.launch_btn.grid(row=9, column=0, pady=(12, 0), sticky="w")
-        ttk.Button(frm, text="Stop", command=self.stop_server).grid(row=9, column=1, pady=(12, 0), sticky="e")
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="we")
+        self.launch_btn = ttk.Button(btn_row, text="Start review", command=self.start_server)
+        self.launch_btn.grid(row=0, column=0, sticky="w")
+        ttk.Button(btn_row, text="Stop", command=self.stop_server).grid(row=0, column=1, padx=(10, 0))
+        self.details_btn = ttk.Button(btn_row, text="Export detailed PDF", command=self.export_details)
+        self.details_btn.grid(row=0, column=2, padx=(10, 0))
 
         output_frame = ttk.LabelFrame(self.root, text="Server log", padding=6)
         output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
@@ -197,16 +219,18 @@ class ReviewLauncher:
         transform_value = self.transform_var.get()
         transform = self._transform_value(transform_value)
 
-        cmd = _review_command(session_path, host, port, atlas_path, self.overlay_var.get(), transform)
+        label = self.label_var.get().strip()
+        cmd = _review_command(
+            session_path,
+            host,
+            port,
+            atlas_path,
+            self.overlay_var.get(),
+            transform,
+            session_label=label or None,
+        )
 
-        env = os.environ.copy()
-        src_dir = REPO_ROOT / "src"
-        if src_dir.is_dir():
-            existing = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = str(src_dir) if not existing else f"{src_dir}{os.pathsep}{existing}"
-        temp_dir = env.get("TMP", env.get("TEMP", os.path.expanduser("~")))
-        env.setdefault("MPLCONFIGDIR", os.path.join(temp_dir, "mplcache"))
-        env.setdefault("FONTCONFIG_PATH", os.path.join(temp_dir, "mplcache"))
+        env = self._build_env()
 
         try:
             self.proc = subprocess.Popen(
@@ -225,6 +249,41 @@ class ReviewLauncher:
         self.launch_btn.configure(state="disabled")
         threading.Thread(target=self._stream_output, daemon=True).start()
         self._log(f"Started server on {host}:{port}. Close the browser tab when finished.\n")
+
+    def export_details(self) -> None:
+        if self._details_running:
+            messagebox.showinfo("Please wait", "Detailed export already in progress.")
+            return
+        session_path = self.session_var.get().strip()
+        if not session_path:
+            messagebox.showerror("Missing path", "Please select a session root or Images-Disc folder.")
+            return
+        if not Path(session_path).exists():
+            messagebox.showerror("Invalid path", "The selected session path does not exist.")
+            return
+        atlas_path = self.atlas_var.get().strip()
+        transform_value = self.transform_var.get()
+        transform = self._transform_value(transform_value)
+        host = self.host_var.get().strip() or DEFAULT_HOST
+        port = self.port_var.get().strip() or DEFAULT_PORT
+        label = self.label_var.get().strip()
+        cmd = _review_command(
+            session_path,
+            host,
+            port,
+            atlas_path,
+            self.overlay_var.get(),
+            transform,
+            session_label=label or None,
+            details_only=True,
+            open_browser=False,
+        )
+        self._set_details_running(True)
+        threading.Thread(
+            target=self._run_details_job,
+            args=(cmd, session_path, atlas_path, transform),
+            daemon=True,
+        ).start()
 
     def stop_server(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -277,10 +336,22 @@ class ReviewLauncher:
             "overlay": bool(self.overlay_var.get()),
             "last_session": self.session_var.get().strip(),
             "last_atlas": atlas_path,
+            "session_label": self.label_var.get().strip(),
         }
         path = self._prefs_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(prefs, indent=2))
+
+    def _build_env(self) -> dict:
+        env = os.environ.copy()
+        src_dir = REPO_ROOT / "src"
+        if src_dir.is_dir():
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = str(src_dir) if not existing else f"{src_dir}{os.pathsep}{existing}"
+        temp_dir = env.get("TMP", env.get("TEMP", os.path.expanduser("~")))
+        env.setdefault("MPLCONFIGDIR", os.path.join(temp_dir, "mplcache"))
+        env.setdefault("FONTCONFIG_PATH", os.path.join(temp_dir, "mplcache"))
+        return env
 
     def _stream_output(self) -> None:
         assert self.proc and self.proc.stdout
@@ -289,6 +360,44 @@ class ReviewLauncher:
         self._log("Server exited.\n")
         self.proc = None
         self.root.after(0, lambda: self.launch_btn.configure(state="normal"))
+
+    def _run_details_job(self, cmd: list[str], session_path: str, atlas_path: str, transform: str) -> None:
+        env = self._build_env()
+        self._log("Generating detailed PDF for all GridSquares…\n")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=_runtime_cwd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+        except Exception as exc:
+            self._log(f"Failed to start export: {exc}\n")
+            self.root.after(0, lambda: messagebox.showerror("Export failed", f"Could not start review_app: {exc}"))
+            self._set_details_running(False)
+            return
+        assert proc.stdout
+        for line in proc.stdout:
+            self._log(line)
+        ret = proc.wait()
+        if ret == 0:
+            self._log("Detailed PDF export finished.\n")
+            self.root.after(0, lambda: self._remember_session(session_path))
+            self.root.after(0, lambda: self._persist_preferences(transform, atlas_path))
+            self.root.after(0, lambda: messagebox.showinfo("Export complete", "Detailed PDF generated successfully."))
+        else:
+            self._log(f"Detailed export failed (exit code {ret}).\n")
+            self.root.after(0, lambda: messagebox.showerror("Export failed", f"review_app exited with code {ret}"))
+        self._set_details_running(False)
+
+    def _set_details_running(self, running: bool) -> None:
+        self._details_running = running
+        def toggle() -> None:
+            state = "disabled" if running else "normal"
+            self.details_btn.configure(state=state)
+        self.root.after(0, toggle)
 
     def _log(self, text: str) -> None:
         def append() -> None:

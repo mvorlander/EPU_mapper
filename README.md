@@ -95,6 +95,18 @@ Prefer running through `scripts/run_review_app.sh` whenever possible—it keeps
 and Windows builds use.
 </details>
 
+### Optional helpers
+
+- **Prefix PDF names** – provide a session/grid label once and reuse it for
+  both reports. Either set `SESSION_LABEL=MyRun` (or `GRID_LABEL=/REPORT_PREFIX`)
+  before launching, or pass `--grid-label MyRun` / `--session-label MyRun` to
+  the wrapper/Windows launcher. The resulting files become
+  `MyRun_Screening_overview.pdf` and `MyRun_Screening_details.pdf`.
+- **Skip the UI and export everything** – add `--details-only`
+  (alias: `--export-all-details`) to the command to render the detailed PDF for
+  *every* GridSquare, then exit immediately. Use `--details-output path/to/out.pdf`
+  if you want to override the default filename.
+
 
 ### Troubleshooting (ports)
 

@@ -4,6 +4,7 @@ import errno
 import json
 import json
 import os
+import re
 import sys
 import urllib.parse
 import time
@@ -56,6 +57,28 @@ def _format_meta(meta: dict) -> list[str]:
 _OVERLAY_TOOLS: tuple | None = None
 _OVERLAY_TRANSFORM: str | None = None
 _OVERLAY_EVENTS: deque = deque(maxlen=200)
+
+
+def _sanitize_label(label: str | None) -> str:
+    if not label:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", label.strip())
+    return cleaned.strip("_")
+
+
+def _prefix_from_label(label: str | None) -> str:
+    cleaned = _sanitize_label(label)
+    return f"{cleaned}_" if cleaned else ""
+
+
+def _configure_overlay_transform(value: str | None):
+    global _OVERLAY_TRANSFORM
+    if value == "auto":
+        _OVERLAY_TRANSFORM = None
+    elif value in (None, "", "identity"):
+        _OVERLAY_TRANSFORM = "identity"
+    else:
+        _OVERLAY_TRANSFORM = value
 
 
 def _record_status(message: str) -> None:
@@ -191,15 +214,11 @@ def create_app(
     report_file: Path | None = None,
     overlay: bool = False,
     overlay_transform: str | None = "identity",
+    session_label: str | None = None,
 ) -> FastAPI:
-    global _OVERLAY_TRANSFORM
-    if overlay_transform == "auto":
-        _OVERLAY_TRANSFORM = None
-    elif overlay_transform in (None, ""):
-        _OVERLAY_TRANSFORM = "identity"
-    else:
-        _OVERLAY_TRANSFORM = overlay_transform
+    _configure_overlay_transform(overlay_transform)
     base_dir = base_dir.resolve()
+    label_prefix = _prefix_from_label(session_label)
     overlay_enabled = bool(overlay)
     overlay_notice_html = ""
     if overlay_enabled:
@@ -757,8 +776,11 @@ if (lastIdx !== null){{
             overview = report_file
             details = report_file.with_name(f"{report_file.stem}_details.pdf")
         else:
-            overview = base_dir / "Screening_overview.pdf"
-            details = base_dir / "Screening_details.pdf"
+            prefix = label_prefix
+            overview_name = f"{prefix}Screening_overview.pdf"
+            details_name = f"{prefix}Screening_details.pdf"
+            overview = base_dir / overview_name
+            details = base_dir / details_name
         return overview, details
 
     def _temp_report_path(filename: str) -> Path:
@@ -832,11 +854,52 @@ localStorage.removeItem('last_idx');
     return app
 
 
+def generate_details_report(
+    base_dir: Path,
+    atlas_name: str | None,
+    session_label: str | None,
+    details_output: Path | None,
+    overlay: bool,
+    overlay_transform: str | None,
+) -> Path:
+    base_dir = base_dir.resolve()
+    _configure_overlay_transform(overlay_transform)
+    grids = _collect_grids(base_dir)
+    if not grids:
+        raise RuntimeError(f"no GridSquare directories found in {base_dir}")
+    responses = {gdir.name: {"include": True, "rating": 0, "comment": ""} for _gid, gdir in grids}
+    if details_output:
+        target_path = details_output
+    else:
+        prefix = _prefix_from_label(session_label)
+        name = f"{prefix}Screening_details.pdf"
+        target_path = base_dir / name
+    write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay)
+    return target_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Web review app for GridSquare folders")
     parser.add_argument("grid_dir", type=Path, help="path to a GridSquare directory, Images-Disc*, or session root")
     parser.add_argument("--atlas", type=str, help="atlas image name")
     parser.add_argument("--report", type=Path, help="output PDF path")
+    label_env_default = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX")
+    parser.add_argument(
+        "--session-label",
+        "--grid-label",
+        dest="session_label",
+        type=str,
+        default=label_env_default,
+        help="name prefixed to generated PDF filenames (defaults to SESSION_LABEL / GRID_LABEL / REPORT_PREFIX env vars if set)",
+    )
+    parser.add_argument(
+        "--details-only",
+        "--export-all-details",
+        dest="details_only",
+        action="store_true",
+        help="generate the detailed PDF for every GridSquare and exit (skips launching the web app)",
+    )
+    parser.add_argument("--details-output", type=Path, help="custom output path when using --details-only / --export-all-details")
     parser.add_argument(
         "--overlay",
         dest="overlay",
@@ -872,7 +935,32 @@ def main():
         print(f"[review_app] {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     overlay_transform = args.overlay_transform if args.overlay else None
-    app = create_app(grid_root, args.atlas, args.report, args.overlay, overlay_transform)
+    if args.details_only:
+        try:
+            details_path = generate_details_report(
+                grid_root,
+                args.atlas,
+                args.session_label,
+                args.details_output,
+                args.overlay,
+                overlay_transform,
+            )
+        except RuntimeError as exc:
+            print(f"[review_app] {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        except Exception as exc:
+            print(f"[review_app] Failed to build detailed PDF: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        print(f"[review_app] Detailed PDF written to {details_path}")
+        return
+    app = create_app(
+        grid_root,
+        args.atlas,
+        args.report,
+        args.overlay,
+        overlay_transform,
+        session_label=args.session_label,
+    )
     if args.open:
         url = f"http://{args.host}:{args.port}"
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

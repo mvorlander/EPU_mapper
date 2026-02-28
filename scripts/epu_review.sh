@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APPTAINER_IMAGE=${APPTAINER_IMAGE:-/groups/plaschka/shared/software/containers/epu_mapper_review.sif}
+APPTAINER_IMAGE=${APPTAINER_IMAGE:-/resources/cryo-em/epu_mapper_review.sif}
 DEFAULT_HOST=${HOST_OVERRIDE:-127.0.0.1}
 DEFAULT_PORT=${PORT_OVERRIDE:-8000}
 
@@ -17,7 +17,10 @@ Required:
 
 Common optional:
   --atlas PATH        Path to the atlas screenshot (absolute or relative).
+  --session-label TXT Prefix added to generated PDF filenames.
   --no-overlay        Skip automatic creation/display of foil overlays (enabled by default).
+  --details-only      Generate the detailed PDF for every GridSquare and exit (no web UI).
+  --details-output PATH Custom path for the detailed PDF when using --details-only.
 
 Less frequently changed:
   --host HOST         Host interface for uvicorn (default: ${DEFAULT_HOST}).
@@ -33,6 +36,9 @@ USAGE
 
 SESSION_DIR=""
 ATLAS_PATH=""
+SESSION_LABEL=""
+DETAILS_ONLY=0
+DETAILS_OUTPUT=""
 HOST="$DEFAULT_HOST"
 PORT="$DEFAULT_PORT"
 EXTRA_ARGS=()
@@ -47,6 +53,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --atlas)
       ATLAS_PATH="$2"
+      shift 2
+      ;;
+    --session-label)
+      SESSION_LABEL="$2"
+      shift 2
+      ;;
+    --details-only)
+      DETAILS_ONLY=1
+      shift
+      ;;
+    --details-output)
+      DETAILS_OUTPUT="$2"
       shift 2
       ;;
     --overlay)
@@ -170,6 +188,9 @@ CMD=(apptainer exec "${BIND_ARGS[@]}" "$APPTAINER_IMAGE" start-review-app "$SESS
 if [[ -n "$ATLAS_PATH" ]]; then
   CMD+=(--atlas "$ATLAS_PATH")
 fi
+if [[ -n "$SESSION_LABEL" ]]; then
+  CMD+=(--session-label "$SESSION_LABEL")
+fi
 if [[ "$OVERLAY" == "1" ]]; then
   CMD+=(--overlay)
   if [[ -n "$OVERLAY_TRANSFORM" ]]; then
@@ -177,6 +198,12 @@ if [[ "$OVERLAY" == "1" ]]; then
   fi
 else
   CMD+=(--no-overlay)
+fi
+if [[ "$DETAILS_ONLY" == "1" ]]; then
+  CMD+=(--details-only)
+fi
+if [[ -n "$DETAILS_OUTPUT" ]]; then
+  CMD+=(--details-output "$DETAILS_OUTPUT")
 fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=(-- "${EXTRA_ARGS[@]}")
