@@ -264,8 +264,49 @@ def _latest_only(d: dict[str, list[Path]]) -> dict[str, list[Path]]:
     return latest
 
 
+def _grid_timestamp_from_name(name: str) -> tuple[str, str] | None:
+    """Parse `GridSquare_YYYYMMDD_HHMMSS.*` style timestamps from a filename."""
+    stem = Path(name).stem
+    parts = stem.split("_")
+    if len(parts) < 3:
+        return None
+    if parts[0].lower() != "gridsquare":
+        return None
+    date_part = parts[1]
+    time_part = parts[2]
+    if len(date_part) != 8 or not date_part.isdigit():
+        return None
+    digits = "".join(ch for ch in time_part if ch.isdigit())
+    if len(digits) < 6:
+        return None
+    return date_part, digits[:6]
+
+
+def _grid_acquisition_key(grid_dir: Path) -> tuple[int, str, str]:
+    """Return a sortable key that approximates EPU acquisition order for a GridSquare."""
+    timestamp_candidates: list[tuple[str, str]] = []
+    try:
+        for entry in grid_dir.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() not in (".jpg", ".jpeg"):
+                continue
+            ts = _grid_timestamp_from_name(entry.name)
+            if ts is not None:
+                timestamp_candidates.append(ts)
+    except Exception:
+        pass
+    if timestamp_candidates:
+        # Use the earliest timestamp in this GridSquare directory.
+        # This is closest to the acquisition sequence shown by EPU.
+        first = min(timestamp_candidates)
+        return (0, first[0], first[1])
+    # Fall back to legacy ordering for datasets without parseable timestamps.
+    return (1, "", "")
+
+
 def _collect_grids(base_dir: Path):
-    grids = []
+    grids: list[tuple[int | float, Path, tuple[int, str, str]]] = []
     for entry in base_dir.iterdir():
         if entry.is_dir() and entry.name.startswith("GridSquare_"):
             parts = entry.name.split("_")
@@ -273,14 +314,15 @@ def _collect_grids(base_dir: Path):
                 gid = int(parts[1])
             except Exception:
                 gid = float("inf")
-            grids.append((gid, entry))
+            grids.append((gid, entry, _grid_acquisition_key(entry)))
     if not grids and base_dir.name.startswith("GridSquare_"):
         try:
-            grids.append((int(base_dir.name.split("_")[1]), base_dir))
+            gid = int(base_dir.name.split("_")[1])
         except Exception:
-            grids.append((float("inf"), base_dir))
-    grids.sort(key=lambda x: x[0])
-    return grids
+            gid = float("inf")
+        grids.append((gid, base_dir, _grid_acquisition_key(base_dir)))
+    grids.sort(key=lambda row: (row[2], row[0], row[1].name))
+    return [(gid, entry) for gid, entry, _ in grids]
 
 
 def _load_image(path: Path, mode: str | None = None) -> Image.Image | None:
@@ -1524,22 +1566,8 @@ def run_interactive_review(base_dir: Path, atlas_name: str | None = None, report
     collect responses and proceed to the next gridsquare. The page attempts
     to close itself after submission.
     """
-    # collect grid dirs in order
-    grids = []
-    for entry in base_dir.iterdir():
-        if entry.is_dir() and entry.name.startswith("GridSquare_"):
-            parts = entry.name.split("_")
-            try:
-                gid = int(parts[1])
-            except Exception:
-                gid = float('inf')
-            grids.append((gid, entry))
-    if not grids and base_dir.name.startswith("GridSquare_"):
-        try:
-            grids.append((int(base_dir.name.split("_")[1]), base_dir))
-        except Exception:
-            grids.append((float('inf'), base_dir))
-    grids.sort(key=lambda x: x[0])
+    # collect grid dirs in acquisition order (same ordering as the web app)
+    grids = _collect_grids(base_dir)
 
     responses: dict[str, dict] = {}
 
@@ -1909,6 +1937,7 @@ def write_review_report(
     atlas_name: str | None,
     responses: dict,
     atlas_overlay: bool = True,
+    global_summary: str | None = None,
 ):
     """Generate a single-page PDF with atlas (left) and ratings/comments (right) in a compact format."""
     grids = _collect_grids(base_dir)
@@ -1989,6 +2018,15 @@ def write_review_report(
         include_flag = "Yes" if resp and resp.get('include') else "No"
         rows.append((f"GridSquare {idx}", str(rating), include_flag, comment or "—"))
     draw.text((margin, stats_y), f"Selected GridSquares: {selected_count}", fill=0, font=fonts["body"])
+    summary_text = (global_summary or "").strip()
+    if summary_text:
+        stats_y += line_h + 4
+        draw.text((margin, stats_y), "Session summary:", fill=0, font=fonts["body"])
+        stats_y += line_h
+        summary_line_h = (fonts["small"].size + 4) if getattr(fonts["small"], "size", None) else 20
+        for line in textwrap.wrap(summary_text, width=48):
+            draw.text((margin, stats_y), line, fill=0, font=fonts["small"])
+            stats_y += summary_line_h
 
     # place ratings/comments on right
     heading = "GridSquare Review Summary"
@@ -2040,6 +2078,7 @@ def write_selected_report(
     responses: dict,
     overlay: bool = False,
     atlas_overlay: bool = True,
+    global_summary: str | None = None,
 ):
     """Generate a PDF with only the included GridSquares."""
     grids = _collect_grids(base_dir)
@@ -2053,6 +2092,10 @@ def write_selected_report(
     failed: list[tuple[str, str]] = []
     _ensure_pdf_fonts()
     pdf = pdf_canvas.Canvas(str(report_file))
+    summary_text = (global_summary or "").strip()
+    if summary_text:
+        summary_lines = textwrap.wrap(summary_text, width=100) or [summary_text]
+        _draw_pdf_message_page(pdf, summary_lines, title="Session Summary")
     if not include_list:
         _draw_pdf_message_page(pdf, ["No GridSquares selected for this report."])
     else:

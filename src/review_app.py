@@ -284,6 +284,43 @@ def _prefix_from_label(label: str | None) -> str:
     return f"{cleaned}_" if cleaned else ""
 
 
+_SUMMARY_MAX_LEN = 300
+
+
+def _summary_file_path(base_dir: Path) -> Path:
+    return base_dir / "review_summary.txt"
+
+
+def _normalize_summary_text(text: str | None) -> str:
+    if not text:
+        return ""
+    # Keep this as a compact single sentence/line for report headers.
+    cleaned = " ".join(str(text).strip().split())
+    if len(cleaned) > _SUMMARY_MAX_LEN:
+        cleaned = cleaned[:_SUMMARY_MAX_LEN].rstrip()
+    return cleaned
+
+
+def _load_review_summary(base_dir: Path) -> str:
+    path = _summary_file_path(base_dir)
+    if not path.is_file():
+        return ""
+    try:
+        return _normalize_summary_text(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+
+
+def _save_review_summary(base_dir: Path, text: str | None) -> str:
+    normalized = _normalize_summary_text(text)
+    path = _summary_file_path(base_dir)
+    try:
+        path.write_text(normalized, encoding="utf-8")
+    except Exception:
+        pass
+    return normalized
+
+
 def _configure_overlay_transform(value: str | None):
     global _OVERLAY_TRANSFORM
     if value == "auto":
@@ -533,6 +570,7 @@ def create_app(
             return
 
     responses = _load_responses()
+    summary_state = {"text": _load_review_summary(base_dir)}
 
     app = FastAPI()
 
@@ -565,14 +603,14 @@ def create_app(
             )
         grid_frame_html = (
             f"<div class=\"image-frame\"><div id=\"viewer-caption\" class=\"image-caption\">Viewer: {default_label} (last clicked image)</div>"
-            f"<img id=\"gridimg\" src=\"{default_src}\"/></div>"
+            f"<div id=\"viewer-viewport\" class=\"viewer-viewport\"><img id=\"gridimg\" class=\"frame-image\" src=\"{default_src}\"/></div></div>"
         )
         overlay_html = ""
         overlay_inline_notice = ""
         if item.get("overlay"):
             overlay_html = (
                 f"<div class=\"image-frame\"><div class=\"image-caption\">Foil overlay</div>"
-                f"<img id=\"overlayimg\" src=\"/overlay?idx={idx}&t={ts}\"/></div>"
+                f"<img id=\"overlayimg\" class=\"frame-image\" src=\"/overlay?idx={idx}&t={ts}\"/></div>"
             )
         elif item.get("overlay_message"):
             overlay_inline_notice = f"<div class=\"note warn\">{item['overlay_message']}</div>"
@@ -613,13 +651,18 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .grid-panel{{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:16px;}}
 .image-frame{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;flex:1 1 360px;max-width:100%;}}
 .image-caption{{font-size:13px;font-weight:600;color:#222;}}
-.image-frame img{{width:100%;max-width:var(--img-size);max-height:var(--img-size);height:auto;object-fit:contain;display:block;}}
+.image-frame img.frame-image{{width:100%;max-width:var(--img-size);max-height:var(--img-size);height:auto;object-fit:contain;display:block;}}
+.viewer-viewport{{position:relative;width:100%;max-width:var(--img-size);height:var(--img-size);overflow:hidden;border:1px solid #e1e4e8;border-radius:8px;background:#fbfcff;display:flex;align-items:center;justify-content:center;}}
+.viewer-viewport.pan-enabled{{touch-action:none;}}
 .atlas-img{{max-width:100%;height:auto;display:block;}}
 .atlas-img.selected{{outline:2px solid #1b6ef3;border-radius:6px;}}
-#gridimg{{transform-origin:center center;transition:transform 0.15s ease;}}
+#gridimg{{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;transform-origin:center center;transition:transform 0.05s linear;cursor:pointer;user-select:none;-webkit-user-drag:none;}}
+.viewer-viewport.pan-enabled #gridimg{{cursor:grab;}}
+.viewer-viewport.pan-enabled #gridimg.dragging{{cursor:grabbing;}}
 .actions{{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;}}
 .btn{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;}}
 .btn:hover{{background:#f0f2f5;}}
+.btn.active{{background:#1b6ef3;color:#fff;border-color:#1b6ef3;}}
 .btn:disabled{{opacity:0.5;cursor:default;}}
 .rate-buttons{{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;}}
 .rate{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;min-width:38px;}}
@@ -689,11 +732,12 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <button type=\"button\" id=\"zoom-out\" class=\"btn\">Zoom -</button>
 <button type=\"button\" id=\"zoom-in\" class=\"btn\">Zoom +</button>
 <button type=\"button\" id=\"zoom-reset\" class=\"btn\">Reset zoom</button>
+<button type=\"button\" id=\"pan-toggle\" class=\"btn\">Pan: Off</button>
 </div>
 <div id=\"zoom-level\" class=\"note\">Zoom: 100%</div>
 {grid_mrc_note}
 <div class=\"note\">Viewer defaults to the Atlas when available. Click Atlas, GridSquare, FoilHole, or Data images to switch what is shown here.</div>
-<div class=\"note\">Use MRC + sliders for contrast and zoom controls for detail inspection.</div>
+<div class=\"note\">Use MRC + sliders for contrast, then enable Pan to drag the zoomed image within the viewer.</div>
 <div id=\"contrast-panel\" style=\"display:none;margin-bottom:8px;\">
 <div>Low: <span id=\"lowv\">2</span>% <input type=\"range\" id=\"low\" min=\"0\" max=\"99\" value=\"2\"></div>
 <div>High: <span id=\"highv\">98</span>% <input type=\"range\" id=\"high\" min=\"1\" max=\"100\" value=\"98\"></div>
@@ -726,6 +770,15 @@ let selectedKind = DEFAULT_KIND;
 let selectedName = '';
 let selectedHasMrc = DEFAULT_HAS_MRC;
 let zoomLevel = 1.0;
+let panEnabled = false;
+let panX = 0;
+let panY = 0;
+let isDragging = false;
+let dragStartX = 0;
+let dragStartY = 0;
+let dragPointerStartX = 0;
+let dragPointerStartY = 0;
+let suppressNextGridClick = false;
 let allowPersist = false;
 function hideLoading(){{
   const overlay = document.getElementById('loading-overlay');
@@ -784,13 +837,57 @@ function mrcUrl(){{
 function updateButtons(){{
   document.getElementById('show-mrc').disabled = !selectedHasMrc;
 }}
+function clampPan(){{
+  const img = document.getElementById('gridimg');
+  const viewport = document.getElementById('viewer-viewport');
+  if (!img || !viewport) return;
+  const baseW = img.clientWidth || 0;
+  const baseH = img.clientHeight || 0;
+  if (baseW <= 0 || baseH <= 0) {{
+    panX = 0;
+    panY = 0;
+    return;
+  }}
+  const scaledW = baseW * zoomLevel;
+  const scaledH = baseH * zoomLevel;
+  const maxPanX = Math.max(0, (scaledW - viewport.clientWidth) / 2);
+  const maxPanY = Math.max(0, (scaledH - viewport.clientHeight) / 2);
+  panX = Math.max(-maxPanX, Math.min(maxPanX, panX));
+  panY = Math.max(-maxPanY, Math.min(maxPanY, panY));
+}}
 function applyZoom(){{
   const img = document.getElementById('gridimg');
-  img.style.transform = 'scale(' + zoomLevel.toFixed(3) + ')';
+  clampPan();
+  img.style.transform = 'translate(' + panX.toFixed(1) + 'px,' + panY.toFixed(1) + 'px) scale(' + zoomLevel.toFixed(3) + ')';
   document.getElementById('zoom-level').textContent = 'Zoom: ' + Math.round(zoomLevel * 100) + '%';
 }}
+function updatePanUi(){{
+  const btn = document.getElementById('pan-toggle');
+  const viewport = document.getElementById('viewer-viewport');
+  if (btn) {{
+    btn.textContent = panEnabled ? 'Pan: On' : 'Pan: Off';
+    btn.classList.toggle('active', panEnabled);
+  }}
+  if (viewport) {{
+    viewport.classList.toggle('pan-enabled', panEnabled);
+  }}
+}}
 function setZoom(value){{
-  zoomLevel = Math.max(0.5, Math.min(4.0, value));
+  const next = Math.max(0.5, Math.min(4.0, value));
+  const ratio = zoomLevel > 0 ? (next / zoomLevel) : 1.0;
+  zoomLevel = next;
+  panX *= ratio;
+  panY *= ratio;
+  if (zoomLevel <= 1.0) {{
+    panX = 0;
+    panY = 0;
+  }}
+  applyZoom();
+}}
+function resetViewerTransform(){{
+  zoomLevel = 1.0;
+  panX = 0;
+  panY = 0;
   applyZoom();
 }}
 function selectionLabel(kind,name){{
@@ -812,7 +909,9 @@ function selectImage(kind,name,hasMrc){{
   }}
   document.getElementById('gridimg').src = jpgUrl(kind,name);
   document.getElementById('contrast-panel').style.display = 'none';
-  setZoom(1.0);
+  panEnabled = false;
+  updatePanUi();
+  resetViewerTransform();
   updateButtons();
   document.querySelectorAll('.thumb').forEach(t=>t.classList.toggle('selected', t.dataset.kind === kind && t.dataset.name === name));
   const atlasImg = document.getElementById('atlasimg');
@@ -823,7 +922,57 @@ function selectImage(kind,name,hasMrc){{
 Array.from(document.querySelectorAll('.thumb')).forEach(t=>{{
   t.onclick = () => selectImage(t.dataset.kind, t.dataset.name, t.dataset.hasMrc === '1');
 }});
-document.getElementById('gridimg').onclick = () => selectImage('grid','',GRID_HAS_MRC);
+const viewerImg = document.getElementById('gridimg');
+viewerImg.onclick = (e) => {{
+  if (suppressNextGridClick) {{
+    suppressNextGridClick = false;
+    e.preventDefault();
+    return;
+  }}
+  if (selectedKind !== 'grid') {{
+    selectImage('grid','',GRID_HAS_MRC);
+  }}
+}};
+viewerImg.addEventListener('load', () => {{
+  if (zoomLevel <= 1.0) {{
+    panX = 0;
+    panY = 0;
+  }}
+  applyZoom();
+}});
+viewerImg.onpointerdown = (e) => {{
+  if (!panEnabled || zoomLevel <= 1.0) return;
+  isDragging = true;
+  suppressNextGridClick = false;
+  dragStartX = e.clientX - panX;
+  dragStartY = e.clientY - panY;
+  dragPointerStartX = e.clientX;
+  dragPointerStartY = e.clientY;
+  viewerImg.classList.add('dragging');
+  try {{ viewerImg.setPointerCapture(e.pointerId); }} catch (_err) {{}}
+  e.preventDefault();
+}};
+viewerImg.onpointermove = (e) => {{
+  if (!isDragging) return;
+  panX = e.clientX - dragStartX;
+  panY = e.clientY - dragStartY;
+  if (Math.abs(e.clientX - dragPointerStartX) > 2 || Math.abs(e.clientY - dragPointerStartY) > 2) {{
+    suppressNextGridClick = true;
+  }}
+  applyZoom();
+}};
+function stopPanDrag(e){{
+  if (!isDragging) return;
+  isDragging = false;
+  viewerImg.classList.remove('dragging');
+  try {{
+    if (viewerImg.hasPointerCapture(e.pointerId)) {{
+      viewerImg.releasePointerCapture(e.pointerId);
+    }}
+  }} catch (_err) {{}}
+}}
+viewerImg.onpointerup = stopPanDrag;
+viewerImg.onpointercancel = stopPanDrag;
 const atlasImg = document.getElementById('atlasimg');
 if (atlasImg) {{
   atlasImg.onclick = () => selectImage('atlas', '', ATLAS_HAS_MRC);
@@ -856,7 +1005,15 @@ document.getElementById('show-jpeg').onclick = () => {{
 }};
 document.getElementById('zoom-in').onclick = () => setZoom(zoomLevel * 1.25);
 document.getElementById('zoom-out').onclick = () => setZoom(zoomLevel / 1.25);
-document.getElementById('zoom-reset').onclick = () => setZoom(1.0);
+document.getElementById('zoom-reset').onclick = () => resetViewerTransform();
+document.getElementById('pan-toggle').onclick = () => {{
+  panEnabled = !panEnabled;
+  if (!panEnabled) {{
+    isDragging = false;
+    viewerImg.classList.remove('dragging');
+  }}
+  updatePanUi();
+}};
 function persistState(){{
   const data = {{
     rating,
@@ -882,6 +1039,7 @@ includeEl.addEventListener('change', persistState);
 document.getElementById('low').oninput = updateContrast;
 document.getElementById('high').oninput = updateContrast;
 updateButtons();
+updatePanUi();
 applyZoom();
 document.getElementById('submit').onclick = submitReview;
 document.addEventListener('keydown', (e)=>{{
@@ -1087,6 +1245,23 @@ if (lastIdx !== null){{
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    @app.get("/summary")
+    def summary():
+        return JSONResponse({"summary": summary_state["text"]})
+
+    @app.post("/summary")
+    async def set_summary(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        raw_summary = data.get("summary", "")
+        if not isinstance(raw_summary, str):
+            raw_summary = str(raw_summary)
+        normalized = _save_review_summary(base_dir, raw_summary)
+        summary_state["text"] = normalized
+        return JSONResponse({"summary": normalized})
+
     def _report_paths() -> tuple[Path, Path]:
         if report_file:
             overview = report_file
@@ -1106,30 +1281,75 @@ if (lastIdx !== null){{
 
     @app.get("/done")
     def done():
-        return HTMLResponse(
-            """<html><head><meta charset="utf-8"><title>Review complete</title>
+        summary_json = json.dumps(summary_state["text"])
+        done_html = """<html><head><meta charset="utf-8"><title>Review complete</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}
 .page{max-width:600px;margin:0 auto;padding:36px;}
 .card{background:#fff;border:1px solid #e1e4e8;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.08);}
 .title{font-size:22px;font-weight:600;margin-bottom:8px;}
 .note{color:#555;font-size:14px;margin-bottom:12px;}
+.summary-label{display:block;font-weight:600;margin:14px 0 6px;font-size:14px;}
+textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;padding:8px;font-size:14px;box-sizing:border-box;}
 .btn{display:inline-block;margin-top:10px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;margin-right:8px;}
 #done-status{margin-top:12px;font-size:13px;color:#1b6ef3;}
 </style>
 </head><body><div class="page"><div class="card">
 <div class="title">All GridSquares reviewed</div>
-<div class="note">Download the PDF summaries below. You can reopen this session later to continue editing notes or regenerate the reports.</div>
+<div class="note">Before generating PDFs, optionally add one session-level summary sentence.</div>
+<label class="summary-label" for="global-summary">Session summary (one sentence, optional)</label>
+<textarea id="global-summary" rows="2" maxlength="__SUMMARY_MAX_LEN__"></textarea>
+<div><button type="button" class="btn" id="save-summary">Save summary</button></div>
+<div class="note">Then download the PDF summaries below. You can reopen this session later to continue editing notes or regenerate reports.</div>
 <a class="btn" id="report-link" href="/report">Download overview</a>
 <a class="btn" id="selected-link" href="/selected_report">Download details</a>
 <div id="done-status"></div>
 </div></div>
 <script>
+const SUMMARY_INITIAL = __SUMMARY_JSON__;
+const summaryEl = document.getElementById('global-summary');
+const doneStatus = document.getElementById('done-status');
+summaryEl.value = SUMMARY_INITIAL || '';
+
+async function saveSummary(showStatus=true){
+  const payload = {summary: summaryEl.value || ''};
+  const res = await fetch('/summary', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok){
+    const txt = await res.text();
+    throw new Error(txt || ('Failed to save summary (' + res.status + ')'));
+  }
+  const data = await res.json();
+  summaryEl.value = data.summary || '';
+  if (showStatus){
+    doneStatus.textContent = 'Summary saved.';
+  }
+}
+
+document.getElementById('save-summary').addEventListener('click', async ()=>{
+  doneStatus.textContent = 'Saving summary…';
+  try{
+    await saveSummary(true);
+  }catch(err){
+    doneStatus.textContent = String(err);
+  }
+});
+
 function prepLink(id,url,msg){
   const link=document.getElementById(id);
-  link.href=url + '?t=' + Date.now();
-  link.addEventListener('click',()=>{
-    document.getElementById('done-status').textContent=msg;
+  link.addEventListener('click',async (ev)=>{
+    ev.preventDefault();
+    doneStatus.textContent=msg;
+    try{
+      await saveSummary(false);
+    }catch(err){
+      doneStatus.textContent = String(err);
+      return;
+    }
+    window.location = url + '?t=' + Date.now();
   });
 }
 prepLink('report-link','/report','Generating overview PDF…');
@@ -1137,18 +1357,34 @@ prepLink('selected-link','/selected_report','Generating selected-report PDF…')
 localStorage.removeItem('last_idx');
 </script>
 </body></html>"""
-        )
+        done_html = done_html.replace("__SUMMARY_JSON__", summary_json)
+        done_html = done_html.replace("__SUMMARY_MAX_LEN__", str(_SUMMARY_MAX_LEN))
+        return HTMLResponse(done_html)
 
     @app.get("/report")
     def report():
         overview_path, _details_path = _report_paths()
         target_path = overview_path
         try:
-            write_review_report(base_dir, target_path, atlas_name, responses, atlas_overlay=atlas_overlay)
+            write_review_report(
+                base_dir,
+                target_path,
+                atlas_name,
+                responses,
+                atlas_overlay=atlas_overlay,
+                global_summary=summary_state["text"],
+            )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
             target_path = _temp_report_path(overview_path.name)
-            write_review_report(base_dir, target_path, atlas_name, responses, atlas_overlay=atlas_overlay)
+            write_review_report(
+                base_dir,
+                target_path,
+                atlas_name,
+                responses,
+                atlas_overlay=atlas_overlay,
+                global_summary=summary_state["text"],
+            )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate overview report: {exc}"}, status_code=500)
         return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
@@ -1165,6 +1401,7 @@ localStorage.removeItem('last_idx');
                 responses,
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
+                global_summary=summary_state["text"],
             )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
@@ -1176,6 +1413,7 @@ localStorage.removeItem('last_idx');
                 responses,
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
+                global_summary=summary_state["text"],
             )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate selected report: {exc}"}, status_code=500)
@@ -1195,6 +1433,7 @@ def generate_details_report(
 ) -> Path:
     base_dir = base_dir.resolve()
     _configure_overlay_transform(overlay_transform)
+    summary_text = _load_review_summary(base_dir)
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
@@ -1205,7 +1444,15 @@ def generate_details_report(
         prefix = _prefix_from_label(session_label)
         name = f"{prefix}Screening_details.pdf"
         target_path = base_dir / name
-    write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay, atlas_overlay=atlas_overlay)
+    write_selected_report(
+        base_dir,
+        target_path,
+        atlas_name,
+        responses,
+        overlay=overlay,
+        atlas_overlay=atlas_overlay,
+        global_summary=summary_text,
+    )
     return target_path
 
 

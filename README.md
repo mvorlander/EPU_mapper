@@ -8,7 +8,7 @@ The screenshot shows the reviewing app.
 ![UI overview](images/UI_overview.png)
 
 **Top left pannel:** 
-- Shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. You can adjust contrast via **Show MRC for selected image** on the right. 
+- Shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. You can adjust contrast via **Show MRC for selected image** on the right. Zoom stays inside the viewer window, and **Pan** lets you drag around the zoomed image.
 
 **Right panel:**
 - Allows you to add comments and a rating of the square. If you click the checkbox on the right, screening images from that square will be included in a final PDF report. A minimal report showing only the user rating and comments next to the atlas will always be created.
@@ -107,10 +107,21 @@ and Windows builds use.
   before launching, or pass `--grid-label MyRun` / `--session-label MyRun` to
   the wrapper/Windows launcher. The resulting files become
   `MyRun_Screening_overview.pdf` and `MyRun_Screening_details.pdf`.
+- **Add one session-level summary sentence** – after the final GridSquare, the
+  completion page includes a text field for a single summary sentence that is
+  included in generated reports.
 - **Skip the UI and export everything** – add `--details-only`
   (alias: `--export-all-details`) to the command to render the detailed PDF for
   *every* GridSquare, then exit immediately. Use `--details-output path/to/out.pdf`
   if you want to override the default filename.
+
+### GridSquare Order
+
+- GridSquares are displayed in acquisition order based on timestamps parsed from
+  `GridSquare_YYYYMMDD_HHMMSS.jpg` file names (earliest first), which should
+  better match EPU acquisition screenshots.
+- If timestamps are missing/unparseable, the app falls back to `GridSquare_<ID>`
+  numeric ordering.
 
 
 ### Troubleshooting (ports)
@@ -187,6 +198,8 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
   collection, including foil/data thumbnails plus metadata.
 - `review_responses.json` – the persisted ratings, comments, and inclusion
   flags, written next to the disc so you can resume later.
+- `review_summary.txt` – optional one-line session summary entered on the final
+  page before downloading reports.
 
 Use the web UI to download either report once you finish reviewing. The app’s
 sole goal is to surface the best GridSquares/FoilHoles for downstream data
