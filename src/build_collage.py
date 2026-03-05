@@ -27,6 +27,7 @@ import threading
 import urllib.parse
 import webbrowser
 import textwrap
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -290,6 +291,217 @@ def _load_image(path: Path, mode: str | None = None) -> Image.Image | None:
             return im.copy()
     except Exception:
         return None
+
+
+_ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, tuple[float, float]], float | None, float | None]] = {}
+
+
+def _local_tag(tag: str | None) -> str:
+    if not tag:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1].lower()
+    return tag.lower()
+
+
+def _as_float(text: str | None) -> float | None:
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _atlas_dm_candidates(atlas_path: Path) -> list[Path]:
+    candidates = [
+        atlas_path.with_suffix(".dm"),
+        atlas_path.parent / "Atlas.dm",
+        atlas_path.parent / f"{atlas_path.stem}.dm",
+    ]
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(resolved)
+    return ordered
+
+
+def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    try:
+        root = ET.parse(dm_path).getroot()
+    except Exception:
+        return centers
+
+    for parent in root.iter():
+        if not _local_tag(parent.tag).startswith("keyvaluepairofintnodexml"):
+            continue
+        key_node = None
+        value_node = None
+        for child in list(parent):
+            child_name = _local_tag(child.tag)
+            if child_name == "key":
+                key_node = child
+            elif child_name == "value":
+                value_node = child
+        if key_node is None or value_node is None or not key_node.text:
+            continue
+        key = key_node.text.strip()
+        if not key:
+            continue
+        pos_node = None
+        for node in value_node.iter():
+            if _local_tag(node.tag) == "positionontheatlas":
+                pos_node = node
+                break
+        if pos_node is None:
+            continue
+        center_node = None
+        for node in list(pos_node):
+            if _local_tag(node.tag) == "center":
+                center_node = node
+                break
+        if center_node is None:
+            continue
+        center_x = None
+        center_y = None
+        for node in list(center_node):
+            name = _local_tag(node.tag)
+            if name == "x":
+                center_x = _as_float(node.text)
+            elif name == "y":
+                center_y = _as_float(node.text)
+        if center_x is None or center_y is None:
+            continue
+        centers[key] = (center_x, center_y)
+    return centers
+
+
+def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float, float]]) -> tuple[float | None, float | None]:
+    atlas_mrc = atlas_path.with_suffix(".mrc")
+    if atlas_mrc.is_file():
+        try:
+            with mrcfile.open(atlas_mrc, permissive=True) as mrc:
+                width = float(mrc.header.nx)
+                height = float(mrc.header.ny)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            pass
+    if centers:
+        max_x = max(v[0] for v in centers.values())
+        max_y = max(v[1] for v in centers.values())
+        return max_x + 1.0, max_y + 1.0
+    return None, None
+
+
+def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]], float | None, float | None]:
+    key = atlas_path.resolve()
+    cached = _ATLAS_MAPPING_CACHE.get(key)
+    if cached is not None:
+        return cached
+    dm_path = next((path for path in _atlas_dm_candidates(key) if path.is_file()), None)
+    if dm_path is None:
+        result = ({}, None, None)
+        _ATLAS_MAPPING_CACHE[key] = result
+        return result
+    centers = _parse_atlas_dm_centers(dm_path)
+    if not centers:
+        result = ({}, None, None)
+        _ATLAS_MAPPING_CACHE[key] = result
+        return result
+    ref_w, ref_h = _atlas_reference_dimensions(key, centers)
+    result = (centers, ref_w, ref_h)
+    _ATLAS_MAPPING_CACHE[key] = result
+    return result
+
+
+def _atlas_lookup_keys(grid_dir: Path, grid_id: int | float | None) -> list[str]:
+    keys: list[str] = []
+    if grid_id is not None:
+        try:
+            keys.append(str(int(grid_id)))
+        except Exception:
+            pass
+    keys.append(grid_dir.name)
+    digits = "".join(ch for ch in grid_dir.name if ch.isdigit())
+    if digits:
+        keys.append(digits)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for key in keys:
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def _atlas_center_for_grid(
+    centers: dict[str, tuple[float, float]],
+    grid_dir: Path,
+    grid_id: int | float | None,
+) -> tuple[float, float] | None:
+    for key in _atlas_lookup_keys(grid_dir, grid_id):
+        if key in centers:
+            return centers[key]
+    return None
+
+
+def _atlas_with_grid_markers(
+    atlas_img: Image.Image,
+    atlas_path: Path | None,
+    marker_items: list[tuple[int, Path, int | float | None, bool]],
+) -> Image.Image:
+    if atlas_path is None or not marker_items:
+        return atlas_img
+    centers, ref_w, ref_h = _load_atlas_mapping(atlas_path)
+    if not centers:
+        return atlas_img
+
+    rendered = atlas_img.convert("RGB").copy()
+    width, height = rendered.size
+    scale_x = width / ref_w if ref_w and ref_w > 0 else 1.0
+    scale_y = height / ref_h if ref_h and ref_h > 0 else 1.0
+    draw = ImageDraw.Draw(rendered, "RGBA")
+    radius = max(12, int(min(width, height) * 0.018))
+    ring_width = max(2, radius // 5)
+    font = _get_font(max(16, int(radius * 1.2))) or ImageFont.load_default()
+
+    for label_idx, grid_dir, grid_id, highlight in marker_items:
+        center = _atlas_center_for_grid(centers, grid_dir, grid_id)
+        if center is None:
+            continue
+        cx = center[0] * scale_x
+        cy = center[1] * scale_y
+        if not (0 <= cx < width and 0 <= cy < height):
+            continue
+        fill_rgba = (220, 55, 55, 210) if highlight else (36, 109, 217, 190)
+        edge_rgba = (145, 24, 24, 255) if highlight else (14, 68, 151, 255)
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=fill_rgba,
+            outline=edge_rgba,
+            width=ring_width,
+        )
+        text = str(label_idx)
+        if hasattr(draw, "textbbox"):
+            box = draw.textbbox((0, 0), text, font=font)
+            text_w = box[2] - box[0]
+            text_h = box[3] - box[1]
+        else:
+            text_w, text_h = font.getsize(text)
+        tx = cx - text_w / 2
+        ty = cy - text_h / 2
+        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0, 210), font=font)
+        draw.text((tx, ty), text, fill=(255, 255, 255, 255), font=font)
+
+    return rendered
 
 
 @lru_cache(maxsize=16)
@@ -1224,38 +1436,82 @@ def _resolve_atlas_path(atlas_name: str, grid_dir: Path, base_dir: Path) -> Path
     """Resolve an atlas path robustly.
 
     Tries (in order):
-    - if atlas_name is absolute and exists -> that path
+    - if atlas_name is absolute image path -> that path
+    - if atlas_name is an absolute directory -> pick Atlas_*.jpg/png from it
     - grid_dir / atlas_name
     - base_dir / atlas_name
     - any file named atlas_name anywhere under base_dir (first match)
     - atlas_name relative to CWD
     Returns Path or None.
     """
+
+    def _choose_from_dir(directory: Path) -> Path | None:
+        if not directory.is_dir():
+            return None
+        patterns = (
+            "Atlas_*.jpg",
+            "Atlas_*.jpeg",
+            "Atlas_*.png",
+            "atlas_*.jpg",
+            "atlas_*.jpeg",
+            "atlas_*.png",
+            "*.jpg",
+            "*.jpeg",
+            "*.png",
+        )
+        matches: list[Path] = []
+        for pattern in patterns:
+            matches = [p for p in directory.glob(pattern) if p.is_file()]
+            if matches:
+                break
+        if not matches:
+            return None
+        def _mtime(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except Exception:
+                return 0.0
+        matches.sort(key=lambda p: (_mtime(p), p.name), reverse=True)
+        return matches[0]
+
+    def _resolve_candidate(candidate: Path) -> Path | None:
+        if candidate.is_file():
+            return candidate
+        if candidate.is_dir():
+            return _choose_from_dir(candidate)
+        return None
+
     if not atlas_name:
         return None
     p = Path(atlas_name)
     # absolute
-    if p.is_absolute() and p.is_file():
-        return p
+    if p.is_absolute():
+        resolved = _resolve_candidate(p)
+        if resolved is not None:
+            return resolved
     # relative to grid_dir
     cand = grid_dir / atlas_name
-    if cand.is_file():
-        return cand
+    resolved = _resolve_candidate(cand)
+    if resolved is not None:
+        return resolved
     # relative to base_dir
     cand = base_dir / atlas_name
-    if cand.is_file():
-        return cand
+    resolved = _resolve_candidate(cand)
+    if resolved is not None:
+        return resolved
     # search recursively under base_dir
     try:
         for f in base_dir.rglob(atlas_name):
-            if f.is_file():
-                return f
+            resolved = _resolve_candidate(f)
+            if resolved is not None:
+                return resolved
     except Exception:
         pass
     # finally try relative to cwd
     cand = Path(atlas_name)
-    if cand.is_file():
-        return cand
+    resolved = _resolve_candidate(cand)
+    if resolved is not None:
+        return resolved
     return None
 
 
@@ -1647,7 +1903,13 @@ document.addEventListener('keydown', (e)=>{
     print(f"Wrote review report to {report_out}")
 
 
-def write_review_report(base_dir: Path, report_file: Path, atlas_name: str | None, responses: dict):
+def write_review_report(
+    base_dir: Path,
+    report_file: Path,
+    atlas_name: str | None,
+    responses: dict,
+    atlas_overlay: bool = True,
+):
     """Generate a single-page PDF with atlas (left) and ratings/comments (right) in a compact format."""
     grids = _collect_grids(base_dir)
     if not grids:
@@ -1680,17 +1942,25 @@ def write_review_report(base_dir: Path, report_file: Path, atlas_name: str | Non
     y_offset = margin
 
     atlas_img = None
+    atlas_path_for_report = None
     if atlas_name:
         for _, g in grids:
             atlas_path = _resolve_atlas_path(atlas_name, g, base_dir)
             if atlas_path:
                 atlas_img = _load_image(atlas_path, "RGB")
                 if atlas_img is not None:
+                    atlas_path_for_report = atlas_path
                     break
 
     atlas_panel = Image.new("RGB", (left_col_w, atlas_box_h), color=(245, 245, 245))
     if atlas_img is not None:
         atlas_copy = atlas_img.convert("RGB")
+        if atlas_overlay and atlas_path_for_report is not None:
+            marker_items = [
+                (idx, gdir, gid, False)
+                for idx, (gid, gdir) in enumerate(grids, start=1)
+            ]
+            atlas_copy = _atlas_with_grid_markers(atlas_copy, atlas_path_for_report, marker_items)
         atlas_copy.thumbnail((left_col_w - 20, atlas_box_h - 20), Image.LANCZOS)
         ox = (left_col_w - atlas_copy.width) // 2
         oy = (atlas_box_h - atlas_copy.height) // 2
@@ -1763,23 +2033,30 @@ def write_review_report(base_dir: Path, report_file: Path, atlas_name: str | Non
     page.save(report_file, "PDF", resolution=300)
 
 
-def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | None, responses: dict, overlay: bool = False):
+def write_selected_report(
+    base_dir: Path,
+    report_file: Path,
+    atlas_name: str | None,
+    responses: dict,
+    overlay: bool = False,
+    atlas_overlay: bool = True,
+):
     """Generate a PDF with only the included GridSquares."""
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
     include_list = []
-    for idx, (_gid, gdir) in enumerate(grids, start=1):
+    for idx, (gid, gdir) in enumerate(grids, start=1):
         resp = responses.get(gdir.name)
         if resp and bool(resp.get("include")):
-            include_list.append((idx, gdir, resp))
+            include_list.append((idx, gid, gdir, resp))
     failed: list[tuple[str, str]] = []
     _ensure_pdf_fonts()
     pdf = pdf_canvas.Canvas(str(report_file))
     if not include_list:
         _draw_pdf_message_page(pdf, ["No GridSquares selected for this report."])
     else:
-        for idx, gdir, resp in include_list:
+        for idx, gid, gdir, resp in include_list:
             grid_name = gdir.name
             try:
                 grid_image_path = find_grid_image(gdir)
@@ -1793,10 +2070,18 @@ def write_selected_report(base_dir: Path, report_file: Path, atlas_name: str | N
                 print(f"[selected_report] skipping {grid_name}: unable to load grid image {grid_image_path}")
                 continue
             atlas_img_local = None
+            atlas_path_local = None
             if atlas_name:
                 atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir)
                 if atlas_path:
+                    atlas_path_local = atlas_path
                     atlas_img_local = _load_image(atlas_path, "RGB")
+                    if atlas_overlay and atlas_img_local is not None:
+                        atlas_img_local = _atlas_with_grid_markers(
+                            atlas_img_local,
+                            atlas_path_local,
+                            [(idx, gdir, gid, True)],
+                        )
             overlay_img_local = None
             if overlay:
                 overlay_path = _find_overlay_image(gdir, base_dir)

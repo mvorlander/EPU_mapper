@@ -8,7 +8,7 @@ The screenshot shows the reviewing app.
 ![UI overview](images/UI_overview.png)
 
 **Top left pannel:** 
-- Shows the current Gridsquare image by default. If you click on any other image, the last-clicked image is shown there instead. You can adjust the contrast by clicking on the "Show MRC to adjust contrast..." button on the right. 
+- Shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. You can adjust contrast via **Show MRC for selected image** on the right. 
 
 **Right panel:**
 - Allows you to add comments and a rating of the square. If you click the checkbox on the right, screening images from that square will be included in a final PDF report. A minimal report showing only the user rating and comments next to the atlas will always be created.
@@ -20,8 +20,9 @@ The screenshot shows the reviewing app.
 
 - Point the app at the **session root** (the directory that contains `EpuSession.dm`,
 `Metadata/`, and one or more `Images-Disc*` subfolders).
-- A **screenshot of the Atlas** showing the GridSquares you selected for screening: 
-optional but strongly recommended so you know which gridsquare you are looking at 
+- Atlas input (optional but strongly recommended):
+  - **Preferred (new mode):** an **Atlas root directory** that contains `Atlas_*.jpg` (or `.png`) plus metadata (`.dm`; optional `.mrc` for contrast).
+  - **Legacy mode:** a static atlas screenshot (`.jpg`/`.png`) without metadata-based highlighting.
 
 <details>
 <summary>Advanced path options</summary>
@@ -50,8 +51,8 @@ Images-Disc1/
 ```
 
 The `.dm` files inside `Metadata/` plus the top-level `EpuSession.dm` are used to plot the FoilHole positions onto the GridSquare images.
-Store the atlas JPEG anywhere that is readable by the machine running the app
-so the `--atlas` (or `ATLAS_JPEG`) flag can pick it up quickly.
+For atlas mapping, pass `--atlas` as either an atlas image path or an atlas
+directory.
 
 ## Windows Installer
 
@@ -59,9 +60,13 @@ so the `--atlas` (or `ATLAS_JPEG`) flag can pick it up quickly.
    [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
 2. Double-click the installer and accept the defaults (the installer bundles
    Python, so no extra dependencies are needed).
-3. Launch **EPU Mapper Review** from the Start Menu desktop shortcut, choose
-   your session root (or `Images-Disc*` folder) plus an atlas JPEG, and click
-   **Start review**.
+3. Launch **EPU Mapper Review** from the Start Menu shortcut, choose your
+   session root (or `Images-Disc*` folder), then select one Atlas mode:
+   - **Use EPU atlas data** (default): provide the Atlas root directory.
+   - **Use atlas screenshot with screened GridSquares**: provide a static atlas image.
+   Click **Start review**.
+4. Overlay transform is now under **Show advanced settings** (hidden by
+   default in the launcher).
 
 Advanced packaging details for maintainers are documented separately in
 `windows/README.md`.
@@ -81,7 +86,7 @@ conda activate epu-mapper
 **Usage**
 
 ```bash
-./scripts/run_review_app.sh /path/to/session_root --atlas /path/to/atlas.jpg --host 127.0.0.1 --port 8000 --open
+./scripts/run_review_app.sh /path/to/session_root --atlas /path/to/Atlas --host 127.0.0.1 --port 8000 --open
 ```
 <details>
 If you prefer to target a specific disc directly, replace `/path/to/session_root`
@@ -155,6 +160,24 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
   `/tmp/outdir`.
 
 </details>
+
+## Atlas Marker Overlay
+
+- When you provide an atlas image via `--atlas`, the app now tries to read
+  `Atlas.dm` from the same folder and marks the currently reviewed GridSquare
+  directly on the atlas panel.
+- `--atlas` accepts either an atlas image file or an atlas directory. If you
+  pass a directory, the app auto-picks the latest matching `Atlas_*.jpg/.png`.
+- If the atlas JPG is downsampled, marker coordinates are scaled automatically
+  (using `Atlas_*.mrc` dimensions when present).
+- If no atlas metadata is found, the app falls back to the plain atlas image.
+  Use `--no-atlas-overlay` to disable this overlay behavior.
+- In the Windows launcher, this behavior maps to:
+  - **Use EPU atlas data** → metadata-based atlas overlays in UI/PDF
+  - **Use atlas screenshot with screened GridSquares** → static atlas mode
+- The atlas panel is clickable: selecting it enables `Show MRC` (if
+  `Atlas_*.mrc` is present), the same contrast sliders, and zoom controls
+  (`Zoom -`, `Zoom +`, `Reset zoom`) used for the main image viewer.
 
 ## Outputs
 

@@ -2,7 +2,6 @@ import argparse
 import io
 import errno
 import json
-import json
 import os
 import re
 import sys
@@ -11,11 +10,13 @@ import time
 import tempfile
 import webbrowser
 import threading
+import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, JSONResponse
+from PIL import Image, ImageDraw, ImageFont
 import uvicorn
 
 from build_collage import (
@@ -57,6 +58,218 @@ def _format_meta(meta: dict) -> list[str]:
 _OVERLAY_TOOLS: tuple | None = None
 _OVERLAY_TRANSFORM: str | None = None
 _OVERLAY_EVENTS: deque = deque(maxlen=200)
+_ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, tuple[float, float]], float | None, float | None, str | None]] = {}
+
+
+def _local_tag(tag: str | None) -> str:
+    if not tag:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1].lower()
+    return tag.lower()
+
+
+def _as_float(text: str | None) -> float | None:
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _atlas_dm_candidates(atlas_path: Path) -> list[Path]:
+    candidates = [
+        atlas_path.with_suffix(".dm"),
+        atlas_path.parent / "Atlas.dm",
+        atlas_path.parent / f"{atlas_path.stem}.dm",
+    ]
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(resolved)
+    return ordered
+
+
+def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    try:
+        root = ET.parse(dm_path).getroot()
+    except Exception:
+        return centers
+
+    for parent in root.iter():
+        if not _local_tag(parent.tag).startswith("keyvaluepairofintnodexml"):
+            continue
+        key_node = None
+        value_node = None
+        for child in list(parent):
+            name = _local_tag(child.tag)
+            if name == "key":
+                key_node = child
+            elif name == "value":
+                value_node = child
+        if key_node is None or value_node is None or not key_node.text:
+            continue
+        key = key_node.text.strip()
+        if not key:
+            continue
+
+        pos_node = None
+        for node in value_node.iter():
+            if _local_tag(node.tag) == "positionontheatlas":
+                pos_node = node
+                break
+        if pos_node is None:
+            continue
+
+        center_node = None
+        for node in list(pos_node):
+            if _local_tag(node.tag) == "center":
+                center_node = node
+                break
+        if center_node is None:
+            continue
+
+        center_x = None
+        center_y = None
+        for node in list(center_node):
+            name = _local_tag(node.tag)
+            if name == "x":
+                center_x = _as_float(node.text)
+            elif name == "y":
+                center_y = _as_float(node.text)
+        if center_x is None or center_y is None:
+            continue
+        centers[key] = (center_x, center_y)
+    return centers
+
+
+def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float, float]]) -> tuple[float | None, float | None]:
+    atlas_mrc = atlas_path.with_suffix(".mrc")
+    if atlas_mrc.is_file():
+        try:
+            import mrcfile  # local import to avoid hard dependency at module import
+
+            with mrcfile.open(atlas_mrc, permissive=True) as mrc:
+                w = float(mrc.header.nx)
+                h = float(mrc.header.ny)
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception:
+            pass
+    if centers:
+        max_x = max(v[0] for v in centers.values())
+        max_y = max(v[1] for v in centers.values())
+        return max_x + 1.0, max_y + 1.0
+    return None, None
+
+
+def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]], float | None, float | None, str | None]:
+    atlas_key = atlas_path.resolve()
+    cached = _ATLAS_MAPPING_CACHE.get(atlas_key)
+    if cached is not None:
+        return cached
+
+    dm_path = next((p for p in _atlas_dm_candidates(atlas_key) if p.is_file()), None)
+    if dm_path is None:
+        result = ({}, None, None, "Atlas marker unavailable: Atlas.dm metadata not found.")
+        _ATLAS_MAPPING_CACHE[atlas_key] = result
+        return result
+
+    centers = _parse_atlas_dm_centers(dm_path)
+    if not centers:
+        result = ({}, None, None, f"Atlas marker unavailable: could not parse GridSquare centers from {dm_path.name}.")
+        _ATLAS_MAPPING_CACHE[atlas_key] = result
+        return result
+
+    ref_w, ref_h = _atlas_reference_dimensions(atlas_key, centers)
+    result = (centers, ref_w, ref_h, None)
+    _ATLAS_MAPPING_CACHE[atlas_key] = result
+    return result
+
+
+def _atlas_lookup_keys(grid_dir: Path, grid_id: int | float) -> list[str]:
+    keys: list[str] = []
+    keys.append(str(grid_id))
+    keys.append(grid_dir.name)
+    digits = "".join(ch for ch in grid_dir.name if ch.isdigit())
+    if digits:
+        keys.append(digits)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for key in keys:
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def _render_atlas_overlay(
+    atlas_path: Path,
+    centers: dict[str, tuple[float, float]],
+    active_key: str,
+    ref_w: float | None,
+    ref_h: float | None,
+    label: str,
+) -> bytes | None:
+    if active_key not in centers:
+        return None
+    try:
+        with Image.open(atlas_path) as atlas_image:
+            atlas_rgb = atlas_image.convert("RGB")
+    except Exception:
+        return None
+
+    width, height = atlas_rgb.size
+    scale_x = width / ref_w if ref_w and ref_w > 0 else 1.0
+    scale_y = height / ref_h if ref_h and ref_h > 0 else 1.0
+    center_x_raw, center_y_raw = centers[active_key]
+    center_x = center_x_raw * scale_x
+    center_y = center_y_raw * scale_y
+    if not (0 <= center_x < width and 0 <= center_y < height):
+        return None
+
+    draw = ImageDraw.Draw(atlas_rgb, "RGBA")
+    radius = max(12, int(min(width, height) * 0.035))
+    ring_width = max(3, radius // 5)
+    draw.ellipse(
+        (center_x - radius, center_y - radius, center_x + radius, center_y + radius),
+        fill=(220, 40, 40, 60),
+        outline=(220, 40, 40, 240),
+        width=ring_width,
+    )
+    cross = int(radius * 1.6)
+    cross_width = max(2, radius // 6)
+    draw.line((center_x - cross, center_y, center_x + cross, center_y), fill=(220, 40, 40, 240), width=cross_width)
+    draw.line((center_x, center_y - cross, center_x, center_y + cross), fill=(220, 40, 40, 240), width=cross_width)
+
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    if font is not None:
+        text = label
+        if hasattr(draw, "textbbox"):
+            box = draw.textbbox((0, 0), text, font=font)
+            text_w = box[2] - box[0]
+            text_h = box[3] - box[1]
+        else:
+            text_w, text_h = font.getsize(text)
+        text_x = min(max(8, center_x + radius + 10), max(8, width - text_w - 8))
+        text_y = min(max(8, center_y - radius - text_h - 8), max(8, height - text_h - 8))
+        draw.rectangle((text_x - 4, text_y - 3, text_x + text_w + 4, text_y + text_h + 3), fill=(255, 255, 255, 200))
+        draw.text((text_x, text_y), text, fill=(150, 25, 25, 255), font=font)
+
+    buf = io.BytesIO()
+    atlas_rgb.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _sanitize_label(label: str | None) -> str:
@@ -215,6 +428,7 @@ def create_app(
     overlay: bool = False,
     overlay_transform: str | None = "identity",
     session_label: str | None = None,
+    atlas_overlay: bool = True,
 ) -> FastAPI:
     _configure_overlay_transform(overlay_transform)
     base_dir = base_dir.resolve()
@@ -244,6 +458,20 @@ def create_app(
         grid_img = find_grid_image(gdir)
         mrc_path = find_grid_mrc(gdir)
         atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir) if atlas_name else None
+        atlas_mrc_path = _find_mrc_for_jpg(atlas_path) if atlas_path else None
+        atlas_centers: dict[str, tuple[float, float]] = {}
+        atlas_ref_w: float | None = None
+        atlas_ref_h: float | None = None
+        atlas_center_key: str | None = None
+        atlas_overlay_message: str | None = None
+        if atlas_overlay and atlas_path and atlas_path.is_file():
+            atlas_centers, atlas_ref_w, atlas_ref_h, atlas_overlay_message = _load_atlas_mapping(atlas_path)
+            for lookup_key in _atlas_lookup_keys(gdir, _gid):
+                if lookup_key in atlas_centers:
+                    atlas_center_key = lookup_key
+                    break
+            if atlas_center_key is None and atlas_centers and atlas_overlay_message is None:
+                atlas_overlay_message = "GridSquare not found in Atlas metadata."
         foils, datas = gather_foil_and_data(gdir)
         foils = _latest_only(foils)
         datas = _latest_only(datas)
@@ -274,6 +502,12 @@ def create_app(
                 "name": grid_img.name,
                 "mrc": mrc_path,
                 "atlas": atlas_path,
+                "atlas_mrc": atlas_mrc_path,
+                "atlas_centers": atlas_centers,
+                "atlas_ref_w": atlas_ref_w,
+                "atlas_ref_h": atlas_ref_h,
+                "atlas_center_key": atlas_center_key,
+                "atlas_overlay_message": atlas_overlay_message,
                 "overlay": overlay_path,
                 "overlay_message": overlay_message,
                 "foils": foil_list,
@@ -308,15 +542,30 @@ def create_app(
         nodata_html = "" if has_data else "<div class=\"note warn\">No screening data available for this GridSquare.</div>"
         grid_has_mrc = bool(item["mrc"])
         grid_mrc_json = "true" if grid_has_mrc else "false"
+        atlas_has_mrc = bool(item.get("atlas_mrc"))
+        atlas_mrc_json = "true" if atlas_has_mrc else "false"
         grid_mrc_note = "" if grid_has_mrc else "<div class=\"note\">No grid MRC available.</div>"
         ts = int(time.time() * 1000)
+        default_kind = "atlas" if item["atlas"] else "grid"
+        default_label = "Atlas" if default_kind == "atlas" else "GridSquare"
+        default_src = f"/atlas?idx={idx}&t={ts}" if default_kind == "atlas" else f"/grid?idx={idx}&t={ts}"
+        default_has_mrc_json = atlas_mrc_json if default_kind == "atlas" else grid_mrc_json
+        atlas_note_html = ""
         if item["atlas"]:
-            atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\"/>"
+            atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\" data-kind=\"atlas\" data-has-mrc=\"{1 if atlas_has_mrc else 0}\"/>"
+            if item.get("atlas_center_key"):
+                atlas_note_html = "<div class=\"note\">Current GridSquare is marked in red.</div>"
+            elif item.get("atlas_overlay_message"):
+                atlas_note_html = f"<div class=\"note\">{item['atlas_overlay_message']}</div>"
         else:
-            atlas_html = "<div class=\"atlas-placeholder\"><div class=\"placeholder-title\">Atlas not provided</div><div class=\"placeholder-note\">Add an atlas JPEG/PNG and launch with <code>--atlas atlas.jpg</code> (or the launcher field) so reviewers can align squares quickly.</div></div>"
+            atlas_html = (
+                "<div class=\"atlas-placeholder\"><div class=\"placeholder-title\">Atlas not provided</div>"
+                "<div class=\"placeholder-note\">Add an atlas JPEG/PNG or atlas directory and launch with "
+                "<code>--atlas /path/to/Atlas</code> (or the launcher field) so reviewers can align squares quickly.</div></div>"
+            )
         grid_frame_html = (
-            f"<div class=\"image-frame\"><div class=\"image-caption\">GridSquare view</div>"
-            f"<img id=\"gridimg\" src=\"/grid?idx={idx}&t={ts}\"/></div>"
+            f"<div class=\"image-frame\"><div id=\"viewer-caption\" class=\"image-caption\">Viewer: {default_label} (last clicked image)</div>"
+            f"<img id=\"gridimg\" src=\"{default_src}\"/></div>"
         )
         overlay_html = ""
         overlay_inline_notice = ""
@@ -366,6 +615,8 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .image-caption{{font-size:13px;font-weight:600;color:#222;}}
 .image-frame img{{width:100%;max-width:var(--img-size);max-height:var(--img-size);height:auto;object-fit:contain;display:block;}}
 .atlas-img{{max-width:100%;height:auto;display:block;}}
+.atlas-img.selected{{outline:2px solid #1b6ef3;border-radius:6px;}}
+#gridimg{{transform-origin:center center;transition:transform 0.15s ease;}}
 .actions{{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;}}
 .btn{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;}}
 .btn:hover{{background:#f0f2f5;}}
@@ -414,6 +665,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div class=\"card\">
 <div class=\"section-title\">Atlas</div>
 {atlas_html}
+{atlas_note_html}
 </div>
 <div class=\"card status-card\">
 <div class=\"section-title\">Background tasks</div>
@@ -430,13 +682,18 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <button type=\"button\" id=\"skip\" class=\"btn\">Skip</button>
 </div>
 <div class=\"section-title\">Selected image</div>
-<div id=\"selected-image\" class=\"note\">GridSquare</div>
+<div id=\"selected-image\" class=\"note\">{default_label}</div>
 <div class=\"actions\">
 <button type=\"button\" id=\"show-jpeg\" class=\"btn\">Show JPEG</button>
-<button type=\"button\" id=\"show-mrc\" class=\"btn\">Show MRC to adjust contrast of last-clicked image</button>
+<button type=\"button\" id=\"show-mrc\" class=\"btn\">Show MRC for selected image</button>
+<button type=\"button\" id=\"zoom-out\" class=\"btn\">Zoom -</button>
+<button type=\"button\" id=\"zoom-in\" class=\"btn\">Zoom +</button>
+<button type=\"button\" id=\"zoom-reset\" class=\"btn\">Reset zoom</button>
 </div>
+<div id=\"zoom-level\" class=\"note\">Zoom: 100%</div>
 {grid_mrc_note}
-<div class=\"note\">When viewing MRCs you can fine-tune the current image using the sliders below.</div>
+<div class=\"note\">Viewer defaults to the Atlas when available. Click Atlas, GridSquare, FoilHole, or Data images to switch what is shown here.</div>
+<div class=\"note\">Use MRC + sliders for contrast and zoom controls for detail inspection.</div>
 <div id=\"contrast-panel\" style=\"display:none;margin-bottom:8px;\">
 <div>Low: <span id=\"lowv\">2</span>% <input type=\"range\" id=\"low\" min=\"0\" max=\"99\" value=\"2\"></div>
 <div>High: <span id=\"highv\">98</span>% <input type=\"range\" id=\"high\" min=\"1\" max=\"100\" value=\"98\"></div>
@@ -457,14 +714,18 @@ const TOTAL_GRIDS = {total_len};
 const NEXT_IDX = {next_idx_val};
 const PREV_IDX = {prev_idx_val};
 const GRID_HAS_MRC = {grid_mrc_json};
+const ATLAS_HAS_MRC = {atlas_mrc_json};
+const DEFAULT_KIND = {json.dumps(default_kind)};
+const DEFAULT_HAS_MRC = {default_has_mrc_json};
 const STORAGE_KEY = 'review_state_' + IDX;
 localStorage.setItem('last_idx', IDX);
 const commentEl = document.getElementById('comment');
 const includeEl = document.getElementById('include-report');
 let rating = 3;
-let selectedKind = 'grid';
+let selectedKind = DEFAULT_KIND;
 let selectedName = '';
-let selectedHasMrc = GRID_HAS_MRC;
+let selectedHasMrc = DEFAULT_HAS_MRC;
+let zoomLevel = 1.0;
 let allowPersist = false;
 function hideLoading(){{
   const overlay = document.getElementById('loading-overlay');
@@ -511,6 +772,7 @@ document.getElementById('skip').onclick = () => {{ rating = 0; submitReview(); }
 setRating(3);
 function jpgUrl(kind,name){{
   if (kind === 'grid') return '/grid?idx=' + IDX + '&t=' + Date.now();
+  if (kind === 'atlas') return '/atlas?idx=' + IDX + '&t=' + Date.now();
   if (kind === 'foil') return '/foil?idx=' + IDX + '&name=' + encodeURIComponent(name) + '&t=' + Date.now();
   return '/data?idx=' + IDX + '&name=' + encodeURIComponent(name) + '&t=' + Date.now();
 }}
@@ -522,21 +784,55 @@ function mrcUrl(){{
 function updateButtons(){{
   document.getElementById('show-mrc').disabled = !selectedHasMrc;
 }}
+function applyZoom(){{
+  const img = document.getElementById('gridimg');
+  img.style.transform = 'scale(' + zoomLevel.toFixed(3) + ')';
+  document.getElementById('zoom-level').textContent = 'Zoom: ' + Math.round(zoomLevel * 100) + '%';
+}}
+function setZoom(value){{
+  zoomLevel = Math.max(0.5, Math.min(4.0, value));
+  applyZoom();
+}}
+function selectionLabel(kind,name){{
+  if (kind === 'grid') return 'GridSquare';
+  if (kind === 'atlas') return 'Atlas';
+  if (kind === 'foil') return name ? ('FoilHole: ' + name) : 'FoilHole';
+  if (kind === 'data') return name ? ('Data image: ' + name) : 'Data image';
+  return name ? (kind + ': ' + name) : kind;
+}}
 function selectImage(kind,name,hasMrc){{
   selectedKind = kind;
   selectedName = name || '';
   selectedHasMrc = !!hasMrc;
-  const label = kind === 'grid' ? 'GridSquare' : (kind + ': ' + name);
+  const label = selectionLabel(kind, name);
   document.getElementById('selected-image').textContent = label;
+  const viewerCaption = document.getElementById('viewer-caption');
+  if (viewerCaption) {{
+    viewerCaption.textContent = 'Viewer: ' + label + ' (last clicked image)';
+  }}
   document.getElementById('gridimg').src = jpgUrl(kind,name);
   document.getElementById('contrast-panel').style.display = 'none';
+  setZoom(1.0);
   updateButtons();
   document.querySelectorAll('.thumb').forEach(t=>t.classList.toggle('selected', t.dataset.kind === kind && t.dataset.name === name));
+  const atlasImg = document.getElementById('atlasimg');
+  if (atlasImg) {{
+    atlasImg.classList.toggle('selected', kind === 'atlas');
+  }}
 }}
 Array.from(document.querySelectorAll('.thumb')).forEach(t=>{{
   t.onclick = () => selectImage(t.dataset.kind, t.dataset.name, t.dataset.hasMrc === '1');
 }});
 document.getElementById('gridimg').onclick = () => selectImage('grid','',GRID_HAS_MRC);
+const atlasImg = document.getElementById('atlasimg');
+if (atlasImg) {{
+  atlasImg.onclick = () => selectImage('atlas', '', ATLAS_HAS_MRC);
+}}
+if (DEFAULT_KIND === 'atlas' && atlasImg) {{
+  selectImage('atlas', '', ATLAS_HAS_MRC);
+}} else {{
+  selectImage('grid', '', GRID_HAS_MRC);
+}}
 function updateContrast(){{
   const lowEl = document.getElementById('low');
   const highEl = document.getElementById('high');
@@ -558,6 +854,9 @@ document.getElementById('show-mrc').onclick = () => {{
 document.getElementById('show-jpeg').onclick = () => {{
   document.getElementById('gridimg').src = jpgUrl(selectedKind, selectedName);
 }};
+document.getElementById('zoom-in').onclick = () => setZoom(zoomLevel * 1.25);
+document.getElementById('zoom-out').onclick = () => setZoom(zoomLevel / 1.25);
+document.getElementById('zoom-reset').onclick = () => setZoom(1.0);
 function persistState(){{
   const data = {{
     rating,
@@ -583,6 +882,7 @@ includeEl.addEventListener('change', persistState);
 document.getElementById('low').oninput = updateContrast;
 document.getElementById('high').oninput = updateContrast;
 updateButtons();
+applyZoom();
 document.getElementById('submit').onclick = submitReview;
 document.addEventListener('keydown', (e)=>{{
   if (e.key >= '1' && e.key <= '5') {{ setRating(parseInt(e.key)); }}
@@ -656,9 +956,23 @@ if (lastIdx !== null){{
     def atlas(idx: int):
         if idx < 0 or idx >= len(items):
             raise HTTPException(status_code=404)
-        atlas_path = items[idx]["atlas"]
+        item = items[idx]
+        atlas_path = item["atlas"]
         if not atlas_path or not atlas_path.is_file():
             raise HTTPException(status_code=404)
+        atlas_center_key = item.get("atlas_center_key")
+        atlas_centers = item.get("atlas_centers") or {}
+        if atlas_center_key and atlas_center_key in atlas_centers:
+            payload = _render_atlas_overlay(
+                atlas_path,
+                atlas_centers,
+                atlas_center_key,
+                item.get("atlas_ref_w"),
+                item.get("atlas_ref_h"),
+                f"GridSquare {item['id']}",
+            )
+            if payload:
+                return Response(content=payload, media_type="image/png")
         return FileResponse(atlas_path)
 
     @app.get("/overlay")
@@ -695,6 +1009,8 @@ if (lastIdx !== null){{
         mrc_path = None
         if kind == "grid":
             mrc_path = items[idx]["mrc"]
+        elif kind == "atlas":
+            mrc_path = items[idx].get("atlas_mrc")
         elif kind == "foil":
             for p in items[idx]["foils"]:
                 if p["path"].name == name:
@@ -828,11 +1144,11 @@ localStorage.removeItem('last_idx');
         overview_path, _details_path = _report_paths()
         target_path = overview_path
         try:
-            write_review_report(base_dir, target_path, atlas_name, responses)
+            write_review_report(base_dir, target_path, atlas_name, responses, atlas_overlay=atlas_overlay)
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
             target_path = _temp_report_path(overview_path.name)
-            write_review_report(base_dir, target_path, atlas_name, responses)
+            write_review_report(base_dir, target_path, atlas_name, responses, atlas_overlay=atlas_overlay)
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate overview report: {exc}"}, status_code=500)
         return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
@@ -842,11 +1158,25 @@ localStorage.removeItem('last_idx');
         _overview_path, details_path = _report_paths()
         target_path = details_path
         try:
-            write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay_enabled)
+            write_selected_report(
+                base_dir,
+                target_path,
+                atlas_name,
+                responses,
+                overlay=overlay_enabled,
+                atlas_overlay=atlas_overlay,
+            )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
             target_path = _temp_report_path(details_path.name)
-            write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay_enabled)
+            write_selected_report(
+                base_dir,
+                target_path,
+                atlas_name,
+                responses,
+                overlay=overlay_enabled,
+                atlas_overlay=atlas_overlay,
+            )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate selected report: {exc}"}, status_code=500)
         return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
@@ -861,6 +1191,7 @@ def generate_details_report(
     details_output: Path | None,
     overlay: bool,
     overlay_transform: str | None,
+    atlas_overlay: bool = True,
 ) -> Path:
     base_dir = base_dir.resolve()
     _configure_overlay_transform(overlay_transform)
@@ -874,14 +1205,18 @@ def generate_details_report(
         prefix = _prefix_from_label(session_label)
         name = f"{prefix}Screening_details.pdf"
         target_path = base_dir / name
-    write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay)
+    write_selected_report(base_dir, target_path, atlas_name, responses, overlay=overlay, atlas_overlay=atlas_overlay)
     return target_path
 
 
 def main():
     parser = argparse.ArgumentParser(description="Web review app for GridSquare folders")
     parser.add_argument("grid_dir", type=Path, help="path to a GridSquare directory, Images-Disc*, or session root")
-    parser.add_argument("--atlas", type=str, help="atlas image name")
+    parser.add_argument(
+        "--atlas",
+        type=str,
+        help="atlas image path/name, or an atlas directory containing Atlas_*.jpg/.png",
+    )
     parser.add_argument("--report", type=Path, help="output PDF path")
     label_env_default = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX")
     parser.add_argument(
@@ -920,6 +1255,19 @@ def main():
         help="Overlay rotation/mirror transform when --overlay is enabled (default: identity; choose 'auto' to detect)",
     )
     parser.add_argument(
+        "--atlas-overlay",
+        dest="atlas_overlay",
+        action="store_true",
+        default=True,
+        help="highlight the current GridSquare on the atlas when Atlas.dm metadata is available (default: on)",
+    )
+    parser.add_argument(
+        "--no-atlas-overlay",
+        dest="atlas_overlay",
+        action="store_false",
+        help="disable atlas GridSquare highlighting",
+    )
+    parser.add_argument(
         "--images-subdir",
         type=str,
         help="Name of the Images-Disc* subdirectory when pointing at a session root (defaults to IMAGES_SUBDIR env or auto-detect)",
@@ -944,6 +1292,7 @@ def main():
                 args.details_output,
                 args.overlay,
                 overlay_transform,
+                atlas_overlay=args.atlas_overlay,
             )
         except RuntimeError as exc:
             print(f"[review_app] {exc}", file=sys.stderr)
@@ -960,6 +1309,7 @@ def main():
         args.overlay,
         overlay_transform,
         session_label=args.session_label,
+        atlas_overlay=args.atlas_overlay,
     )
     if args.open:
         url = f"http://{args.host}:{args.port}"

@@ -23,6 +23,12 @@ REPO_ROOT = SCRIPT_PATH.parent.parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8000"
 DEFAULT_LABEL = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX") or ""
+ATLAS_MODE_EPU = "epu"
+ATLAS_MODE_STATIC = "static"
+ATLAS_MODE_OPTIONS = [
+    ("Use EPU atlas data (Recommended)", ATLAS_MODE_EPU),
+    ("Use atlas screenshot with screened GridSquares", ATLAS_MODE_STATIC),
+]
 TRANSFORM_OPTIONS = [
     ("Identity (default)", "identity"),
     ("Auto detect", "auto"),
@@ -64,6 +70,7 @@ def _review_command(
     host: str,
     port: str,
     atlas_path: str,
+    atlas_overlay: bool,
     overlay_enabled: bool,
     transform: str,
     *,
@@ -79,6 +86,10 @@ def _review_command(
     cmd.extend(["--host", host, "--port", port, "--overlay-transform", transform])
     if atlas_path:
         cmd.extend(["--atlas", atlas_path])
+    if atlas_overlay:
+        cmd.append("--atlas-overlay")
+    else:
+        cmd.append("--no-atlas-overlay")
     if overlay_enabled:
         cmd.append("--overlay")
     else:
@@ -149,18 +160,41 @@ class ReviewLauncher:
         self.recent_combo.grid(row=3, column=0, sticky="we")
         self.recent_combo.bind("<<ComboboxSelected>>", self._select_recent_session)
 
-        ttk.Label(frm, text="Atlas screenshot (optional but recommended):").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        self.atlas_var = tk.StringVar(value=self.preferences.get("last_atlas", ""))
-        atlas_entry = ttk.Entry(frm, textvariable=self.atlas_var, width=70)
-        atlas_entry.grid(row=5, column=0, sticky="we")
-        ttk.Button(frm, text="Browse", command=self.browse_atlas).grid(row=5, column=1, padx=(6, 0))
+        ttk.Label(frm, text="Atlas mode:").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.atlas_mode_var = tk.StringVar(value=self.preferences.get("atlas_mode", ATLAS_MODE_EPU))
+        if self.atlas_mode_var.get() not in (ATLAS_MODE_EPU, ATLAS_MODE_STATIC):
+            self.atlas_mode_var.set(ATLAS_MODE_EPU)
+        atlas_mode_frame = ttk.Frame(frm)
+        atlas_mode_frame.grid(row=5, column=0, columnspan=2, sticky="w")
+        for idx, (label, value) in enumerate(ATLAS_MODE_OPTIONS):
+            ttk.Radiobutton(
+                atlas_mode_frame,
+                text=label,
+                value=value,
+                variable=self.atlas_mode_var,
+                command=self._on_atlas_mode_change,
+            ).grid(row=idx, column=0, sticky="w", pady=(0 if idx == 0 else 2, 0))
 
-        ttk.Label(frm, text="Session/Grid label (optional):").grid(row=6, column=0, sticky="w", pady=(10, 0))
+        self.atlas_root_var = tk.StringVar(
+            value=self.preferences.get("last_atlas_root", self.preferences.get("last_atlas", ""))
+        )
+        self.atlas_file_var = tk.StringVar(value=self.preferences.get("last_atlas_file", ""))
+        self.atlas_var = tk.StringVar()
+        self.atlas_label_text = tk.StringVar()
+        self.atlas_label = ttk.Label(frm, textvariable=self.atlas_label_text)
+        self.atlas_label.grid(row=6, column=0, sticky="w", pady=(10, 0))
+        atlas_entry = ttk.Entry(frm, textvariable=self.atlas_var, width=70)
+        atlas_entry.grid(row=7, column=0, sticky="we")
+        self.atlas_browse_btn = ttk.Button(frm, text="Browse", command=self.browse_atlas)
+        self.atlas_browse_btn.grid(row=7, column=1, padx=(6, 0))
+        self._on_atlas_mode_change(remember_current=False)
+
+        ttk.Label(frm, text="Session/Grid label (optional):").grid(row=8, column=0, sticky="w", pady=(10, 0))
         self.label_var = tk.StringVar(value=self.preferences.get("session_label", DEFAULT_LABEL))
-        ttk.Entry(frm, textvariable=self.label_var, width=40).grid(row=7, column=0, sticky="we")
+        ttk.Entry(frm, textvariable=self.label_var, width=40).grid(row=9, column=0, sticky="we")
 
         options_row = ttk.Frame(frm)
-        options_row.grid(row=8, column=0, columnspan=2, pady=(10, 0), sticky="we")
+        options_row.grid(row=10, column=0, columnspan=2, pady=(10, 0), sticky="we")
         ttk.Label(options_row, text="Host:").grid(row=0, column=0, sticky="w")
         self.host_var = tk.StringVar(value=self.preferences.get("host", DEFAULT_HOST))
         ttk.Entry(options_row, textvariable=self.host_var, width=12).grid(row=0, column=1, padx=(4, 12))
@@ -170,15 +204,27 @@ class ReviewLauncher:
         self.overlay_var = tk.BooleanVar(value=self.preferences.get("overlay", True))
         ttk.Checkbutton(options_row, text="Generate foil overlays", variable=self.overlay_var).grid(row=0, column=4)
 
-        ttk.Label(frm, text="Overlay transform:").grid(row=9, column=0, sticky="w", pady=(10, 0))
-        self.transform_var = tk.StringVar(value=self._transform_label(self.preferences.get("transform", "identity")))
-        transform_box = ttk.Combobox(frm, textvariable=self.transform_var, state="readonly")
-        transform_box["values"] = [label for label, _ in TRANSFORM_OPTIONS]
-        transform_box.current(0)
-        transform_box.grid(row=10, column=0, sticky="we")
+        self.advanced_var = tk.BooleanVar(value=bool(self.preferences.get("show_advanced", False)))
+        ttk.Checkbutton(
+            frm,
+            text="Show advanced settings",
+            variable=self.advanced_var,
+            command=self._toggle_advanced,
+        ).grid(row=11, column=0, sticky="w", pady=(10, 0))
+
+        self.advanced_frame = ttk.Frame(frm)
+        self.advanced_frame.grid(row=12, column=0, columnspan=2, sticky="we")
+        ttk.Label(self.advanced_frame, text="Overlay transform:").grid(row=0, column=0, sticky="w")
+        transform_labels = [label for label, _ in TRANSFORM_OPTIONS]
+        transform_pref = self._transform_label(self.preferences.get("transform", "identity"))
+        self.transform_var = tk.StringVar(value=transform_pref if transform_pref in transform_labels else transform_labels[0])
+        transform_box = ttk.Combobox(self.advanced_frame, textvariable=self.transform_var, state="readonly")
+        transform_box["values"] = transform_labels
+        transform_box.grid(row=1, column=0, sticky="we", pady=(4, 0))
+        self._toggle_advanced()
 
         btn_row = ttk.Frame(frm)
-        btn_row.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="we")
+        btn_row.grid(row=13, column=0, columnspan=2, pady=(12, 0), sticky="we")
         self.launch_btn = ttk.Button(btn_row, text="Start review", command=self.start_server)
         self.launch_btn.grid(row=0, column=0, sticky="w")
         ttk.Button(btn_row, text="Stop", command=self.stop_server).grid(row=0, column=1, padx=(10, 0))
@@ -197,10 +243,50 @@ class ReviewLauncher:
         if path:
             self.session_var.set(path)
 
+    def _atlas_mode(self) -> str:
+        mode = self.atlas_mode_var.get()
+        if mode in (ATLAS_MODE_EPU, ATLAS_MODE_STATIC):
+            return mode
+        return ATLAS_MODE_EPU
+
+    def _store_atlas_input(self) -> None:
+        current = self.atlas_var.get().strip()
+        if self._atlas_mode() == ATLAS_MODE_EPU:
+            self.atlas_root_var.set(current)
+        else:
+            self.atlas_file_var.set(current)
+
+    def _current_atlas_path(self) -> str:
+        return self.atlas_var.get().strip()
+
+    def _on_atlas_mode_change(self, remember_current: bool = True) -> None:
+        if remember_current:
+            self._store_atlas_input()
+        mode = self._atlas_mode()
+        if mode == ATLAS_MODE_EPU:
+            self.atlas_label_text.set("Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):")
+            self.atlas_var.set(self.atlas_root_var.get().strip())
+        else:
+            self.atlas_label_text.set("Atlas screenshot file (JPG/PNG):")
+            self.atlas_var.set(self.atlas_file_var.get().strip())
+
+    def _toggle_advanced(self) -> None:
+        if self.advanced_var.get():
+            self.advanced_frame.grid()
+        else:
+            self.advanced_frame.grid_remove()
+
     def browse_atlas(self) -> None:
-        path = filedialog.askopenfilename(title="Select atlas screenshot", filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All", "*.*")])
+        if self._atlas_mode() == ATLAS_MODE_EPU:
+            path = filedialog.askdirectory(title="Select atlas root directory")
+        else:
+            path = filedialog.askopenfilename(
+                title="Select atlas screenshot",
+                filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All", "*.*")],
+            )
         if path:
             self.atlas_var.set(path)
+            self._store_atlas_input()
 
     def start_server(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -213,7 +299,18 @@ class ReviewLauncher:
         if not Path(session_path).exists():
             messagebox.showerror("Invalid path", "The selected session path does not exist.")
             return
-        atlas_path = self.atlas_var.get().strip()
+        self._store_atlas_input()
+        atlas_path = self._current_atlas_path()
+        atlas_mode = self._atlas_mode()
+        atlas_overlay = atlas_mode == ATLAS_MODE_EPU
+        if atlas_path:
+            atlas_candidate = Path(atlas_path)
+            if atlas_mode == ATLAS_MODE_EPU and not atlas_candidate.is_dir():
+                messagebox.showerror("Invalid atlas path", "In EPU atlas mode, please choose the atlas root directory.")
+                return
+            if atlas_mode == ATLAS_MODE_STATIC and not atlas_candidate.is_file():
+                messagebox.showerror("Invalid atlas path", "In screenshot mode, please choose an atlas image file.")
+                return
         host = self.host_var.get().strip() or DEFAULT_HOST
         port = self.port_var.get().strip() or DEFAULT_PORT
         transform_value = self.transform_var.get()
@@ -225,6 +322,7 @@ class ReviewLauncher:
             host,
             port,
             atlas_path,
+            atlas_overlay,
             self.overlay_var.get(),
             transform,
             session_label=label or None,
@@ -245,7 +343,7 @@ class ReviewLauncher:
             messagebox.showerror("Failed to launch", f"Could not start review_app: {exc}")
             return
         self._remember_session(session_path)
-        self._persist_preferences(transform, atlas_path)
+        self._persist_preferences(transform)
         self.launch_btn.configure(state="disabled")
         threading.Thread(target=self._stream_output, daemon=True).start()
         self._log(f"Started server on {host}:{port}. Close the browser tab when finished.\n")
@@ -261,7 +359,18 @@ class ReviewLauncher:
         if not Path(session_path).exists():
             messagebox.showerror("Invalid path", "The selected session path does not exist.")
             return
-        atlas_path = self.atlas_var.get().strip()
+        self._store_atlas_input()
+        atlas_path = self._current_atlas_path()
+        atlas_mode = self._atlas_mode()
+        atlas_overlay = atlas_mode == ATLAS_MODE_EPU
+        if atlas_path:
+            atlas_candidate = Path(atlas_path)
+            if atlas_mode == ATLAS_MODE_EPU and not atlas_candidate.is_dir():
+                messagebox.showerror("Invalid atlas path", "In EPU atlas mode, please choose the atlas root directory.")
+                return
+            if atlas_mode == ATLAS_MODE_STATIC and not atlas_candidate.is_file():
+                messagebox.showerror("Invalid atlas path", "In screenshot mode, please choose an atlas image file.")
+                return
         transform_value = self.transform_var.get()
         transform = self._transform_value(transform_value)
         host = self.host_var.get().strip() or DEFAULT_HOST
@@ -272,6 +381,7 @@ class ReviewLauncher:
             host,
             port,
             atlas_path,
+            atlas_overlay,
             self.overlay_var.get(),
             transform,
             session_label=label or None,
@@ -281,7 +391,7 @@ class ReviewLauncher:
         self._set_details_running(True)
         threading.Thread(
             target=self._run_details_job,
-            args=(cmd, session_path, atlas_path, transform),
+            args=(cmd, session_path, transform),
             daemon=True,
         ).start()
 
@@ -327,7 +437,8 @@ class ReviewLauncher:
         self.session_history = self.session_history[:5]
         self.recent_combo["values"] = self.session_history
 
-    def _persist_preferences(self, transform: str, atlas_path: str) -> None:
+    def _persist_preferences(self, transform: str) -> None:
+        self._store_atlas_input()
         prefs = {
             "sessions": self.session_history,
             "host": self.host_var.get().strip() or DEFAULT_HOST,
@@ -335,8 +446,12 @@ class ReviewLauncher:
             "transform": transform,
             "overlay": bool(self.overlay_var.get()),
             "last_session": self.session_var.get().strip(),
-            "last_atlas": atlas_path,
+            "atlas_mode": self._atlas_mode(),
+            "last_atlas_root": self.atlas_root_var.get().strip(),
+            "last_atlas_file": self.atlas_file_var.get().strip(),
+            "last_atlas": self._current_atlas_path(),
             "session_label": self.label_var.get().strip(),
+            "show_advanced": bool(self.advanced_var.get()),
         }
         path = self._prefs_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -361,7 +476,7 @@ class ReviewLauncher:
         self.proc = None
         self.root.after(0, lambda: self.launch_btn.configure(state="normal"))
 
-    def _run_details_job(self, cmd: list[str], session_path: str, atlas_path: str, transform: str) -> None:
+    def _run_details_job(self, cmd: list[str], session_path: str, transform: str) -> None:
         env = self._build_env()
         self._log("Generating detailed PDF for all GridSquares…\n")
         try:
@@ -385,7 +500,7 @@ class ReviewLauncher:
         if ret == 0:
             self._log("Detailed PDF export finished.\n")
             self.root.after(0, lambda: self._remember_session(session_path))
-            self.root.after(0, lambda: self._persist_preferences(transform, atlas_path))
+            self.root.after(0, lambda: self._persist_preferences(transform))
             self.root.after(0, lambda: messagebox.showinfo("Export complete", "Detailed PDF generated successfully."))
         else:
             self._log(f"Detailed export failed (exit code {ret}).\n")

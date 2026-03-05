@@ -27,10 +27,12 @@ try:
     matplotlib.use("Agg")  # type: ignore[attr-defined]
     import matplotlib.pyplot as plt  # type: ignore
     from matplotlib.patches import Circle  # type: ignore
+    import matplotlib.patheffects as path_effects  # type: ignore
 except Exception:  # matplotlib is optional at import time
     matplotlib = None
     plt = None
     Circle = None
+    path_effects = None
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -867,16 +869,24 @@ def plot_overlay(
         ax.add_patch(circle)
         ax.plot([px - radius * 0.55, px + radius * 0.55], [py, py], color=color, lw=0.8)
         ax.plot([px, px], [py - radius * 0.55, py + radius * 0.55], color=color, lw=0.8)
-        ax.text(
+        label_text = ax.text(
             px + radius + 2,
             py - radius,
             str(label),
-            color=color,
+            color="#ffffff",
             fontsize=font_size,
             fontweight="bold",
             va="top",
             ha="left",
+            bbox=dict(
+                boxstyle="round,pad=0.15",
+                facecolor=(0.0, 0.0, 0.0, 0.58),
+                edgecolor=color,
+                linewidth=0.6,
+            ),
         )
+        if path_effects is not None:
+            label_text.set_path_effects([path_effects.withStroke(linewidth=1.1, foreground="black")])
 
     heading = title or "FoilHole positions"
     ax.set_title(heading, fontsize=13, fontweight="bold", pad=6)
