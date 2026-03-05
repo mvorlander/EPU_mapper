@@ -1,9 +1,12 @@
 import argparse
+import csv
 import io
 import errno
+import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import urllib.parse
 import time
@@ -31,6 +34,7 @@ from build_collage import (
     write_selected_report,
     _resolve_atlas_path,
     parse_metadata,
+    parse_grid_info,
 )
 
 
@@ -285,6 +289,8 @@ def _prefix_from_label(label: str | None) -> str:
 
 
 _SUMMARY_MAX_LEN = 300
+_DRAFT_MAX_LEN = 5000
+_THUMB_DEFAULT_SIZE = 280
 
 
 def _summary_file_path(base_dir: Path) -> Path:
@@ -319,6 +325,127 @@ def _save_review_summary(base_dir: Path, text: str | None) -> str:
     except Exception:
         pass
     return normalized
+
+
+def _drafts_file_path(base_dir: Path) -> Path:
+    return base_dir / "review_drafts.json"
+
+
+def _load_json_dict(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_json_dict(path: Path, payload: dict) -> None:
+    try:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _preflight_checks(
+    base_dir: Path,
+    grids: list[tuple[int | float, Path]],
+    atlas_name: str | None,
+    overlay_requested: bool,
+    overlay_enabled: bool,
+    atlas_overlay: bool,
+) -> dict[str, list[str]]:
+    checks: dict[str, list[str]] = {"errors": [], "warnings": [], "info": []}
+    checks["info"].append(f"Detected {len(grids)} GridSquare directories under {base_dir}.")
+    session_root, metadata_dir = _find_session_components(base_dir)
+    if session_root is not None:
+        checks["info"].append(f"Session root detected: {session_root}")
+    else:
+        checks["warnings"].append("Session root (EpuSession.dm) not detected in parent folders.")
+    if metadata_dir is not None:
+        checks["info"].append(f"Metadata folder detected: {metadata_dir}")
+    else:
+        checks["warnings"].append("Metadata folder not detected in parent folders.")
+
+    if overlay_requested and not overlay_enabled:
+        checks["warnings"].append("Foil overlay was requested but disabled due to missing session metadata.")
+    elif overlay_requested and overlay_enabled:
+        checks["info"].append("Foil overlay generation enabled.")
+
+    readout_scales: dict[str, tuple[float, float]] = {}
+    missing_xml = 0
+    missing_grid_mrc = 0
+    for gid, gdir in grids:
+        try:
+            grid_img = find_grid_image(gdir)
+        except Exception:
+            checks["errors"].append(f"{gdir.name}: no GridSquare JPEG found.")
+            continue
+        grid_xml = gdir / grid_img.with_suffix(".xml").name
+        if not grid_xml.is_file():
+            missing_xml += 1
+            checks["warnings"].append(f"{gdir.name}: grid XML missing ({grid_xml.name}); some mapping checks skipped.")
+        else:
+            try:
+                grid_info = parse_grid_info(grid_xml)
+            except Exception as exc:
+                checks["warnings"].append(f"{gdir.name}: failed to parse grid XML ({exc}).")
+                grid_info = {}
+            readout_w = grid_info.get("readout_width")
+            readout_h = grid_info.get("readout_height")
+            if readout_w and readout_h:
+                try:
+                    scale_x = float(grid_img.width) / float(readout_w)
+                    scale_y = float(grid_img.height) / float(readout_h)
+                    readout_scales[gdir.name] = (scale_x, scale_y)
+                    if abs(scale_x - scale_y) > 0.02:
+                        checks["warnings"].append(
+                            f"{gdir.name}: anisotropic readout scaling detected (x={scale_x:.3f}, y={scale_y:.3f})."
+                        )
+                except Exception:
+                    pass
+        if find_grid_mrc(gdir) is None:
+            missing_grid_mrc += 1
+
+    if missing_xml == 0:
+        checks["info"].append("Grid XML files detected for all GridSquares.")
+    if missing_grid_mrc:
+        checks["warnings"].append(f"{missing_grid_mrc} GridSquares are missing MRC files (JPEG still available).")
+
+    if readout_scales:
+        unique_scales = sorted({(round(v[0], 3), round(v[1], 3)) for v in readout_scales.values()})
+        if len(unique_scales) == 1:
+            sx, sy = unique_scales[0]
+            checks["info"].append(f"Readout/image scaling appears consistent (x={sx:.3f}, y={sy:.3f}).")
+        else:
+            scale_str = ", ".join(f"x={sx:.3f},y={sy:.3f}" for sx, sy in unique_scales[:6])
+            checks["warnings"].append(
+                "Mixed readout/image scales detected across GridSquares "
+                f"({scale_str}). This usually indicates mixed camera binning or export settings."
+            )
+
+    if atlas_name:
+        atlas_sample = None
+        for _gid, gdir in grids:
+            atlas_candidate = _resolve_atlas_path(atlas_name, gdir, base_dir)
+            if atlas_candidate and atlas_candidate.is_file():
+                atlas_sample = atlas_candidate
+                break
+        if atlas_sample is None:
+            checks["warnings"].append(f"Atlas path '{atlas_name}' could not be resolved to an image.")
+        else:
+            checks["info"].append(f"Atlas image resolved: {atlas_sample}")
+            if atlas_overlay:
+                centers, _ref_w, _ref_h, atlas_msg = _load_atlas_mapping(atlas_sample)
+                if centers:
+                    checks["info"].append(f"Atlas metadata contains {len(centers)} GridSquare center entries.")
+                elif atlas_msg:
+                    checks["warnings"].append(atlas_msg)
+    else:
+        checks["info"].append("Atlas not configured; atlas panel will show placeholder content.")
+
+    return checks
 
 
 def _configure_overlay_transform(value: str | None):
@@ -467,6 +594,7 @@ def create_app(
     session_label: str | None = None,
     atlas_overlay: bool = True,
 ) -> FastAPI:
+    _OVERLAY_EVENTS.clear()
     _configure_overlay_transform(overlay_transform)
     base_dir = base_dir.resolve()
     label_prefix = _prefix_from_label(session_label)
@@ -487,6 +615,21 @@ def create_app(
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
+    preflight_state = _preflight_checks(
+        base_dir,
+        grids,
+        atlas_name,
+        overlay_requested=bool(overlay),
+        overlay_enabled=overlay_enabled,
+        atlas_overlay=atlas_overlay,
+    )
+    if preflight_state["errors"]:
+        detail = "\n".join(f"- {msg}" for msg in preflight_state["errors"])
+        raise RuntimeError(f"Preflight checks failed:\n{detail}")
+    for message in preflight_state["warnings"]:
+        _record_status(f"[preflight] {message}")
+    for message in preflight_state["info"][:3]:
+        _record_status(f"[preflight] {message}")
     items = []
     total_grids = len(grids)
     status_state = {"total": total_grids, "loaded": 0}
@@ -554,25 +697,236 @@ def create_app(
         status_state["loaded"] = idx_item
 
     responses_file = base_dir / "review_responses.json"
+    drafts_file = _drafts_file_path(base_dir)
+    summary_state = {"text": _load_review_summary(base_dir)}
+    session_storage_key = hashlib.sha1(str(base_dir).encode("utf-8")).hexdigest()[:16]
+    thumb_cache_dir = Path(tempfile.gettempdir()) / "EPUMapperThumbCache" / session_storage_key
+    thumb_cache_dir.mkdir(parents=True, exist_ok=True)
+    drafts_lock = threading.Lock()
+    report_jobs_lock = threading.Lock()
+    thumb_cache_lock = threading.Lock()
 
     def _load_responses() -> dict[str, dict]:
-        if responses_file.is_file():
-            try:
-                return json.loads(responses_file.read_text())
-            except Exception:
-                return {}
-        return {}
+        loaded = _load_json_dict(responses_file)
+        return {str(k): v for k, v in loaded.items() if isinstance(v, dict)}
 
     def _save_responses(current: dict[str, dict]) -> None:
-        try:
-            responses_file.write_text(json.dumps(current))
-        except Exception:
-            return
+        _save_json_dict(responses_file, current)
+
+    def _load_drafts() -> dict[str, dict]:
+        loaded = _load_json_dict(drafts_file)
+        return {str(k): v for k, v in loaded.items() if isinstance(v, dict)}
+
+    def _save_drafts(current: dict[str, dict]) -> None:
+        _save_json_dict(drafts_file, current)
 
     responses = _load_responses()
-    summary_state = {"text": _load_review_summary(base_dir)}
+    drafts = _load_drafts()
+    report_jobs: dict[str, dict] = {}
 
     app = FastAPI()
+
+    def _item_key(idx: int) -> str:
+        return items[idx]["dir"].name
+
+    def _normalize_review_entry(payload: dict, default_include: bool = False) -> dict:
+        rating_raw = payload.get("rating", 0)
+        try:
+            rating = int(rating_raw)
+        except Exception:
+            try:
+                rating = int(float(rating_raw))
+            except Exception:
+                rating = 0
+        rating = max(0, min(5, rating))
+        comment = str(payload.get("comment", "") or "")
+        if len(comment) > _DRAFT_MAX_LEN:
+            comment = comment[:_DRAFT_MAX_LEN]
+        include = bool(payload.get("include", default_include))
+        updated_at_raw = payload.get("updated_at", time.time())
+        try:
+            updated_at = float(updated_at_raw)
+        except Exception:
+            updated_at = time.time()
+        return {
+            "rating": rating,
+            "comment": comment,
+            "include": include,
+            "updated_at": updated_at,
+        }
+
+    def _resolve_media_path(item: dict, kind: str, name: str | None = None) -> Path | None:
+        if kind == "grid":
+            return item["grid_img"]
+        if kind == "atlas":
+            return item.get("atlas")
+        if kind == "overlay":
+            return item.get("overlay")
+        if kind == "foil":
+            for entry in item["foils"]:
+                if entry["path"].name == (name or ""):
+                    return entry["path"]
+            return None
+        if kind == "data":
+            for entry in item["data"]:
+                if entry["path"].name == (name or ""):
+                    return entry["path"]
+            return None
+        return None
+
+    def _thumb_cache_path(src: Path, size: int) -> Path | None:
+        if not src or not src.is_file():
+            return None
+        try:
+            stat = src.stat()
+        except Exception:
+            return None
+        key_payload = f"{src.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{size}".encode("utf-8")
+        digest = hashlib.sha1(key_payload).hexdigest()
+        return thumb_cache_dir / f"{digest}.jpg"
+
+    def _build_thumb(src: Path, size: int) -> Path | None:
+        cache_path = _thumb_cache_path(src, size)
+        if cache_path is None:
+            return None
+        if cache_path.is_file():
+            return cache_path
+        with thumb_cache_lock:
+            if cache_path.is_file():
+                return cache_path
+            try:
+                with Image.open(src) as img:
+                    thumb = img.convert("RGB")
+                    thumb.thumbnail((size, size), Image.LANCZOS)
+                tmp_path = cache_path.with_suffix(".tmp.jpg")
+                thumb.save(tmp_path, format="JPEG", quality=90, optimize=True)
+                tmp_path.replace(cache_path)
+                return cache_path
+            except Exception:
+                return None
+
+    def _thumbnail_sources() -> list[Path]:
+        sources: list[Path] = []
+        for item in items:
+            sources.append(item["grid_img"])
+            atlas_path = item.get("atlas")
+            if atlas_path:
+                sources.append(atlas_path)
+            overlay_path = item.get("overlay")
+            if overlay_path:
+                sources.append(overlay_path)
+            for entry in item["foils"]:
+                sources.append(entry["path"])
+            for entry in item["data"]:
+                sources.append(entry["path"])
+        unique: dict[Path, None] = {}
+        for path in sources:
+            if path and path.is_file() and path not in unique:
+                unique[path] = None
+        return list(unique.keys())
+
+    def _prime_thumbnail_cache() -> None:
+        sources = _thumbnail_sources()
+        if not sources:
+            return
+        total = len(sources)
+        _record_status(f"[thumb] caching {total} thumbnails in background...")
+        for idx_src, src in enumerate(sources, start=1):
+            _build_thumb(src, _THUMB_DEFAULT_SIZE)
+            if idx_src == 1 or idx_src == total or idx_src % 25 == 0:
+                _record_status(f"[thumb] cached {idx_src}/{total}")
+        _record_status("[thumb] cache ready")
+
+    def _export_rows() -> list[dict]:
+        rows: list[dict] = []
+        for idx_item, item in enumerate(items):
+            name = item["dir"].name
+            response = _normalize_review_entry(responses.get(name, {}), default_include=False)
+            rows.append(
+                {
+                    "index": idx_item + 1,
+                    "gridsquare_id": item["id"],
+                    "gridsquare_dir": name,
+                    "gridsquare_image": item["name"],
+                    "include": bool(response.get("include", False)),
+                    "rating": int(response.get("rating", 0)),
+                    "comment": str(response.get("comment", "")),
+                    "foil_count": len(item["foils"]),
+                    "data_count": len(item["data"]),
+                    "atlas_available": bool(item.get("atlas")),
+                    "overlay_available": bool(item.get("overlay")),
+                }
+            )
+        return rows
+
+    def _export_payload() -> dict:
+        return {
+            "session_root": str(base_dir),
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "summary": summary_state["text"],
+            "rows": _export_rows(),
+        }
+
+    def _job_state(job_id: str) -> dict | None:
+        with report_jobs_lock:
+            job = report_jobs.get(job_id)
+            if job is None:
+                return None
+            snapshot = dict(job)
+        path_value = snapshot.pop("path", None)
+        if path_value:
+            snapshot["download_url"] = f"/report_jobs/{job_id}/download"
+        return snapshot
+
+    def _update_job(job_id: str, **updates) -> None:
+        with report_jobs_lock:
+            job = report_jobs.get(job_id)
+            if job is None:
+                return
+            job.update(updates)
+            job["updated_at"] = time.time()
+
+    def _run_report_job(job_id: str, kind: str) -> None:
+        _update_job(job_id, status="running", progress=10, message="Preparing report...")
+        overview_path, details_path = _report_paths()
+        target_path = overview_path if kind == "overview" else details_path
+
+        def _write_target(path: Path) -> None:
+            if kind == "overview":
+                write_review_report(
+                    base_dir,
+                    path,
+                    atlas_name,
+                    responses,
+                    atlas_overlay=atlas_overlay,
+                    global_summary=summary_state["text"],
+                )
+            else:
+                write_selected_report(
+                    base_dir,
+                    path,
+                    atlas_name,
+                    responses,
+                    overlay=overlay_enabled,
+                    atlas_overlay=atlas_overlay,
+                    global_summary=summary_state["text"],
+                )
+
+        try:
+            _update_job(job_id, progress=35, message="Rendering PDF pages...")
+            _write_target(target_path)
+        except (PermissionError, OSError):
+            target_path = _temp_report_path(target_path.name)
+            _update_job(job_id, progress=55, message="Output directory is not writable; using temporary folder...")
+            try:
+                _write_target(target_path)
+            except Exception as exc:
+                _update_job(job_id, status="error", progress=100, message=f"Failed to generate report: {exc}", error=str(exc))
+                return
+        except Exception as exc:
+            _update_job(job_id, status="error", progress=100, message=f"Failed to generate report: {exc}", error=str(exc))
+            return
+        _update_job(job_id, status="done", progress=100, message="Report ready.", path=str(target_path), filename=target_path.name)
 
     def review_html(idx: int) -> str:
         item = items[idx]
@@ -621,19 +975,40 @@ def create_app(
         if item["foils"]:
             groups = []
             for f in item["foils"]:
-                foil_thumb = f"<img class=\"thumb\" data-kind=\"foil\" data-name=\"{f['path'].name}\" data-has-mrc=\"{1 if f['mrc'] else 0}\" src=\"/foil?idx={idx}&name={urllib.parse.quote(f['path'].name)}\"/>"
+                foil_thumb = (
+                    f"<img class=\"thumb\" loading=\"lazy\" data-kind=\"foil\" data-name=\"{f['path'].name}\" "
+                    f"data-has-mrc=\"{1 if f['mrc'] else 0}\" "
+                    f"src=\"/thumb?idx={idx}&kind=foil&name={urllib.parse.quote(f['path'].name)}&size={_THUMB_DEFAULT_SIZE}\"/>"
+                )
                 data_imgs = []
                 for p in data_by_id.get(f["id"], []):
                     meta_html = ""
                     if p.get("meta"):
                         meta_html = "<div class=\"meta\">" + "<br>".join(p["meta"]) + "</div>"
-                    data_imgs.append(f"<div class=\"data-card\"><img class=\"thumb\" data-kind=\"data\" data-name=\"{p['path'].name}\" data-has-mrc=\"{1 if p['mrc'] else 0}\" src=\"/data?idx={idx}&name={urllib.parse.quote(p['path'].name)}\"/>{meta_html}</div>")
+                    data_imgs.append(
+                        f"<div class=\"data-card\"><img class=\"thumb\" loading=\"lazy\" data-kind=\"data\" "
+                        f"data-name=\"{p['path'].name}\" data-has-mrc=\"{1 if p['mrc'] else 0}\" "
+                        f"src=\"/thumb?idx={idx}&kind=data&name={urllib.parse.quote(p['path'].name)}&size={_THUMB_DEFAULT_SIZE}\"/>{meta_html}</div>"
+                    )
                 data_block = f"<div class=\"thumb-grid\">{''.join(data_imgs)}</div>" if data_imgs else "<div class=\"note\">No data images for this FoilHole.</div>"
                 groups.append(f"<div class=\"foil-group\"><div class=\"foil-row\">{foil_thumb}<div class=\"data-block\">{data_block}</div></div></div>")
             thumb_html = "<div class=\"section-title\">Foil holes and data</div>" + "".join(groups)
         else:
             thumb_html = "<div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div>"
         overlay_banner = overlay_notice_html or ""
+        warning_items = preflight_state.get("warnings", [])[:4]
+        info_items = preflight_state.get("info", [])[:2]
+        preflight_rows = warning_items if warning_items else info_items
+        preflight_level = "warn" if warning_items else "ok"
+        if preflight_rows:
+            preflight_li = "".join(f"<li>{msg}</li>" for msg in preflight_rows)
+            preflight_title = "Preflight checks" if warning_items else "Preflight checks passed"
+            preflight_html = (
+                f"<div class=\"preflight-box\"><div class=\"preflight-title note {preflight_level}\">{preflight_title}</div>"
+                f"<ul class=\"preflight-list\">{preflight_li}</ul></div>"
+            )
+        else:
+            preflight_html = ""
         next_idx_val = idx + 1 if idx + 1 < len(items) else "null"
         prev_idx_val = idx - 1 if idx - 1 >= 0 else "null"
         total_len = len(items)
@@ -669,6 +1044,11 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .rate.active{{background:#1b6ef3;color:#fff;border-color:#1b6ef3;}}
 .note{{color:#555;font-size:13px;margin:6px 0;}}
 .note.warn{{color:#b00020;}}
+.note.ok{{color:#13653f;}}
+.preflight-box{{background:#fbfcff;border:1px solid #d7deea;border-radius:10px;padding:10px;margin-bottom:14px;}}
+.preflight-title{{font-size:13px;font-weight:600;margin-bottom:4px;}}
+.preflight-list{{margin:0;padding-left:18px;font-size:12px;color:#455;}}
+.preflight-list li{{margin:2px 0;}}
 .status-card{{margin-top:16px;}}
 .status-log{{max-height:180px;overflow:auto;font-size:12px;color:#333;background:#fafafa;border-radius:8px;padding:8px;border:1px solid #e1e4e8;}}
 .status-log div{{padding:2px 0;border-bottom:1px solid #eceff3;}}
@@ -687,6 +1067,9 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 .atlas-placeholder{{border:1px dashed #cfd6e4;border-radius:10px;padding:10px;background:#fdfdfd;color:#445;}}
 .atlas-placeholder .placeholder-title{{font-weight:600;margin-bottom:4px;}}
 .atlas-placeholder code{{background:#eef1f6;padding:2px 4px;border-radius:4px;}}
+.shortcut-list{{margin:4px 0 0;padding-left:18px;color:#555;font-size:12px;}}
+.shortcut-list li{{margin:2px 0;}}
+.autosave-state{{font-size:12px;min-height:16px;}}
 #loading-overlay{{position:fixed;inset:0;background:rgba(245,246,248,0.96);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:18px;color:#111;z-index:9999;transition:opacity 0.3s;}}
 #loading-overlay.hidden{{opacity:0;pointer-events:none;}}
 .spinner{{width:40px;height:40px;border:4px solid #d0d7e7;border-top-color:#1b6ef3;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:12px;}}
@@ -699,6 +1082,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div></div><div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div></div>
 {overlay_banner}
 {nodata_html}
+{preflight_html}
 <div class=\"layout\">
 <div class=\"left\">
 {grid_section_html}
@@ -742,11 +1126,18 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div>Low: <span id=\"lowv\">2</span>% <input type=\"range\" id=\"low\" min=\"0\" max=\"99\" value=\"2\"></div>
 <div>High: <span id=\"highv\">98</span>% <input type=\"range\" id=\"high\" min=\"1\" max=\"100\" value=\"98\"></div>
 </div>
+<div class=\"section-title\">Keyboard shortcuts</div>
+<label class=\"note\"><input type=\"checkbox\" id=\"hotkeys-enabled\" checked> Enable keyboard shortcuts</label>
+<ul class=\"shortcut-list\">
+<li>1-5: set rating</li>
+<li>Ctrl/Cmd+Enter: submit current GridSquare</li>
+</ul>
 <div class=\"section-title\">Report</div>
 <label class=\"note\"><input type=\"checkbox\" id=\"include-report\"> Include this GridSquare in the final report</label>
 <div>Selected rating: <span id=\"selected\">3</span></div>
 <div>Comments:</div>
 <textarea id=\"comment\" rows=\"4\"></textarea>
+<div id=\"autosave-state\" class=\"note autosave-state\"></div>
 <div class=\"submit-row\"><button type=\"button\" id=\"submit\" class=\"btn\">Submit (Ctrl+Enter)</button></div>
 <div id=\"submit-status\" class=\"note\"></div>
 </div>
@@ -761,10 +1152,15 @@ const GRID_HAS_MRC = {grid_mrc_json};
 const ATLAS_HAS_MRC = {atlas_mrc_json};
 const DEFAULT_KIND = {json.dumps(default_kind)};
 const DEFAULT_HAS_MRC = {default_has_mrc_json};
-const STORAGE_KEY = 'review_state_' + IDX;
-localStorage.setItem('last_idx', IDX);
+const SESSION_STORAGE_KEY = {json.dumps(session_storage_key)};
+const STORAGE_KEY = 'review_state_' + SESSION_STORAGE_KEY + '_' + IDX;
+const LAST_IDX_KEY = 'last_idx_' + SESSION_STORAGE_KEY;
+const HOTKEYS_KEY = 'hotkeys_enabled_' + SESSION_STORAGE_KEY;
+localStorage.setItem(LAST_IDX_KEY, IDX);
 const commentEl = document.getElementById('comment');
 const includeEl = document.getElementById('include-report');
+const hotkeysEl = document.getElementById('hotkeys-enabled');
+const autosaveEl = document.getElementById('autosave-state');
 let rating = 3;
 let selectedKind = DEFAULT_KIND;
 let selectedName = '';
@@ -780,6 +1176,10 @@ let dragPointerStartX = 0;
 let dragPointerStartY = 0;
 let suppressNextGridClick = false;
 let allowPersist = false;
+let hotkeysEnabled = true;
+let persistTimer = null;
+let saveInFlight = false;
+let pendingSave = false;
 function hideLoading(){{
   const overlay = document.getElementById('loading-overlay');
   overlay.classList.add('hidden');
@@ -795,6 +1195,10 @@ function setRating(v){{
 async function submitReview(){{
   const statusEl = document.getElementById('submit-status');
   statusEl.textContent = 'Submitting...';
+  if (persistTimer) {{
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }}
   try {{
     const payload = {{idx: IDX, rating: rating, comment: document.getElementById('comment').value, include: document.getElementById('include-report').checked}};
     const res = await fetch('/submit', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(payload)}});
@@ -813,6 +1217,7 @@ async function submitReview(){{
       return;
     }}
     localStorage.removeItem(STORAGE_KEY);
+    setAutosaveState('');
     if (data.next === null) {{ window.location = '/done'; }}
     else {{ window.location = '/review/' + data.next; }}
   }} catch (e) {{
@@ -1015,25 +1420,119 @@ document.getElementById('pan-toggle').onclick = () => {{
   updatePanUi();
 }};
 function persistState(){{
+  const nowTs = Date.now() / 1000.0;
   const data = {{
     rating,
     comment: commentEl.value,
-    include: includeEl.checked
+    include: includeEl.checked,
+    updated_at: nowTs
   }};
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  queueServerPersist();
 }}
-function restoreState(){{
+function setAutosaveState(message, isError=false){{
+  if (!autosaveEl) return;
+  autosaveEl.textContent = message || '';
+  autosaveEl.classList.toggle('warn', !!isError);
+  autosaveEl.classList.toggle('ok', !isError && !!message);
+}}
+async function saveDraftToServer(){{
+  if (saveInFlight) {{
+    pendingSave = true;
+    return;
+  }}
+  saveInFlight = true;
+  setAutosaveState('Saving draft…');
+  try {{
+    const payload = {{
+      idx: IDX,
+      rating,
+      comment: commentEl.value,
+      include: includeEl.checked,
+      updated_at: Date.now() / 1000.0
+    }};
+    const res = await fetch('/draft', {{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify(payload)
+    }});
+    if (!res.ok) {{
+      throw new Error('HTTP ' + res.status);
+    }}
+    const data = await res.json();
+    if (data && data.draft) {{
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data.draft));
+    }}
+    setAutosaveState('Draft saved');
+  }} catch (_err) {{
+    setAutosaveState('Draft save failed (local cache kept).', true);
+  }} finally {{
+    saveInFlight = false;
+    if (pendingSave) {{
+      pendingSave = false;
+      queueServerPersist();
+    }}
+  }}
+}}
+function queueServerPersist(){{
+  if (!allowPersist) return;
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {{
+    persistTimer = null;
+    saveDraftToServer();
+  }}, 500);
+}}
+function applyState(data){{
+  if (!data || typeof data !== 'object') return;
+  if (typeof data.comment === 'string') commentEl.value = data.comment;
+  if (typeof data.include === 'boolean') includeEl.checked = data.include;
+  if (typeof data.rating === 'number' && data.rating >= 1 && data.rating <= 5) setRating(data.rating);
+}}
+function restoreLocalState(){{
   const saved = localStorage.getItem(STORAGE_KEY);
-  if (!saved) return;
+  if (!saved) return null;
   try {{
     const data = JSON.parse(saved);
-    if (typeof data.comment === 'string') commentEl.value = data.comment;
-    if (typeof data.include === 'boolean') includeEl.checked = data.include;
-    if (typeof data.rating === 'number' && data.rating >=1 && data.rating <=5) setRating(data.rating);
-  }} catch (e) {{}}
+    applyState(data);
+    return data;
+  }} catch (_err) {{
+    return null;
+  }}
 }}
-restoreState();
-allowPersist = true;
+async function restoreServerState(localData){{
+  let localTs = 0;
+  try {{
+    localTs = localData && typeof localData.updated_at === 'number' ? localData.updated_at : 0;
+  }} catch (_err) {{}}
+  try {{
+    const res = await fetch('/draft?idx=' + IDX + '&t=' + Date.now());
+    if (!res.ok) return;
+    const payload = await res.json();
+    if (!payload || !payload.draft) return;
+    const remote = payload.draft;
+    const remoteTs = typeof remote.updated_at === 'number' ? remote.updated_at : 0;
+    if (!localData || remoteTs >= localTs) {{
+      applyState(remote);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
+    }}
+  }} catch (_err) {{}}
+}}
+function initHotkeysSetting(){{
+  const saved = localStorage.getItem(HOTKEYS_KEY);
+  hotkeysEnabled = saved !== '0';
+  hotkeysEl.checked = hotkeysEnabled;
+  hotkeysEl.addEventListener('change', () => {{
+    hotkeysEnabled = !!hotkeysEl.checked;
+    localStorage.setItem(HOTKEYS_KEY, hotkeysEnabled ? '1' : '0');
+  }});
+}}
+initHotkeysSetting();
+(async () => {{
+  const localDraft = restoreLocalState();
+  if (localDraft) setAutosaveState('Draft restored.');
+  await restoreServerState(localDraft);
+  allowPersist = true;
+}})();
 commentEl.addEventListener('input', persistState);
 includeEl.addEventListener('change', persistState);
 document.getElementById('low').oninput = updateContrast;
@@ -1043,10 +1542,18 @@ updatePanUi();
 applyZoom();
 document.getElementById('submit').onclick = submitReview;
 document.addEventListener('keydown', (e)=>{{
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{
+    e.preventDefault();
+    submitReview();
+    return;
+  }}
+  if (!hotkeysEnabled) return;
+  const activeEl = document.activeElement;
+  if (activeEl) {{
+    const tagName = (activeEl.tagName || '').toLowerCase();
+    if (tagName === 'textarea' || tagName === 'input') return;
+  }}
   if (e.key >= '1' && e.key <= '5') {{ setRating(parseInt(e.key)); }}
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{ submitReview(); }}
-  if (e.key === 'ArrowRight' && NEXT_IDX !== null) {{ window.location = '/review/' + NEXT_IDX; }}
-  if (e.key === 'ArrowLeft' && PREV_IDX !== null) {{ window.location = '/review/' + PREV_IDX; }}
 }});
 async function refreshStatus(){{
   try {{
@@ -1071,7 +1578,7 @@ setInterval(refreshStatus, 5000);
 
     @app.get("/")
     def root():
-        return HTMLResponse("""<html><head><meta charset=\"utf-8\"><title>Grid review</title>
+        root_html = """<html><head><meta charset=\"utf-8\"><title>Grid review</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}
 .page{max-width:900px;margin:0 auto;padding:32px;}
@@ -1080,29 +1587,65 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
 .note{color:#555;font-size:14px;line-height:1.4;margin-bottom:10px;}
 .btn{display:inline-block;margin-top:14px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;margin-right:8px;}
 .btn.secondary{background:#fff;color:#1b6ef3;}
+.preflight{margin-top:14px;padding:10px;border-radius:10px;border:1px solid #d7deea;background:#fbfcff;font-size:13px;}
+.preflight.ok{border-color:#b8d7c3;background:#f5fbf6;}
+.preflight.warn{border-color:#e8d7ad;background:#fffaf0;}
+.preflight.err{border-color:#e7b9b9;background:#fff6f6;}
+.preflight ul{margin:6px 0 0;padding-left:18px;}
 </style>
 </head><body><div class=\"page\"><div class=\"card\"><div class=\"title\">Grid review</div>
 <div class=\"note\">Review GridSquare, FoilHole, and Data images. Click any thumbnail to inspect it. Use "Show MRC" to adjust contrast when available. Rate each GridSquare and leave comments. A PDF report is generated at the end.</div>
 <a class=\"btn\" id=\"start-btn\" href=\"/review/0\">Start review</a>
 <a class=\"btn secondary\" id=\"resume-btn\" style=\"display:none;\" href=\"#\">Resume last visited</a>
+<div id=\"preflight\" class=\"preflight\">Running preflight checks…</div>
 </div></div>
 <script>
 const resumeBtn = document.getElementById('resume-btn');
 const startBtn = document.getElementById('start-btn');
-const lastIdx = localStorage.getItem('last_idx');
+const preflightEl = document.getElementById('preflight');
+const SESSION_STORAGE_KEY = __SESSION_STORAGE_KEY_JSON__;
+const LAST_IDX_KEY = 'last_idx_' + SESSION_STORAGE_KEY;
+const lastIdx = localStorage.getItem(LAST_IDX_KEY);
 if (lastIdx !== null){{
   resumeBtn.style.display = 'inline-block';
   resumeBtn.href = '/review/' + lastIdx;
   resumeBtn.onclick = () => {{ window.location = '/review/' + lastIdx; return false; }};
 }}
+fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
+  const level = data.level || 'ok';
+  preflightEl.classList.remove('ok', 'warn', 'err');
+  preflightEl.classList.add(level === 'ok' ? 'ok' : (level === 'warn' ? 'warn' : 'err'));
+  const rows = (data.errors || []).concat(data.warnings || []).concat((data.info || []).slice(0, 2));
+  if (!rows.length) {{
+    preflightEl.textContent = 'Preflight checks passed.';
+    return;
+  }}
+  preflightEl.innerHTML = '<strong>Preflight</strong><ul>' + rows.slice(0, 6).map(x => '<li>' + x + '</li>').join('') + '</ul>';
+}}).catch(() => {{
+  preflightEl.textContent = 'Preflight status unavailable.';
+}});
 </script>
-</body></html>""")
+</body></html>"""
+        root_html = root_html.replace("__SESSION_STORAGE_KEY_JSON__", json.dumps(session_storage_key))
+        return HTMLResponse(root_html)
 
     @app.get("/review/{idx}")
     def review(idx: int):
         if idx < 0 or idx >= len(items):
             return HTMLResponse("<html><body>Invalid index</body></html>", status_code=404)
         return HTMLResponse(review_html(idx))
+
+    @app.get("/preflight")
+    def preflight():
+        level = "error" if preflight_state["errors"] else ("warn" if preflight_state["warnings"] else "ok")
+        return JSONResponse(
+            {
+                "level": level,
+                "errors": preflight_state["errors"],
+                "warnings": preflight_state["warnings"],
+                "info": preflight_state["info"],
+            }
+        )
 
     @app.get("/grid")
     def grid(idx: int):
@@ -1141,6 +1684,19 @@ if (lastIdx !== null){{
         if not overlay_path or not overlay_path.is_file():
             raise HTTPException(status_code=404)
         return FileResponse(overlay_path, media_type="image/png")
+
+    @app.get("/thumb")
+    def thumb(idx: int, kind: str, name: str = "", size: int = _THUMB_DEFAULT_SIZE):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        safe_size = max(96, min(1024, int(size)))
+        source = _resolve_media_path(items[idx], kind, name)
+        if source is None or not source.is_file():
+            raise HTTPException(status_code=404)
+        cached = _build_thumb(source, safe_size)
+        if cached and cached.is_file():
+            return FileResponse(cached, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+        return FileResponse(source, headers={"Cache-Control": "no-store"})
 
     @app.get("/data")
     def data(idx: int, name: str):
@@ -1212,6 +1768,36 @@ if (lastIdx !== null){{
         img.save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
 
+    @app.get("/draft")
+    def draft(idx: int):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        item_name = _item_key(idx)
+        with drafts_lock:
+            entry = drafts.get(item_name)
+            if not isinstance(entry, dict):
+                entry = None
+        return JSONResponse({"draft": entry})
+
+    @app.post("/draft")
+    async def save_draft(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        try:
+            idx = int(payload.get("idx", -1))
+        except Exception:
+            idx = -1
+        if idx < 0 or idx >= len(items):
+            return JSONResponse({"error": "invalid idx"}, status_code=400)
+        entry = _normalize_review_entry(payload, default_include=False)
+        item_name = _item_key(idx)
+        with drafts_lock:
+            drafts[item_name] = entry
+            _save_drafts(drafts)
+        return JSONResponse({"ok": True, "draft": entry})
+
     @app.post("/submit")
     async def submit(request: Request):
         try:
@@ -1223,21 +1809,20 @@ if (lastIdx !== null){{
                 idx = int(data.get("idx", -1))
             except Exception:
                 idx = -1
-            try:
-                rating = int(data.get("rating", 0))
-            except Exception:
-                try:
-                    rating = int(float(data.get("rating", 0)))
-                except Exception:
-                    rating = 0
-            comment = str(data.get("comment", ""))
-            include = bool(data.get("include", False))
             if idx < 0 or idx >= len(items):
                 return JSONResponse({"next": None})
+            normalized = _normalize_review_entry(data, default_include=False)
+            rating = normalized["rating"]
+            comment = normalized["comment"]
+            include = normalized["include"]
             name = items[idx]["dir"].name
             responses[name] = {"rating": rating, "comment": comment, "include": include}
             _save_responses(responses)
             responses.update(_load_responses())
+            with drafts_lock:
+                if name in drafts:
+                    drafts.pop(name, None)
+                    _save_drafts(drafts)
             next_idx = idx + 1
             if next_idx >= len(items):
                 return JSONResponse({"next": None})
@@ -1279,6 +1864,101 @@ if (lastIdx !== null){{
         temp_root.mkdir(parents=True, exist_ok=True)
         return temp_root / filename
 
+    @app.get("/export.json")
+    def export_json():
+        filename = f"{label_prefix}review_export.json" if label_prefix else "review_export.json"
+        payload = _export_payload()
+        text = json.dumps(payload, indent=2)
+        return Response(
+            content=text,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    @app.get("/export.csv")
+    def export_csv():
+        filename = f"{label_prefix}review_export.csv" if label_prefix else "review_export.csv"
+        rows = _export_rows()
+        columns = [
+            "index",
+            "gridsquare_id",
+            "gridsquare_dir",
+            "gridsquare_image",
+            "include",
+            "rating",
+            "comment",
+            "foil_count",
+            "data_count",
+            "atlas_available",
+            "overlay_available",
+        ]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    @app.post("/report_jobs")
+    async def create_report_job(request: Request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+        kind = str(payload.get("kind", "overview")).strip().lower()
+        if kind not in {"overview", "details"}:
+            return JSONResponse({"error": "kind must be 'overview' or 'details'"}, status_code=400)
+        job_id = secrets.token_urlsafe(8)
+        now = time.time()
+        with report_jobs_lock:
+            report_jobs[job_id] = {
+                "id": job_id,
+                "kind": kind,
+                "status": "queued",
+                "progress": 0,
+                "message": "Queued...",
+                "created_at": now,
+                "updated_at": now,
+            }
+        threading.Thread(target=_run_report_job, args=(job_id, kind), daemon=True).start()
+        return JSONResponse({"job_id": job_id, "job": _job_state(job_id)})
+
+    @app.get("/report_jobs/{job_id}")
+    def report_job_status(job_id: str):
+        state = _job_state(job_id)
+        if state is None:
+            raise HTTPException(status_code=404)
+        return JSONResponse(state)
+
+    @app.get("/report_jobs/{job_id}/download")
+    def report_job_download(job_id: str):
+        state = _job_state(job_id)
+        if state is None:
+            raise HTTPException(status_code=404)
+        if state.get("status") != "done":
+            return JSONResponse({"error": "report not ready"}, status_code=409)
+        with report_jobs_lock:
+            raw = report_jobs.get(job_id, {}).get("path")
+            filename = report_jobs.get(job_id, {}).get("filename", f"{job_id}.pdf")
+        if not raw:
+            raise HTTPException(status_code=404)
+        path = Path(raw)
+        if not path.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(path, media_type="application/pdf", filename=filename, headers={"Cache-Control": "no-store"})
+
     @app.get("/done")
     def done():
         summary_json = json.dumps(summary_state["text"])
@@ -1292,7 +1972,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
 .summary-label{display:block;font-weight:600;margin:14px 0 6px;font-size:14px;}
 textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;padding:8px;font-size:14px;box-sizing:border-box;}
 .btn{display:inline-block;margin-top:10px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;margin-right:8px;}
+.btn.secondary{background:#fff;color:#1b6ef3;}
 #done-status{margin-top:12px;font-size:13px;color:#1b6ef3;}
+.progress-wrap{margin-top:10px;border:1px solid #d7deea;background:#fbfcff;border-radius:10px;padding:10px;display:none;}
+.progress-label{font-size:13px;color:#445;margin-bottom:8px;}
+.progress-track{height:8px;border-radius:999px;background:#dfe5f1;overflow:hidden;}
+.progress-bar{height:100%;width:0%;background:#1b6ef3;transition:width 0.2s linear;}
 </style>
 </head><body><div class="page"><div class="card">
 <div class="title">All GridSquares reviewed</div>
@@ -1300,15 +1985,25 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 <label class="summary-label" for="global-summary">Session summary (one sentence, optional)</label>
 <textarea id="global-summary" rows="2" maxlength="__SUMMARY_MAX_LEN__"></textarea>
 <div><button type="button" class="btn" id="save-summary">Save summary</button></div>
-<div class="note">Then download the PDF summaries below. You can reopen this session later to continue editing notes or regenerate reports.</div>
-<a class="btn" id="report-link" href="/report">Download overview</a>
-<a class="btn" id="selected-link" href="/selected_report">Download details</a>
+<div class="note">Then generate PDF summaries below. You can reopen this session later to continue editing notes or regenerate reports.</div>
+<a class="btn" id="report-link" href="#">Generate overview PDF</a>
+<a class="btn" id="selected-link" href="#">Generate details PDF</a>
+<div class="note">Export structured review data:</div>
+<a class="btn secondary" id="export-csv" href="/export.csv">Download CSV</a>
+<a class="btn secondary" id="export-json" href="/export.json">Download JSON</a>
+<div id="report-progress-wrap" class="progress-wrap">
+  <div id="report-progress-label" class="progress-label">Preparing report…</div>
+  <div class="progress-track"><div id="report-progress-bar" class="progress-bar"></div></div>
+</div>
 <div id="done-status"></div>
 </div></div>
 <script>
 const SUMMARY_INITIAL = __SUMMARY_JSON__;
 const summaryEl = document.getElementById('global-summary');
 const doneStatus = document.getElementById('done-status');
+const progressWrap = document.getElementById('report-progress-wrap');
+const progressLabel = document.getElementById('report-progress-label');
+const progressBar = document.getElementById('report-progress-bar');
 summaryEl.value = SUMMARY_INITIAL || '';
 
 async function saveSummary(showStatus=true){
@@ -1338,27 +2033,78 @@ document.getElementById('save-summary').addEventListener('click', async ()=>{
   }
 });
 
-function prepLink(id,url,msg){
-  const link=document.getElementById(id);
-  link.addEventListener('click',async (ev)=>{
-    ev.preventDefault();
-    doneStatus.textContent=msg;
-    try{
-      await saveSummary(false);
-    }catch(err){
-      doneStatus.textContent = String(err);
+function setProgress(visible, label, pct){
+  progressWrap.style.display = visible ? 'block' : 'none';
+  if (label) progressLabel.textContent = label;
+  if (typeof pct === 'number'){
+    const clamped = Math.max(0, Math.min(100, pct));
+    progressBar.style.width = String(clamped) + '%';
+  }
+}
+
+async function pollReportJob(jobId){
+  while (true){
+    const res = await fetch('/report_jobs/' + encodeURIComponent(jobId) + '?t=' + Date.now());
+    if (!res.ok){
+      throw new Error('Failed to fetch report status (' + res.status + ')');
+    }
+    const job = await res.json();
+    setProgress(true, job.message || 'Generating report…', job.progress || 0);
+    if (job.status === 'done'){
+      doneStatus.textContent = 'Report ready. Download starting…';
+      const dlUrl = (job.download_url || ('/report_jobs/' + encodeURIComponent(jobId) + '/download')) + '?t=' + Date.now();
+      window.location = dlUrl;
       return;
     }
-    window.location = url + '?t=' + Date.now();
-  });
+    if (job.status === 'error'){
+      throw new Error(job.message || 'Report generation failed.');
+    }
+    await new Promise(resolve => setTimeout(resolve, 800));
+  }
 }
-prepLink('report-link','/report','Generating overview PDF…');
-prepLink('selected-link','/selected_report','Generating selected-report PDF…');
-localStorage.removeItem('last_idx');
-</script>
-</body></html>"""
+
+async function startReport(kind, msg){
+  doneStatus.textContent = msg;
+  setProgress(true, 'Submitting report job…', 5);
+  try{
+    await saveSummary(false);
+  }catch(err){
+    setProgress(false, '', 0);
+    doneStatus.textContent = String(err);
+    return;
+  }
+  try{
+    const res = await fetch('/report_jobs', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kind})
+    });
+    const payload = await res.json();
+    if (!res.ok || !payload.job_id){
+      throw new Error(payload.error || ('Failed to create report job (' + res.status + ')'));
+    }
+    await pollReportJob(payload.job_id);
+  }catch(err){
+    doneStatus.textContent = String(err);
+    setProgress(true, 'Report generation failed.', 100);
+  }
+}
+
+document.getElementById('report-link').addEventListener('click', (ev) => {
+  ev.preventDefault();
+  startReport('overview', 'Generating overview PDF…');
+});
+document.getElementById('selected-link').addEventListener('click', (ev) => {
+  ev.preventDefault();
+  startReport('details', 'Generating detailed PDF…');
+});
+	const SESSION_STORAGE_KEY = __SESSION_STORAGE_KEY_JSON__;
+	localStorage.removeItem('last_idx_' + SESSION_STORAGE_KEY);
+	</script>
+	</body></html>"""
         done_html = done_html.replace("__SUMMARY_JSON__", summary_json)
         done_html = done_html.replace("__SUMMARY_MAX_LEN__", str(_SUMMARY_MAX_LEN))
+        done_html = done_html.replace("__SESSION_STORAGE_KEY_JSON__", json.dumps(session_storage_key))
         return HTMLResponse(done_html)
 
     @app.get("/report")
@@ -1418,6 +2164,8 @@ localStorage.removeItem('last_idx');
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate selected report: {exc}"}, status_code=500)
         return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
+
+    threading.Thread(target=_prime_thumbnail_cache, daemon=True).start()
 
     return app
 
