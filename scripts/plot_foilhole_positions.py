@@ -594,18 +594,22 @@ def compute_markers(
     session_info = _load_session_detector_info(grid_dir)
     session_w = session_info.get("detector_width")
     session_h = session_info.get("detector_height")
-    bin_x = session_info.get("binning_x", 1.0) or 1.0
-    bin_y = session_info.get("binning_y", 1.0) or 1.0
-    if session_w:
-        session_w *= bin_x
-    if session_h:
-        session_h *= bin_y
     readout_w = float(grid_meta.get("readout_width")) if grid_meta.get("readout_width") else None
     readout_h = float(grid_meta.get("readout_height")) if grid_meta.get("readout_height") else None
-    base_w = float(session_w or readout_w or grid_image.width or 4096.0)
-    base_h = float(session_h or readout_h or grid_image.height or 4096.0)
+    # Prefer per-GridSquare geometry (readout/image dimensions) over session defaults.
+    # Session-level settings can come from a different acquisition mode/binning.
+    base_w = float(readout_w or grid_image.width or session_w or 4096.0)
+    base_h = float(readout_h or grid_image.height or session_h or 4096.0)
     scale_x = grid_image.width / base_w
     scale_y = grid_image.height / base_h
+    if _OVERLAY_DEBUG:
+        print(
+            "[overlay] geometry "
+            f"grid={grid_image.width}x{grid_image.height} "
+            f"base={base_w:.1f}x{base_h:.1f} "
+            f"readout={readout_w}x{readout_h} "
+            f"session={session_w}x{session_h}"
+        )
     square_stage_x = dm_square_meta.get("stage_x", grid_meta.get("stage_x"))
     square_stage_y = dm_square_meta.get("stage_y", grid_meta.get("stage_y"))
     square_pixel_size = dm_square_meta.get("pixel_size", grid_meta.get("pixel_size"))
