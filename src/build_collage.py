@@ -122,6 +122,15 @@ def _wrap_text_lines(text: str, font_size: float, max_width: float, min_chars: i
     return textwrap.wrap(text, width=approx_chars) or [text]
 
 
+def _format_category_score(value) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return str(int(value))
+    except Exception:
+        return str(value)
+
+
 def find_grid_image(grid_dir: Path) -> Path:
     for entry in grid_dir.iterdir():
         if entry.is_file() and entry.suffix.lower() in (".jpg", ".jpeg"):
@@ -335,7 +344,17 @@ def _load_image(path: Path, mode: str | None = None) -> Image.Image | None:
         return None
 
 
-_ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, tuple[float, float]], float | None, float | None]] = {}
+_ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, dict], float | None, float | None]] = {}
+_EPU_CATEGORY_COLORS: dict[int, tuple[int, int, int]] = {
+    -1: (148, 163, 184),
+    0: (96, 165, 250),
+    1: (74, 222, 128),
+    2: (250, 204, 21),
+    3: (251, 146, 60),
+    4: (239, 68, 68),
+    5: (192, 132, 252),
+    6: (217, 70, 239),
+}
 
 
 def _local_tag(tag: str | None) -> str:
@@ -374,12 +393,12 @@ def _atlas_dm_candidates(atlas_path: Path) -> list[Path]:
     return ordered
 
 
-def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
-    centers: dict[str, tuple[float, float]] = {}
+def _parse_atlas_dm_nodes(dm_path: Path) -> dict[str, dict]:
+    nodes: dict[str, dict] = {}
     try:
         root = ET.parse(dm_path).getroot()
     except Exception:
-        return centers
+        return nodes
 
     for parent in root.iter():
         if not _local_tag(parent.tag).startswith("keyvaluepairofintnodexml"):
@@ -397,35 +416,50 @@ def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
         key = key_node.text.strip()
         if not key:
             continue
+        category_value = None
+        quality_value = None
+        for node in list(value_node):
+            if _local_tag(node.tag) == "category":
+                category_float = _as_float(node.text)
+                if category_float is not None:
+                    category_value = int(round(category_float))
+                break
         pos_node = None
         for node in value_node.iter():
             if _local_tag(node.tag) == "positionontheatlas":
                 pos_node = node
                 break
-        if pos_node is None:
-            continue
-        center_node = None
-        for node in list(pos_node):
-            if _local_tag(node.tag) == "center":
-                center_node = node
-                break
-        if center_node is None:
-            continue
-        center_x = None
-        center_y = None
-        for node in list(center_node):
-            name = _local_tag(node.tag)
-            if name == "x":
-                center_x = _as_float(node.text)
-            elif name == "y":
-                center_y = _as_float(node.text)
-        if center_x is None or center_y is None:
-            continue
-        centers[key] = (center_x, center_y)
-    return centers
+        center = None
+        if pos_node is not None:
+            center_node = None
+            for node in list(pos_node):
+                if _local_tag(node.tag) == "center":
+                    center_node = node
+                    break
+            center_x = None
+            center_y = None
+            if center_node is not None:
+                for node in list(center_node):
+                    name = _local_tag(node.tag)
+                    if name == "x":
+                        center_x = _as_float(node.text)
+                    elif name == "y":
+                        center_y = _as_float(node.text)
+            if center_x is not None and center_y is not None:
+                center = (center_x, center_y)
+            for node in pos_node.iter():
+                if _local_tag(node.tag) == "quality":
+                    quality_value = _as_float(node.text)
+                    break
+        nodes[key] = {
+            "center": center,
+            "category": category_value,
+            "quality": quality_value,
+        }
+    return nodes
 
 
-def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float, float]]) -> tuple[float | None, float | None]:
+def _atlas_reference_dimensions(atlas_path: Path, nodes: dict[str, dict]) -> tuple[float | None, float | None]:
     atlas_mrc = atlas_path.with_suffix(".mrc")
     if atlas_mrc.is_file():
         try:
@@ -436,14 +470,16 @@ def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float
                 return width, height
         except Exception:
             pass
+    centers = [entry.get("center") for entry in nodes.values() if isinstance(entry, dict)]
+    centers = [center for center in centers if center is not None]
     if centers:
-        max_x = max(v[0] for v in centers.values())
-        max_y = max(v[1] for v in centers.values())
+        max_x = max(center[0] for center in centers)
+        max_y = max(center[1] for center in centers)
         return max_x + 1.0, max_y + 1.0
     return None, None
 
 
-def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]], float | None, float | None]:
+def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, dict], float | None, float | None]:
     key = atlas_path.resolve()
     cached = _ATLAS_MAPPING_CACHE.get(key)
     if cached is not None:
@@ -453,13 +489,13 @@ def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]
         result = ({}, None, None)
         _ATLAS_MAPPING_CACHE[key] = result
         return result
-    centers = _parse_atlas_dm_centers(dm_path)
-    if not centers:
+    nodes = _parse_atlas_dm_nodes(dm_path)
+    if not nodes:
         result = ({}, None, None)
         _ATLAS_MAPPING_CACHE[key] = result
         return result
-    ref_w, ref_h = _atlas_reference_dimensions(key, centers)
-    result = (centers, ref_w, ref_h)
+    ref_w, ref_h = _atlas_reference_dimensions(key, nodes)
+    result = (nodes, ref_w, ref_h)
     _ATLAS_MAPPING_CACHE[key] = result
     return result
 
@@ -485,14 +521,41 @@ def _atlas_lookup_keys(grid_dir: Path, grid_id: int | float | None) -> list[str]
 
 
 def _atlas_center_for_grid(
-    centers: dict[str, tuple[float, float]],
+    nodes: dict[str, dict],
     grid_dir: Path,
     grid_id: int | float | None,
 ) -> tuple[float, float] | None:
     for key in _atlas_lookup_keys(grid_dir, grid_id):
-        if key in centers:
-            return centers[key]
+        entry = nodes.get(key)
+        if isinstance(entry, dict):
+            center = entry.get("center")
+            if center is not None:
+                return center
     return None
+
+
+def _atlas_category_for_grid(
+    nodes: dict[str, dict],
+    grid_dir: Path,
+    grid_id: int | float | None,
+) -> int | None:
+    for key in _atlas_lookup_keys(grid_dir, grid_id):
+        entry = nodes.get(key)
+        if not isinstance(entry, dict):
+            continue
+        category_value = entry.get("category")
+        if category_value is not None:
+            try:
+                return int(category_value)
+            except Exception:
+                continue
+    return None
+
+
+def _category_marker_color(category: int | None) -> tuple[int, int, int]:
+    if category is None:
+        return (148, 163, 184)
+    return _EPU_CATEGORY_COLORS.get(category, (99, 102, 241))
 
 
 def _atlas_with_grid_markers(
@@ -502,8 +565,8 @@ def _atlas_with_grid_markers(
 ) -> Image.Image:
     if atlas_path is None or not marker_items:
         return atlas_img
-    centers, ref_w, ref_h = _load_atlas_mapping(atlas_path)
-    if not centers:
+    nodes, ref_w, ref_h = _load_atlas_mapping(atlas_path)
+    if not nodes:
         return atlas_img
 
     rendered = atlas_img.convert("RGB").copy()
@@ -516,15 +579,15 @@ def _atlas_with_grid_markers(
     font = _get_font(max(16, int(radius * 1.2))) or ImageFont.load_default()
 
     for label_idx, grid_dir, grid_id, highlight in marker_items:
-        center = _atlas_center_for_grid(centers, grid_dir, grid_id)
+        center = _atlas_center_for_grid(nodes, grid_dir, grid_id)
         if center is None:
             continue
         cx = center[0] * scale_x
         cy = center[1] * scale_y
         if not (0 <= cx < width and 0 <= cy < height):
             continue
-        fill_rgba = (220, 55, 55, 210) if highlight else (36, 109, 217, 190)
-        edge_rgba = (145, 24, 24, 255) if highlight else (14, 68, 151, 255)
+        fill_rgba = (220, 55, 55, 128) if highlight else (36, 109, 217, 128)
+        edge_rgba = (145, 24, 24, 128) if highlight else (14, 68, 151, 128)
         draw.ellipse(
             (cx - radius, cy - radius, cx + radius, cy + radius),
             fill=fill_rgba,
@@ -540,8 +603,96 @@ def _atlas_with_grid_markers(
             text_w, text_h = font.getsize(text)
         tx = cx - text_w / 2
         ty = cy - text_h / 2
-        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0, 210), font=font)
-        draw.text((tx, ty), text, fill=(255, 255, 255, 255), font=font)
+        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0, 128), font=font)
+        draw.text((tx, ty), text, fill=(255, 255, 255, 128), font=font)
+
+    return rendered
+
+
+def _atlas_with_category_markers(
+    atlas_img: Image.Image,
+    atlas_path: Path | None,
+) -> Image.Image:
+    if atlas_path is None:
+        return atlas_img
+    nodes, ref_w, ref_h = _load_atlas_mapping(atlas_path)
+    if not nodes:
+        return atlas_img
+
+    rendered = atlas_img.convert("RGB").copy()
+    width, height = rendered.size
+    scale_x = width / ref_w if ref_w and ref_w > 0 else 1.0
+    scale_y = height / ref_h if ref_h and ref_h > 0 else 1.0
+    draw = ImageDraw.Draw(rendered, "RGBA")
+    radius = max(8, int(min(width, height) * 0.009))
+    outline_width = max(1, radius // 4)
+    font = _get_font(max(11, int(radius * 1.1))) or ImageFont.load_default()
+
+    seen_categories: set[int | None] = set()
+    for entry in nodes.values():
+        if not isinstance(entry, dict):
+            continue
+        center = entry.get("center")
+        if center is None:
+            continue
+        cx = center[0] * scale_x
+        cy = center[1] * scale_y
+        if not (0 <= cx < width and 0 <= cy < height):
+            continue
+        category_value = entry.get("category")
+        try:
+            category_value = int(category_value) if category_value is not None else None
+        except Exception:
+            category_value = None
+        seen_categories.add(category_value)
+        r, g, b = _category_marker_color(category_value)
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=(r, g, b, 128),
+            outline=(20, 28, 44, 128),
+            width=outline_width,
+        )
+        if category_value is not None:
+            label = str(category_value)
+            if hasattr(draw, "textbbox"):
+                box = draw.textbbox((0, 0), label, font=font)
+                text_w = box[2] - box[0]
+                text_h = box[3] - box[1]
+            else:
+                text_w, text_h = font.getsize(label)
+            draw.text((cx - text_w / 2, cy - text_h / 2), label, fill=(255, 255, 255, 128), font=font)
+
+    if seen_categories:
+        legend_items = sorted(
+            [cat for cat in seen_categories if cat is not None],
+            key=lambda value: int(value),
+        )
+        if None in seen_categories:
+            legend_items.append(None)
+        legend_font = _get_font(max(14, int(radius * 1.3))) or ImageFont.load_default()
+        pad = max(10, int(radius * 1.4))
+        row_h = max(18, int(radius * 2.0))
+        legend_w = max(230, int(width * 0.26))
+        legend_h = pad * 2 + row_h * len(legend_items)
+        x0 = max(8, width - legend_w - 14)
+        y0 = max(8, height - legend_h - 14)
+        if hasattr(draw, "rounded_rectangle"):
+            draw.rounded_rectangle(
+                (x0, y0, x0 + legend_w, y0 + legend_h),
+                radius=10,
+                fill=(255, 255, 255, 215),
+                outline=(173, 184, 204, 235),
+                width=2,
+            )
+        else:
+            draw.rectangle((x0, y0, x0 + legend_w, y0 + legend_h), fill=(255, 255, 255, 215), outline=(173, 184, 204, 235), width=2)
+        for idx, category_value in enumerate(legend_items):
+            y = y0 + pad + idx * row_h
+            r, g, b = _category_marker_color(category_value)
+            sw = max(10, int(radius * 1.2))
+            draw.rectangle((x0 + pad, y + 2, x0 + pad + sw, y + sw), fill=(r, g, b, 220), outline=(20, 28, 44, 230), width=1)
+            label = "N/A" if category_value is None else str(category_value)
+            draw.text((x0 + pad + sw + 8, y), f"EPU {label}", fill=(20, 28, 44, 255), font=legend_font)
 
     return rendered
 
@@ -670,6 +821,7 @@ def _draw_grid_summary_page(
     heading: str,
     grid_image_name: str,
     overlay_img: Image.Image | None = None,
+    category_score: int | None = None,
 ) -> None:
     """Render a GridSquare summary directly onto a ReportLab canvas."""
     _ensure_pdf_fonts()
@@ -731,10 +883,10 @@ def _draw_grid_summary_page(
         rows_height = 0
 
     rating = '—' if not resp else str(resp.get('rating', '—'))
-    include_flag = 'Yes' if resp and resp.get('include') else 'No'
+    category_text = _format_category_score(category_score)
     comment_raw = '' if not resp else str(resp.get('comment', '')).strip()
     comment_lines = textwrap.wrap(comment_raw, width=110) if comment_raw else []
-    info_card_height = max(260, card_inner_pad * 2 + 120 + len(comment_lines) * 34)
+    info_card_height = max(320, card_inner_pad * 2 + 180 + len(comment_lines) * 34)
     hero_card_height = hero_panel_h + card_inner_pad * 2 + 80
     total_height = (
         base_margin
@@ -769,7 +921,9 @@ def _draw_grid_summary_page(
     c.setFont(_PDF_FONT_REGULAR, 46)
     c.setFillColor(text_color)
     c.drawString(base_margin + card_inner_pad, y - card_inner_pad - 46, f"Rating: {rating}")
-    text_y = y - card_inner_pad - 120
+    c.setFont(_PDF_FONT_REGULAR, 42)
+    c.drawString(base_margin + card_inner_pad, y - card_inner_pad - 102, f"EPU category score: {category_text}")
+    text_y = y - card_inner_pad - 180
     c.setFillColor(muted_color)
     c.setFont(_PDF_FONT_REGULAR, 34)
     if comment_lines:
@@ -1931,15 +2085,13 @@ document.addEventListener('keydown', (e)=>{
     print(f"Wrote review report to {report_out}")
 
 
-def write_review_report(
+def _build_overview_page_image(
     base_dir: Path,
-    report_file: Path,
     atlas_name: str | None,
     responses: dict,
     atlas_overlay: bool = True,
     global_summary: str | None = None,
-):
-    """Generate a single-page PDF with atlas (left) and ratings/comments (right) in a compact format."""
+) -> Image.Image:
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
@@ -1953,11 +2105,11 @@ def write_review_report(
                 return fallback
         return font
 
-    page_w, page_h = 1700, 2200
+    page_w, page_h = 2400, 2300
     margin = 40
-    column_gap = 36
-    left_col_w = 720
-    atlas_box_h = 720
+    atlas_gap = 24
+    atlas_panel_w = int((page_w - 2 * margin - atlas_gap * 2) / 3)
+    atlas_box_h = 520
     page = Image.new("RGB", (page_w, page_h), color=(255, 255, 255))
     draw = ImageDraw.Draw(page)
     fonts = {
@@ -1967,11 +2119,11 @@ def write_review_report(
         "table": _ensure_font(22),
     }
     line_h = (fonts["body"].size + 6) if getattr(fonts["body"], "size", None) else 24
-    right_x = margin + left_col_w + column_gap
     y_offset = margin
 
     atlas_img = None
     atlas_path_for_report = None
+    atlas_nodes: dict[str, dict] = {}
     if atlas_name:
         for _, g in grids:
             atlas_path = _resolve_atlas_path(atlas_name, g, base_dir)
@@ -1980,44 +2132,84 @@ def write_review_report(
                 if atlas_img is not None:
                     atlas_path_for_report = atlas_path
                     break
+    if atlas_path_for_report is not None:
+        atlas_nodes, _ref_w, _ref_h = _load_atlas_mapping(atlas_path_for_report)
 
-    atlas_panel = Image.new("RGB", (left_col_w, atlas_box_h), color=(245, 245, 245))
+    atlas_screened_panel = Image.new("RGB", (atlas_panel_w, atlas_box_h), color=(245, 245, 245))
+    atlas_category_panel = Image.new("RGB", (atlas_panel_w, atlas_box_h), color=(245, 245, 245))
+    atlas_raw_panel = Image.new("RGB", (atlas_panel_w, atlas_box_h), color=(245, 245, 245))
     if atlas_img is not None:
-        atlas_copy = atlas_img.convert("RGB")
+        atlas_raw = atlas_img.convert("RGB")
+        atlas_raw.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
+        ox = (atlas_panel_w - atlas_raw.width) // 2
+        oy = (atlas_box_h - atlas_raw.height) // 2
+        atlas_raw_panel.paste(atlas_raw, (ox, oy))
+
+        atlas_screened = atlas_img.convert("RGB")
         if atlas_overlay and atlas_path_for_report is not None:
             marker_items = [
                 (idx, gdir, gid, False)
                 for idx, (gid, gdir) in enumerate(grids, start=1)
             ]
-            atlas_copy = _atlas_with_grid_markers(atlas_copy, atlas_path_for_report, marker_items)
-        atlas_copy.thumbnail((left_col_w - 20, atlas_box_h - 20), Image.LANCZOS)
-        ox = (left_col_w - atlas_copy.width) // 2
-        oy = (atlas_box_h - atlas_copy.height) // 2
-        atlas_panel.paste(atlas_copy, (ox, oy))
-    atlas_label = "Atlas overview" if atlas_img is not None else "No atlas available"
-    atlas_panel = _label_image(atlas_panel, atlas_label)
-    page.paste(atlas_panel, (margin, margin))
+            atlas_screened = _atlas_with_grid_markers(atlas_screened, atlas_path_for_report, marker_items)
+        atlas_screened.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
+        ox = (atlas_panel_w - atlas_screened.width) // 2
+        oy = (atlas_box_h - atlas_screened.height) // 2
+        atlas_screened_panel.paste(atlas_screened, (ox, oy))
 
-    stats_y = margin + atlas_box_h + 28
+        atlas_category = _atlas_with_category_markers(atlas_img.convert("RGB"), atlas_path_for_report)
+        atlas_category.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
+        ox = (atlas_panel_w - atlas_category.width) // 2
+        oy = (atlas_box_h - atlas_category.height) // 2
+        atlas_category_panel.paste(atlas_category, (ox, oy))
+    atlas_screened_panel = _label_image(
+        atlas_screened_panel,
+        "Atlas: screened GridSquares" if atlas_img is not None else "No atlas available",
+    )
+    atlas_category_panel = _label_image(
+        atlas_category_panel,
+        "Atlas: all squares by EPU color/category (arbitrary colors)" if atlas_img is not None else "No atlas available",
+    )
+    atlas_raw_panel = _label_image(
+        atlas_raw_panel,
+        "Atlas: raw (no overlay)" if atlas_img is not None else "No atlas available",
+    )
+    page.paste(atlas_screened_panel, (margin, margin))
+    page.paste(atlas_category_panel, (margin + atlas_panel_w + atlas_gap, margin))
+    page.paste(atlas_raw_panel, (margin + 2 * (atlas_panel_w + atlas_gap), margin))
+
+    stats_y = margin + atlas_box_h + 24
+    color_note = "Note: category colors are arbitrary and currently do not match the EPU GUI color code."
+    draw.text((margin, stats_y), color_note, fill=(80, 88, 108), font=fonts["small"])
+    stats_y += line_h
     reviewed_count = sum(1 for resp in responses.values() if resp)
-    selected_count = sum(1 for resp in responses.values() if resp and bool(resp.get('include')))
+    selected_count = sum(1 for resp in responses.values() if resp and bool(resp.get("include")))
     stats_lines = [
         f"Total GridSquares: {len(grids)}",
         f"Reviewed GridSquares: {reviewed_count}",
+        f"Selected GridSquares: {selected_count}",
     ]
     for text in stats_lines:
         draw.text((margin, stats_y), text, fill=0, font=fonts["body"])
         stats_y += line_h
 
     rows = []
-    for idx, (_gid, gdir) in enumerate(grids, start=1):
+    for idx, (gid, gdir) in enumerate(grids, start=1):
         name = gdir.name
         resp = responses.get(name)
-        rating = resp.get('rating', '—') if resp else '—'
-        comment = (resp.get('comment', '') if resp else '').strip()
-        include_flag = "Yes" if resp and resp.get('include') else "No"
-        rows.append((f"GridSquare {idx}", str(rating), include_flag, comment or "—"))
-    draw.text((margin, stats_y), f"Selected GridSquares: {selected_count}", fill=0, font=fonts["body"])
+        rating = resp.get("rating", "—") if resp else "—"
+        comment = (resp.get("comment", "") if resp else "").strip()
+        include_flag = "Yes" if resp and resp.get("include") else "No"
+        category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
+        rows.append(
+            (
+                f"GridSquare {idx}",
+                _format_category_score(category_score),
+                str(rating),
+                include_flag,
+                comment or "—",
+            )
+        )
     summary_text = (global_summary or "").strip()
     if summary_text:
         stats_y += line_h + 4
@@ -2028,59 +2220,69 @@ def write_review_report(
             draw.text((margin, stats_y), line, fill=0, font=fonts["small"])
             stats_y += summary_line_h
 
-    # place ratings/comments on right
+    y_offset = stats_y + 18
     heading = "GridSquare Review Summary"
-    draw.text((right_x, y_offset), heading, fill=0, font=fonts["title"])
+    draw.text((margin, y_offset), heading, fill=0, font=fonts["title"])
     if hasattr(draw, "textbbox") and fonts["title"]:
-        bbox = draw.textbbox((right_x, y_offset), heading, font=fonts["title"])
+        bbox = draw.textbbox((margin, y_offset), heading, font=fonts["title"])
         y_offset = bbox[3] + 12
     else:
         y_offset += line_h
 
     legend = (
-        "Each row lists the GridSquare order, its rating (0 means skipped), "
-        "any reviewer notes, and whether it was marked for the Selected report."
+        "Each row lists the GridSquare order, EPU category score, rating (0 means skipped), "
+        "reviewer notes, and whether it was marked for detailed review."
     )
-    for chunk in textwrap.wrap(legend, width=70):
-        draw.text((right_x, y_offset), chunk, fill=0, font=fonts["body"])
+    for chunk in textwrap.wrap(legend, width=120):
+        draw.text((margin, y_offset), chunk, fill=0, font=fonts["body"])
         y_offset += line_h
     y_offset += 12
 
-    grid_col = right_x
-    rating_col = grid_col + 220
-    include_col = rating_col + 150
-    comment_col = include_col + 200
+    grid_col = margin
+    category_col = grid_col + 260
+    rating_col = category_col + 340
+    include_col = rating_col + 180
+    comment_col = include_col + 220
     header_y = y_offset
     draw.text((grid_col, header_y), "GridSquare", fill=0, font=fonts["table"])
+    draw.text((category_col, header_y), "EPU color / category", fill=0, font=fonts["table"])
     draw.text((rating_col, header_y), "Rating", fill=0, font=fonts["table"])
     draw.text((include_col, header_y), "Included?", fill=0, font=fonts["table"])
     draw.text((comment_col, header_y), "Reviewer comments", fill=0, font=fonts["table"])
     y_offset = header_y + (fonts["table"].size if hasattr(fonts["table"], "size") else 24) + 6
     row_height = (fonts["table"].size if hasattr(fonts["table"], "size") else 24) + 6
-    for grid_label, rating_text, include_text, comment_text in rows:
+    for grid_label, category_text, rating_text, include_text, comment_text in rows:
         draw.text((grid_col, y_offset), grid_label, fill=0, font=fonts["table"])
+        draw.text((category_col, y_offset), category_text, fill=0, font=fonts["table"])
         draw.text((rating_col, y_offset), rating_text, fill=0, font=fonts["table"])
         draw.text((include_col, y_offset), include_text, fill=0, font=fonts["table"])
-        comment_lines = textwrap.wrap(comment_text, width=55) or ["—"]
+        comment_lines = textwrap.wrap(comment_text, width=72) or ["—"]
         comment_y = y_offset
-        for idx_line, c_line in enumerate(comment_lines):
+        for c_line in comment_lines:
             draw.text((comment_col, comment_y), c_line, fill=0, font=fonts["table"])
             comment_y += row_height
         y_offset = max(y_offset + row_height, comment_y)
+    return page
 
-    page.save(report_file, "PDF", resolution=300)
+
+def _append_pil_page(pdf: pdf_canvas.Canvas, page_image: Image.Image) -> None:
+    page_rgb = page_image.convert("RGB")
+    page_w, page_h = page_rgb.size
+    pdf.setPageSize((float(page_w), float(page_h)))
+    pdf.drawImage(ImageReader(page_rgb), 0, 0, width=page_w, height=page_h)
+    pdf.showPage()
 
 
-def write_selected_report(
+def _append_selected_report_pages(
+    pdf: pdf_canvas.Canvas,
     base_dir: Path,
-    report_file: Path,
     atlas_name: str | None,
     responses: dict,
     overlay: bool = False,
     atlas_overlay: bool = True,
     global_summary: str | None = None,
-):
-    """Generate a PDF with only the included GridSquares."""
+    include_summary_page: bool = True,
+) -> None:
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
@@ -2090,10 +2292,8 @@ def write_selected_report(
         if resp and bool(resp.get("include")):
             include_list.append((idx, gid, gdir, resp))
     failed: list[tuple[str, str]] = []
-    _ensure_pdf_fonts()
-    pdf = pdf_canvas.Canvas(str(report_file))
     summary_text = (global_summary or "").strip()
-    if summary_text:
+    if include_summary_page and summary_text:
         summary_lines = textwrap.wrap(summary_text, width=100) or [summary_text]
         _draw_pdf_message_page(pdf, summary_lines, title="Session Summary")
     if not include_list:
@@ -2114,17 +2314,20 @@ def write_selected_report(
                 continue
             atlas_img_local = None
             atlas_path_local = None
+            atlas_nodes: dict[str, dict] = {}
             if atlas_name:
                 atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir)
                 if atlas_path:
                     atlas_path_local = atlas_path
                     atlas_img_local = _load_image(atlas_path, "RGB")
+                    atlas_nodes, _ref_w, _ref_h = _load_atlas_mapping(atlas_path_local)
                     if atlas_overlay and atlas_img_local is not None:
                         atlas_img_local = _atlas_with_grid_markers(
                             atlas_img_local,
                             atlas_path_local,
                             [(idx, gdir, gid, True)],
                         )
+            category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
             overlay_img_local = None
             if overlay:
                 overlay_path = _find_overlay_image(gdir, base_dir)
@@ -2145,6 +2348,7 @@ def write_selected_report(
                     heading,
                     grid_image_path.name,
                     overlay_img_local,
+                    category_score=category_score,
                 )
             except Exception as exc:
                 failed.append((grid_name, f"render error: {exc}"))
@@ -2157,6 +2361,82 @@ def write_selected_report(
         if len(failed) > 12:
             lines.append("... see console for the full list")
         _draw_pdf_message_page(pdf, lines)
+
+
+def write_review_report(
+    base_dir: Path,
+    report_file: Path,
+    atlas_name: str | None,
+    responses: dict,
+    atlas_overlay: bool = True,
+    global_summary: str | None = None,
+):
+    """Generate a single-page overview PDF."""
+    page = _build_overview_page_image(
+        base_dir,
+        atlas_name,
+        responses,
+        atlas_overlay=atlas_overlay,
+        global_summary=global_summary,
+    )
+    page.save(report_file, "PDF", resolution=300)
+
+
+def write_selected_report(
+    base_dir: Path,
+    report_file: Path,
+    atlas_name: str | None,
+    responses: dict,
+    overlay: bool = False,
+    atlas_overlay: bool = True,
+    global_summary: str | None = None,
+):
+    """Generate a detailed PDF with only the included GridSquares."""
+    _ensure_pdf_fonts()
+    pdf = pdf_canvas.Canvas(str(report_file))
+    _append_selected_report_pages(
+        pdf,
+        base_dir,
+        atlas_name,
+        responses,
+        overlay=overlay,
+        atlas_overlay=atlas_overlay,
+        global_summary=global_summary,
+        include_summary_page=True,
+    )
+    pdf.save()
+
+
+def write_combined_report(
+    base_dir: Path,
+    report_file: Path,
+    atlas_name: str | None,
+    responses: dict,
+    overlay: bool = False,
+    atlas_overlay: bool = True,
+    global_summary: str | None = None,
+):
+    """Generate one merged PDF: overview first, then included GridSquare details."""
+    _ensure_pdf_fonts()
+    pdf = pdf_canvas.Canvas(str(report_file))
+    overview_page = _build_overview_page_image(
+        base_dir,
+        atlas_name,
+        responses,
+        atlas_overlay=atlas_overlay,
+        global_summary=global_summary,
+    )
+    _append_pil_page(pdf, overview_page)
+    _append_selected_report_pages(
+        pdf,
+        base_dir,
+        atlas_name,
+        responses,
+        overlay=overlay,
+        atlas_overlay=atlas_overlay,
+        global_summary=global_summary,
+        include_summary_page=False,
+    )
     pdf.save()
 
 

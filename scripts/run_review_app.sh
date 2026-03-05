@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Helper wrapper so conda users can launch the review app without manually
 # exporting PYTHONPATH. Usage:
-#   scripts/run_review_app.sh /path/to/session_root --atlas /path/to/atlas.jpg
+#   scripts/run_review_app.sh /path/to/session_root --atlas /path/to/Atlas
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 /path/to/session_root [extra review_app.py args]" >&2

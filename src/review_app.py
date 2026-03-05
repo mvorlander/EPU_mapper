@@ -30,7 +30,7 @@ from build_collage import (
     _find_overlay_image,
     _latest_only,
     _mrc_to_image,
-    write_review_report,
+    write_combined_report,
     write_selected_report,
     _resolve_atlas_path,
     parse_metadata,
@@ -59,10 +59,29 @@ def _format_meta(meta: dict) -> list[str]:
     return lines
 
 
+def _format_category_score_text(value) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return str(int(value))
+    except Exception:
+        return str(value)
+
+
 _OVERLAY_TOOLS: tuple | None = None
 _OVERLAY_TRANSFORM: str | None = None
 _OVERLAY_EVENTS: deque = deque(maxlen=200)
-_ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, tuple[float, float]], float | None, float | None, str | None]] = {}
+_ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, tuple[float, float]], dict[str, int | None], float | None, float | None, str | None]] = {}
+_EPU_CATEGORY_COLORS: dict[int, tuple[int, int, int]] = {
+    -1: (148, 163, 184),
+    0: (96, 165, 250),
+    1: (74, 222, 128),
+    2: (250, 204, 21),
+    3: (251, 146, 60),
+    4: (239, 68, 68),
+    5: (192, 132, 252),
+    6: (217, 70, 239),
+}
 
 
 def _local_tag(tag: str | None) -> str:
@@ -101,12 +120,13 @@ def _atlas_dm_candidates(atlas_path: Path) -> list[Path]:
     return ordered
 
 
-def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
+def _parse_atlas_dm_centers_and_categories(dm_path: Path) -> tuple[dict[str, tuple[float, float]], dict[str, int | None]]:
     centers: dict[str, tuple[float, float]] = {}
+    categories: dict[str, int | None] = {}
     try:
         root = ET.parse(dm_path).getroot()
     except Exception:
-        return centers
+        return centers, categories
 
     for parent in root.iter():
         if not _local_tag(parent.tag).startswith("keyvaluepairofintnodexml"):
@@ -124,6 +144,14 @@ def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
         key = key_node.text.strip()
         if not key:
             continue
+        category_value = None
+        for node in list(value_node):
+            if _local_tag(node.tag) == "category":
+                category_float = _as_float(node.text)
+                if category_float is not None:
+                    category_value = int(round(category_float))
+                break
+        categories[key] = category_value
 
         pos_node = None
         for node in value_node.iter():
@@ -152,7 +180,7 @@ def _parse_atlas_dm_centers(dm_path: Path) -> dict[str, tuple[float, float]]:
         if center_x is None or center_y is None:
             continue
         centers[key] = (center_x, center_y)
-    return centers
+    return centers, categories
 
 
 def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float, float]]) -> tuple[float | None, float | None]:
@@ -175,7 +203,7 @@ def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float
     return None, None
 
 
-def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]], float | None, float | None, str | None]:
+def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]], dict[str, int | None], float | None, float | None, str | None]:
     atlas_key = atlas_path.resolve()
     cached = _ATLAS_MAPPING_CACHE.get(atlas_key)
     if cached is not None:
@@ -183,18 +211,18 @@ def _load_atlas_mapping(atlas_path: Path) -> tuple[dict[str, tuple[float, float]
 
     dm_path = next((p for p in _atlas_dm_candidates(atlas_key) if p.is_file()), None)
     if dm_path is None:
-        result = ({}, None, None, "Atlas marker unavailable: Atlas.dm metadata not found.")
+        result = ({}, {}, None, None, "Atlas marker unavailable: Atlas.dm metadata not found.")
         _ATLAS_MAPPING_CACHE[atlas_key] = result
         return result
 
-    centers = _parse_atlas_dm_centers(dm_path)
+    centers, categories = _parse_atlas_dm_centers_and_categories(dm_path)
     if not centers:
-        result = ({}, None, None, f"Atlas marker unavailable: could not parse GridSquare centers from {dm_path.name}.")
+        result = ({}, categories, None, None, f"Atlas marker unavailable: could not parse GridSquare centers from {dm_path.name}.")
         _ATLAS_MAPPING_CACHE[atlas_key] = result
         return result
 
     ref_w, ref_h = _atlas_reference_dimensions(atlas_key, centers)
-    result = (centers, ref_w, ref_h, None)
+    result = (centers, categories, ref_w, ref_h, None)
     _ATLAS_MAPPING_CACHE[atlas_key] = result
     return result
 
@@ -245,14 +273,14 @@ def _render_atlas_overlay(
     ring_width = max(3, radius // 5)
     draw.ellipse(
         (center_x - radius, center_y - radius, center_x + radius, center_y + radius),
-        fill=(220, 40, 40, 60),
-        outline=(220, 40, 40, 240),
+        fill=(220, 40, 40, 128),
+        outline=(220, 40, 40, 128),
         width=ring_width,
     )
     cross = int(radius * 1.6)
     cross_width = max(2, radius // 6)
-    draw.line((center_x - cross, center_y, center_x + cross, center_y), fill=(220, 40, 40, 240), width=cross_width)
-    draw.line((center_x, center_y - cross, center_x, center_y + cross), fill=(220, 40, 40, 240), width=cross_width)
+    draw.line((center_x - cross, center_y, center_x + cross, center_y), fill=(220, 40, 40, 128), width=cross_width)
+    draw.line((center_x, center_y - cross, center_x, center_y + cross), fill=(220, 40, 40, 128), width=cross_width)
 
     try:
         font = ImageFont.load_default()
@@ -268,8 +296,142 @@ def _render_atlas_overlay(
             text_w, text_h = font.getsize(text)
         text_x = min(max(8, center_x + radius + 10), max(8, width - text_w - 8))
         text_y = min(max(8, center_y - radius - text_h - 8), max(8, height - text_h - 8))
-        draw.rectangle((text_x - 4, text_y - 3, text_x + text_w + 4, text_y + text_h + 3), fill=(255, 255, 255, 200))
-        draw.text((text_x, text_y), text, fill=(150, 25, 25, 255), font=font)
+        draw.rectangle((text_x - 4, text_y - 3, text_x + text_w + 4, text_y + text_h + 3), fill=(255, 255, 255, 128))
+        draw.text((text_x, text_y), text, fill=(150, 25, 25, 128), font=font)
+
+    buf = io.BytesIO()
+    atlas_rgb.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _category_marker_color(category: int | None) -> tuple[int, int, int]:
+    if category is None:
+        return (148, 163, 184)
+    return _EPU_CATEGORY_COLORS.get(category, (99, 102, 241))
+
+
+def _render_atlas_screened_overview(
+    atlas_path: Path,
+    centers: dict[str, tuple[float, float]],
+    screened_items: list[tuple[str, str]],
+    ref_w: float | None,
+    ref_h: float | None,
+) -> bytes | None:
+    if not centers or not screened_items:
+        return None
+    try:
+        with Image.open(atlas_path) as atlas_image:
+            atlas_rgb = atlas_image.convert("RGB")
+    except Exception:
+        return None
+
+    width, height = atlas_rgb.size
+    scale_x = width / ref_w if ref_w and ref_w > 0 else 1.0
+    scale_y = height / ref_h if ref_h and ref_h > 0 else 1.0
+    draw = ImageDraw.Draw(atlas_rgb, "RGBA")
+    radius = max(10, int(min(width, height) * 0.018))
+    ring_width = max(2, radius // 5)
+    font = ImageFont.load_default()
+    for label, key in screened_items:
+        center = centers.get(key)
+        if center is None:
+            continue
+        cx = center[0] * scale_x
+        cy = center[1] * scale_y
+        if not (0 <= cx < width and 0 <= cy < height):
+            continue
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=(37, 99, 235, 128),
+            outline=(20, 28, 44, 128),
+            width=ring_width,
+        )
+        if hasattr(draw, "textbbox"):
+            box = draw.textbbox((0, 0), label, font=font)
+            text_w = box[2] - box[0]
+            text_h = box[3] - box[1]
+        else:
+            text_w, text_h = font.getsize(label)
+        draw.text((cx - text_w / 2, cy - text_h / 2), label, fill=(255, 255, 255, 128), font=font)
+
+    buf = io.BytesIO()
+    atlas_rgb.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _render_atlas_category_overview(
+    atlas_path: Path,
+    centers: dict[str, tuple[float, float]],
+    categories: dict[str, int | None],
+    ref_w: float | None,
+    ref_h: float | None,
+) -> bytes | None:
+    if not centers:
+        return None
+    try:
+        with Image.open(atlas_path) as atlas_image:
+            atlas_rgb = atlas_image.convert("RGB")
+    except Exception:
+        return None
+
+    width, height = atlas_rgb.size
+    scale_x = width / ref_w if ref_w and ref_w > 0 else 1.0
+    scale_y = height / ref_h if ref_h and ref_h > 0 else 1.0
+    draw = ImageDraw.Draw(atlas_rgb, "RGBA")
+    radius = max(8, int(min(width, height) * 0.011))
+    ring_width = max(1, radius // 4)
+    font = ImageFont.load_default()
+    seen_categories: set[int | None] = set()
+
+    for key, center in centers.items():
+        cx = center[0] * scale_x
+        cy = center[1] * scale_y
+        if not (0 <= cx < width and 0 <= cy < height):
+            continue
+        category_value = categories.get(key)
+        try:
+            category_value = int(category_value) if category_value is not None else None
+        except Exception:
+            category_value = None
+        seen_categories.add(category_value)
+        r, g, b = _category_marker_color(category_value)
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            fill=(r, g, b, 128),
+            outline=(20, 28, 44, 128),
+            width=ring_width,
+        )
+        if category_value is not None:
+            label = str(category_value)
+            if hasattr(draw, "textbbox"):
+                box = draw.textbbox((0, 0), label, font=font)
+                text_w = box[2] - box[0]
+                text_h = box[3] - box[1]
+            else:
+                text_w, text_h = font.getsize(label)
+            draw.text((cx - text_w / 2, cy - text_h / 2), label, fill=(255, 255, 255, 128), font=font)
+
+    if seen_categories:
+        legend_items = sorted([cat for cat in seen_categories if cat is not None])
+        if None in seen_categories:
+            legend_items.append(None)
+        pad = max(8, int(radius * 1.2))
+        row_h = max(16, int(radius * 1.9))
+        legend_w = max(180, int(width * 0.2))
+        legend_h = pad * 2 + row_h * len(legend_items)
+        x0 = max(8, width - legend_w - 12)
+        y0 = max(8, height - legend_h - 12)
+        if hasattr(draw, "rounded_rectangle"):
+            draw.rounded_rectangle((x0, y0, x0 + legend_w, y0 + legend_h), radius=9, fill=(255, 255, 255, 220), outline=(173, 184, 204, 240), width=2)
+        else:
+            draw.rectangle((x0, y0, x0 + legend_w, y0 + legend_h), fill=(255, 255, 255, 220), outline=(173, 184, 204, 240), width=2)
+        for idx, category_value in enumerate(legend_items):
+            y = y0 + pad + idx * row_h
+            r, g, b = _category_marker_color(category_value)
+            sw = max(8, int(radius * 1.2))
+            draw.rectangle((x0 + pad, y + 2, x0 + pad + sw, y + sw), fill=(r, g, b, 230), outline=(20, 28, 44, 235), width=1)
+            label = "N/A" if category_value is None else str(category_value)
+            draw.text((x0 + pad + sw + 7, y), f"EPU {label}", fill=(20, 28, 44, 255), font=font)
 
     buf = io.BytesIO()
     atlas_rgb.save(buf, format="PNG")
@@ -437,7 +599,7 @@ def _preflight_checks(
         else:
             checks["info"].append(f"Atlas image resolved: {atlas_sample}")
             if atlas_overlay:
-                centers, _ref_w, _ref_h, atlas_msg = _load_atlas_mapping(atlas_sample)
+                centers, _categories, _ref_w, _ref_h, atlas_msg = _load_atlas_mapping(atlas_sample)
                 if centers:
                     checks["info"].append(f"Atlas metadata contains {len(centers)} GridSquare center entries.")
                 elif atlas_msg:
@@ -640,17 +802,26 @@ def create_app(
         atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir) if atlas_name else None
         atlas_mrc_path = _find_mrc_for_jpg(atlas_path) if atlas_path else None
         atlas_centers: dict[str, tuple[float, float]] = {}
+        atlas_categories: dict[str, int | None] = {}
         atlas_ref_w: float | None = None
         atlas_ref_h: float | None = None
         atlas_center_key: str | None = None
         atlas_overlay_message: str | None = None
-        if atlas_overlay and atlas_path and atlas_path.is_file():
-            atlas_centers, atlas_ref_w, atlas_ref_h, atlas_overlay_message = _load_atlas_mapping(atlas_path)
+        epu_category_score: int | None = None
+        if atlas_path and atlas_path.is_file():
+            atlas_centers, atlas_categories, atlas_ref_w, atlas_ref_h, atlas_overlay_message = _load_atlas_mapping(atlas_path)
             for lookup_key in _atlas_lookup_keys(gdir, _gid):
                 if lookup_key in atlas_centers:
                     atlas_center_key = lookup_key
                     break
-            if atlas_center_key is None and atlas_centers and atlas_overlay_message is None:
+            if atlas_center_key is not None and atlas_center_key in atlas_categories:
+                epu_category_score = atlas_categories.get(atlas_center_key)
+            else:
+                for lookup_key in _atlas_lookup_keys(gdir, _gid):
+                    if lookup_key in atlas_categories:
+                        epu_category_score = atlas_categories.get(lookup_key)
+                        break
+            if atlas_overlay and atlas_center_key is None and atlas_centers and atlas_overlay_message is None:
                 atlas_overlay_message = "GridSquare not found in Atlas metadata."
         foils, datas = gather_foil_and_data(gdir)
         foils = _latest_only(foils)
@@ -688,6 +859,7 @@ def create_app(
                 "atlas_ref_h": atlas_ref_h,
                 "atlas_center_key": atlas_center_key,
                 "atlas_overlay_message": atlas_overlay_message,
+                "epu_category_score": epu_category_score,
                 "overlay": overlay_path,
                 "overlay_message": overlay_message,
                 "foils": foil_list,
@@ -695,6 +867,45 @@ def create_app(
             }
         )
         status_state["loaded"] = idx_item
+
+    atlas_screened_preview: bytes | None = None
+    atlas_category_preview: bytes | None = None
+    atlas_preview_message: str | None = None
+    atlas_preview_path: Path | None = None
+    atlas_sample_item = next(
+        (
+            item
+            for item in items
+            if item.get("atlas") is not None and item["atlas"].is_file()
+        ),
+        None,
+    )
+    if atlas_sample_item is not None:
+        atlas_preview_path = atlas_sample_item["atlas"]
+        centers, categories, ref_w, ref_h, atlas_msg = _load_atlas_mapping(atlas_preview_path)
+        screened_items: list[tuple[str, str]] = []
+        for idx_item, item in enumerate(items, start=1):
+            center_key = item.get("atlas_center_key")
+            if center_key and center_key in centers:
+                screened_items.append((str(idx_item), center_key))
+        atlas_screened_preview = _render_atlas_screened_overview(
+            atlas_preview_path,
+            centers,
+            screened_items,
+            ref_w,
+            ref_h,
+        )
+        atlas_category_preview = _render_atlas_category_overview(
+            atlas_preview_path,
+            centers,
+            categories,
+            ref_w,
+            ref_h,
+        )
+        if atlas_screened_preview is None and atlas_category_preview is None:
+            atlas_preview_message = atlas_msg or "Atlas overview images unavailable (metadata parsing failed)."
+    elif atlas_name:
+        atlas_preview_message = "Atlas image not found; atlas overview previews are unavailable."
 
     responses_file = base_dir / "review_responses.json"
     drafts_file = _drafts_file_path(base_dir)
@@ -853,6 +1064,7 @@ def create_app(
                     "comment": str(response.get("comment", "")),
                     "foil_count": len(item["foils"]),
                     "data_count": len(item["data"]),
+                    "epu_category_score": item.get("epu_category_score"),
                     "atlas_available": bool(item.get("atlas")),
                     "overlay_available": bool(item.get("overlay")),
                 }
@@ -888,20 +1100,22 @@ def create_app(
 
     def _run_report_job(job_id: str, kind: str) -> None:
         _update_job(job_id, status="running", progress=10, message="Preparing report...")
-        overview_path, details_path = _report_paths()
-        target_path = overview_path if kind == "overview" else details_path
+        report_path, details_path = _report_paths()
+        job_kind = "full" if kind == "overview" else kind
+        target_path = report_path if job_kind == "full" else details_path
 
         def _write_target(path: Path) -> None:
-            if kind == "overview":
-                write_review_report(
+            if job_kind == "full":
+                write_combined_report(
                     base_dir,
                     path,
                     atlas_name,
                     responses,
+                    overlay=overlay_enabled,
                     atlas_overlay=atlas_overlay,
                     global_summary=summary_state["text"],
                 )
-            else:
+            elif job_kind == "details":
                 write_selected_report(
                     base_dir,
                     path,
@@ -911,6 +1125,8 @@ def create_app(
                     atlas_overlay=atlas_overlay,
                     global_summary=summary_state["text"],
                 )
+            else:
+                raise ValueError(f"unknown report kind: {job_kind}")
 
         try:
             _update_job(job_id, progress=35, message="Rendering PDF pages...")
@@ -942,6 +1158,8 @@ def create_app(
         default_label = "Atlas" if default_kind == "atlas" else "GridSquare"
         default_src = f"/atlas?idx={idx}&t={ts}" if default_kind == "atlas" else f"/grid?idx={idx}&t={ts}"
         default_has_mrc_json = atlas_mrc_json if default_kind == "atlas" else grid_mrc_json
+        category_text = _format_category_score_text(item.get("epu_category_score"))
+        category_subtitle_html = f"<div class=\"subtitle\">EPU category score: {category_text}</div>"
         atlas_note_html = ""
         if item["atlas"]:
             atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\" data-kind=\"atlas\" data-has-mrc=\"{1 if atlas_has_mrc else 0}\"/>"
@@ -1079,7 +1297,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <body>
 <div id=\"loading-overlay\"><div class=\"spinner\"></div><div>Loading images…</div></div>
 <div class=\"page\">
-<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div></div><div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div></div>
+<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div>{category_subtitle_html}</div><div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div></div>
 {overlay_banner}
 {nodata_html}
 {preflight_html}
@@ -1100,6 +1318,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 </div>
 <div class=\"card\">
 <div class=\"section-title\">Rating</div>
+<div class=\"note\">EPU category score: {category_text}</div>
 <div class=\"rate-buttons\">
 <button type=\"button\" class=\"rate\" data-v=\"1\">1</button>
 <button type=\"button\" class=\"rate\" data-v=\"2\">2</button>
@@ -1592,12 +1811,20 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helve
 .preflight.warn{border-color:#e8d7ad;background:#fffaf0;}
 .preflight.err{border-color:#e7b9b9;background:#fff6f6;}
 .preflight ul{margin:6px 0 0;padding-left:18px;}
+.atlas-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:14px;}
+.atlas-card{border:1px solid #d7deea;border-radius:10px;padding:8px;background:#fbfcff;}
+.atlas-title{font-size:13px;font-weight:600;color:#33415c;margin-bottom:6px;}
+.atlas-card img{display:block;width:100%;height:auto;border-radius:6px;border:1px solid #d5dcea;}
+@media (max-width: 1200px){.atlas-row{grid-template-columns:1fr 1fr;}}
+@media (max-width: 900px){.atlas-row{grid-template-columns:1fr;}}
 </style>
 </head><body><div class=\"page\"><div class=\"card\"><div class=\"title\">Grid review</div>
 <div class=\"note\">Review GridSquare, FoilHole, and Data images. Click any thumbnail to inspect it. Use "Show MRC" to adjust contrast when available. Rate each GridSquare and leave comments. A PDF report is generated at the end.</div>
 <a class=\"btn\" id=\"start-btn\" href=\"/review/0\">Start review</a>
 <a class=\"btn secondary\" id=\"resume-btn\" style=\"display:none;\" href=\"#\">Resume last visited</a>
 <div id=\"preflight\" class=\"preflight\">Running preflight checks…</div>
+__ATLAS_MSG_HTML__
+__ATLAS_OVERVIEW_HTML__
 </div></div>
 <script>
 const resumeBtn = document.getElementById('resume-btn');
@@ -1626,7 +1853,26 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
 }});
 </script>
 </body></html>"""
+        atlas_msg_html = ""
+        if atlas_preview_message:
+            atlas_msg_html = f"<div class=\"note\">{atlas_preview_message}</div>"
+        atlas_overview_html = ""
+        if atlas_screened_preview or atlas_category_preview or atlas_preview_path:
+            ts = int(time.time() * 1000)
+            atlas_overview_html = (
+                f"<div class=\"atlas-row\">"
+                f"<div class=\"atlas-card\"><div class=\"atlas-title\">Atlas overview: screened GridSquares</div>"
+                f"<img src=\"/atlas_overview_screened?t={ts}\" alt=\"Atlas overview with screened GridSquares\"></div>"
+                f"<div class=\"atlas-card\"><div class=\"atlas-title\">Atlas overview: all squares by EPU color / category (arbitrary colors)</div>"
+                f"<img src=\"/atlas_overview_categories?t={ts}\" alt=\"Atlas overview by EPU category\"></div>"
+                f"<div class=\"atlas-card\"><div class=\"atlas-title\">Atlas overview: raw (no overlay)</div>"
+                f"<img src=\"/atlas_overview_raw?t={ts}\" alt=\"Raw atlas overview\"></div>"
+                f"</div>"
+                f"<div class=\"note\">Note: category colors are currently arbitrary and do not match the EPU GUI color code.</div>"
+            )
         root_html = root_html.replace("__SESSION_STORAGE_KEY_JSON__", json.dumps(session_storage_key))
+        root_html = root_html.replace("__ATLAS_MSG_HTML__", atlas_msg_html)
+        root_html = root_html.replace("__ATLAS_OVERVIEW_HTML__", atlas_overview_html)
         return HTMLResponse(root_html)
 
     @app.get("/review/{idx}")
@@ -1675,6 +1921,28 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
             if payload:
                 return Response(content=payload, media_type="image/png")
         return FileResponse(atlas_path)
+
+    @app.get("/atlas_overview_screened")
+    def atlas_overview_screened():
+        if atlas_screened_preview:
+            return Response(content=atlas_screened_preview, media_type="image/png")
+        if atlas_preview_path and atlas_preview_path.is_file():
+            return FileResponse(atlas_preview_path)
+        raise HTTPException(status_code=404)
+
+    @app.get("/atlas_overview_categories")
+    def atlas_overview_categories():
+        if atlas_category_preview:
+            return Response(content=atlas_category_preview, media_type="image/png")
+        if atlas_preview_path and atlas_preview_path.is_file():
+            return FileResponse(atlas_preview_path)
+        raise HTTPException(status_code=404)
+
+    @app.get("/atlas_overview_raw")
+    def atlas_overview_raw():
+        if atlas_preview_path and atlas_preview_path.is_file():
+            return FileResponse(atlas_preview_path)
+        raise HTTPException(status_code=404)
 
     @app.get("/overlay")
     def overlay(idx: int):
@@ -1849,15 +2117,15 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
 
     def _report_paths() -> tuple[Path, Path]:
         if report_file:
-            overview = report_file
+            report = report_file
             details = report_file.with_name(f"{report_file.stem}_details.pdf")
         else:
             prefix = label_prefix
-            overview_name = f"{prefix}Screening_overview.pdf"
+            report_name = f"{prefix}Screening_report.pdf"
             details_name = f"{prefix}Screening_details.pdf"
-            overview = base_dir / overview_name
+            report = base_dir / report_name
             details = base_dir / details_name
-        return overview, details
+        return report, details
 
     def _temp_report_path(filename: str) -> Path:
         temp_root = Path(tempfile.gettempdir()) / "EPUMapperReview"
@@ -1892,6 +2160,7 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
             "comment",
             "foil_count",
             "data_count",
+            "epu_category_score",
             "atlas_available",
             "overlay_available",
         ]
@@ -1917,9 +2186,11 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
                 payload = {}
         except Exception:
             payload = {}
-        kind = str(payload.get("kind", "overview")).strip().lower()
-        if kind not in {"overview", "details"}:
-            return JSONResponse({"error": "kind must be 'overview' or 'details'"}, status_code=400)
+        kind = str(payload.get("kind", "full")).strip().lower()
+        if kind == "overview":
+            kind = "full"
+        if kind not in {"full", "details"}:
+            return JSONResponse({"error": "kind must be 'full' or 'details'"}, status_code=400)
         job_id = secrets.token_urlsafe(8)
         now = time.time()
         with report_jobs_lock:
@@ -1985,9 +2256,8 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 <label class="summary-label" for="global-summary">Session summary (one sentence, optional)</label>
 <textarea id="global-summary" rows="2" maxlength="__SUMMARY_MAX_LEN__"></textarea>
 <div><button type="button" class="btn" id="save-summary">Save summary</button></div>
-<div class="note">Then generate PDF summaries below. You can reopen this session later to continue editing notes or regenerate reports.</div>
-<a class="btn" id="report-link" href="#">Generate overview PDF</a>
-<a class="btn" id="selected-link" href="#">Generate details PDF</a>
+<div class="note">Then generate the full PDF report (overview first, followed by detailed selected GridSquares).</div>
+<a class="btn" id="report-link" href="#">Generate full PDF report</a>
 <div class="note">Export structured review data:</div>
 <a class="btn secondary" id="export-csv" href="/export.csv">Download CSV</a>
 <a class="btn secondary" id="export-json" href="/export.json">Download JSON</a>
@@ -2092,11 +2362,7 @@ async function startReport(kind, msg){
 
 document.getElementById('report-link').addEventListener('click', (ev) => {
   ev.preventDefault();
-  startReport('overview', 'Generating overview PDF…');
-});
-document.getElementById('selected-link').addEventListener('click', (ev) => {
-  ev.preventDefault();
-  startReport('details', 'Generating detailed PDF…');
+  startReport('full', 'Generating full PDF report…');
 });
 	const SESSION_STORAGE_KEY = __SESSION_STORAGE_KEY_JSON__;
 	localStorage.removeItem('last_idx_' + SESSION_STORAGE_KEY);
@@ -2109,30 +2375,32 @@ document.getElementById('selected-link').addEventListener('click', (ev) => {
 
     @app.get("/report")
     def report():
-        overview_path, _details_path = _report_paths()
-        target_path = overview_path
+        report_path, _details_path = _report_paths()
+        target_path = report_path
         try:
-            write_review_report(
+            write_combined_report(
                 base_dir,
                 target_path,
                 atlas_name,
                 responses,
+                overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
             )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
-            target_path = _temp_report_path(overview_path.name)
-            write_review_report(
+            target_path = _temp_report_path(report_path.name)
+            write_combined_report(
                 base_dir,
                 target_path,
                 atlas_name,
                 responses,
+                overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
             )
         except Exception as exc:
-            return JSONResponse({"error": f"failed to generate overview report: {exc}"}, status_code=500)
+            return JSONResponse({"error": f"failed to generate full report: {exc}"}, status_code=500)
         return FileResponse(target_path, media_type="application/pdf", filename=target_path.name, headers={"Cache-Control": "no-store"})
 
     @app.get("/selected_report")

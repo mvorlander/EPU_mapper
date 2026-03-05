@@ -26,8 +26,8 @@ Launch the review UI directly from the managed wrapper located at
   are also available (host, port, `--overlay-transform`, extra args, etc.).
 
 The wrapper binds the provided session directory into the container so that
-overlays, logs, PDFs, and `review_responses.json` are written next to the EPU
-data.
+overlays, logs, reports (for example `Screening_report.pdf`), and
+`review_responses.json` are written next to the EPU data.
 
 ## Maintainer note
 

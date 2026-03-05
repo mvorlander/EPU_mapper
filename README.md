@@ -1,6 +1,6 @@
 # EPU Screening Review App
 
-The EPU Mapper web app speeds up the review of Data from Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth on. It renders every square, lets you add per-square rating and comments, and exports PDF summaries.
+The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth following up. It renders every square, lets you add per-square ratings/comments, and exports PDF reports.
 
 # UI overview
 The screenshot shows the reviewing app. 
@@ -11,7 +11,7 @@ The screenshot shows the reviewing app.
 - Shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. You can adjust contrast via **Show MRC for selected image** on the right. Zoom stays inside the viewer window, and **Pan** lets you drag around the zoomed image.
 
 **Right panel:**
-- Allows you to add comments and a rating of the square. If you click the checkbox on the right, screening images from that square will be included in a final PDF report. A minimal report showing only the user rating and comments next to the atlas will always be created.
+- Lets you add comments and a rating for the current GridSquare. If you tick **Include this GridSquare in the final report**, detailed pages for that square are added to the final PDF.
 
 **Bottom pannel:**
 - Shows FoilHoles next to Data images
@@ -103,10 +103,10 @@ and Windows builds use.
 ### Optional helpers
 
 - **Prefix PDF names** – provide a session/grid label once and reuse it for
-  both reports. Either set `SESSION_LABEL=MyRun` (or `GRID_LABEL=/REPORT_PREFIX`)
+  generated reports. Either set `SESSION_LABEL=MyRun` (or `GRID_LABEL` / `REPORT_PREFIX`)
   before launching, or pass `--grid-label MyRun` / `--session-label MyRun` to
-  the wrapper/Windows launcher. The resulting files become
-  `MyRun_Screening_overview.pdf` and `MyRun_Screening_details.pdf`.
+  the wrapper/Windows launcher. The default file becomes
+  `MyRun_Screening_report.pdf` (and `MyRun_Screening_details.pdf` if you use details-only export).
 - **Add one session-level summary sentence** – after the final GridSquare, the
   completion page includes a text field for a single summary sentence that is
   included in generated reports.
@@ -175,14 +175,17 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
 ## Atlas Marker Overlay
 
 - When you provide an atlas image via `--atlas`, the app now tries to read
-  `Atlas.dm` from the same folder and marks the currently reviewed GridSquare
-  directly on the atlas panel.
+  `Atlas.dm` from the same folder and marks GridSquares directly on atlas views.
 - `--atlas` accepts either an atlas image file or an atlas directory. If you
   pass a directory, the app auto-picks the latest matching `Atlas_*.jpg/.png`.
 - If the atlas JPG is downsampled, marker coordinates are scaled automatically
   (using `Atlas_*.mrc` dimensions when present).
-- If no atlas metadata is found, the app falls back to the plain atlas image.
-  Use `--no-atlas-overlay` to disable this overlay behavior.
+- The app start page now shows three atlas overview panels when atlas metadata is available:
+  1) screened GridSquares overlay, 2) all squares with EPU category overlay, and 3) raw atlas (no overlay).
+- Category overlays use semi-transparent markers (50% opacity).
+- **Important:** EPU category colors are currently arbitrary and do **not** match the EPU GUI color code.
+- If no atlas metadata is found, the app falls back to plain atlas images.
+  Use `--no-atlas-overlay` to disable atlas marker overlays.
 - In the Windows launcher, this behavior maps to:
   - **Use EPU atlas data** → metadata-based atlas overlays in UI/PDF
   - **Use atlas screenshot with screened GridSquares** → static atlas mode
@@ -192,15 +195,13 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
 
 ## Outputs
 
-- `Screening_overview.pdf` – one-page overview of ratings, selections, and
-  atlas snapshot.
-- `Screening_details.pdf` – montage pages for squares you marked for data
-  collection, including foil/data thumbnails plus metadata.
+- `Screening_report.pdf` – combined PDF with overview on page 1, followed by
+  detailed pages for selected GridSquares.
+- `Screening_details.pdf` – optional details-only export (e.g. via
+  `--details-only` / `--export-all-details`), including foil/data thumbnails plus metadata.
 - `review_responses.json` – the persisted ratings, comments, and inclusion
   flags, written next to the disc so you can resume later.
 - `review_summary.txt` – optional one-line session summary entered on the final
   page before downloading reports.
 
-Use the web UI to download either report once you finish reviewing. The app’s
-sole goal is to surface the best GridSquares/FoilHoles for downstream data
-collection decisions.
+Use the web UI to download the combined report once you finish reviewing.
