@@ -3,18 +3,18 @@
 The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth following up. It renders every square, lets you add per-square ratings/comments, and exports PDF reports.
 
 # UI overview
-The screenshot shows the reviewing app. 
+The screenshot shows the main review page.
 
-![UI overview](images/UI_overview.png)
+![UI overview](images/UI_overview.JPG)
 
-**Top left pannel:** 
-- Shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. You can adjust contrast via **Show MRC for selected image** on the right. Zoom stays inside the viewer window, and **Pan** lets you drag around the zoomed image.
+**Left side:**
+- The main viewer shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. When foil overlays are enabled, the current GridSquare overlay is shown next to the viewer.
 
 **Right panel:**
-- Lets you add comments and a rating for the current GridSquare. **Include this GridSquare in the final report** is enabled by default, so you only need to untick it for squares you want to leave out of the final PDF.
+- Shows the Atlas card, background-task status, rating buttons, report inclusion checkbox, comment box, and viewer controls. You can switch between JPEG/MRC here, adjust contrast, zoom within the viewer, and enable **Pan** to drag the zoomed image.
 
-**Bottom pannel:**
-- Shows FoilHoles next to Data images
+**Bottom panel:**
+- Shows FoilHole thumbnails next to their Data images. Clicking any thumbnail updates the main viewer.
 
 ## What You Need
 
@@ -23,6 +23,28 @@ The screenshot shows the reviewing app.
 - Atlas input (optional but strongly recommended):
   - **Preferred (new mode):** an **Atlas root directory** that contains `Atlas_*.jpg` (or `.png`) plus metadata (`.dm`; optional `.mrc` for contrast).
   - **Legacy mode:** a static atlas screenshot (`.jpg`/`.png`) without metadata-based highlighting.
+
+## Which Paths To Provide In The GUI
+
+Use the same path types that the launcher labels ask for:
+
+| GUI field | What you should provide | Correct example | Do not provide |
+| --- | --- | --- | --- |
+| `Session root or Images-Disc folder:` | Prefer the **session root**. This is the folder that contains `EpuSession.dm`, `Metadata/`, and `Images-Disc1/` (and possibly `Images-Disc2/`, etc.). | `/data/20260220_screening/` | `Metadata/`, `Atlas/`, or an individual `GridSquare_12345/` unless you are debugging |
+| `Atlas mode: Use EPU atlas data (Recommended)` and `Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):` | The **Atlas folder itself**. This folder should contain `Atlas_*.jpg` or `Atlas_*.png`, plus the corresponding `.dm`; `.mrc` is optional for contrast control. | `/data/20260220_screening/Atlas/` | The individual `Atlas_123456.jpg` file in this mode |
+| `Atlas mode: Use atlas screenshot with screened GridSquares` and `Atlas screenshot file (JPG/PNG):` | A single atlas image file (`.jpg` or `.png`). Use this only if you do not want metadata-based atlas mapping. | `/data/20260220_screening/Atlas/Atlas_123456.jpg` | The whole `Atlas/` folder in this mode |
+
+The safest choice for most users is:
+
+1. Put the **session root** into `Session root or Images-Disc folder:`
+2. Leave atlas mode on **Use EPU atlas data (Recommended)**
+3. Put the **Atlas folder** into `Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):`
+
+Common mistakes:
+
+- Do not point the first field at `Metadata/` or `Atlas/`.
+- In **Use EPU atlas data** mode, do not pick the atlas JPEG itself; pick the folder containing the atlas files.
+- Only point directly at an `Images-Disc*` folder or a single `GridSquare_*` folder if you intentionally want a reduced/debugging scope.
 
 <details>
 <summary>Advanced path options</summary>
@@ -60,12 +82,16 @@ directory.
    [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
 2. Double-click the installer and accept the defaults (the installer bundles
    Python, so no extra dependencies are needed).
-3. Launch **EPU Mapper Review** from the Start Menu shortcut, choose your
-   session root (or `Images-Disc*` folder), then select one Atlas mode:
-   - **Use EPU atlas data** (default): provide the Atlas root directory.
-   - **Use atlas screenshot with screened GridSquares**: provide a static atlas image.
-   Click **Start review**.
-4. Overlay transform is now under **Show advanced settings** (hidden by
+3. Launch **EPU Mapper Review** from the Start Menu shortcut.
+4. Fill the launcher fields exactly as described in [Which Paths To Provide In The GUI](#which-paths-to-provide-in-the-gui):
+   - `Session root or Images-Disc folder:` → usually the **session root**
+   - `Use EPU atlas data (Recommended)` → choose the **Atlas folder**
+   - `Use atlas screenshot with screened GridSquares` → choose the **atlas JPG/PNG file**
+5. Click **Start review**.
+   If you want the launcher to skip the browser-based review entirely, use
+   **Export detailed PDF without review** instead. That button immediately
+   generates the detailed PDF for all GridSquares.
+6. Overlay transform is now under **Show advanced settings** (hidden by
    default in the launcher).
 
 Advanced packaging details for maintainers are documented separately in
@@ -88,6 +114,10 @@ conda activate epu-mapper
 ```bash
 ./scripts/run_review_app.sh /path/to/session_root --atlas /path/to/Atlas --host 127.0.0.1 --port 8000 --open
 ```
+
+This uses the same recommended inputs as the GUI: session root for the main
+path, Atlas directory for `--atlas`.
+
 <details>
 If you prefer to target a specific disc directly, replace `/path/to/session_root`
 with `/path/to/Images-Disc1` (or another disc) and drop `--images-subdir`. When
@@ -112,8 +142,9 @@ and Windows builds use.
   included in generated reports.
 - **Skip the UI and export everything** – add `--details-only`
   (alias: `--export-all-details`) to the command to render the detailed PDF for
-  *every* GridSquare, then exit immediately. Use `--details-output path/to/out.pdf`
-  if you want to override the default filename.
+  *every* GridSquare, then exit immediately. The Windows launcher exposes the
+  same behavior via **Export detailed PDF without review**. Use
+  `--details-output path/to/out.pdf` if you want to override the default filename.
 
 ### GridSquare Order
 
@@ -174,8 +205,9 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
 
 ## Atlas Marker Overlay
 
-- When you provide an atlas image via `--atlas`, the app now tries to read
-  `Atlas.dm` from the same folder and marks GridSquares directly on atlas views.
+- When you provide an atlas path via `--atlas` (image file or atlas directory),
+  the app tries to read `Atlas.dm` from the same folder and marks GridSquares
+  directly on atlas views.
 - `--atlas` accepts either an atlas image file or an atlas directory. If you
   pass a directory, the app auto-picks the latest matching `Atlas_*.jpg/.png`.
 - If the atlas JPG is downsampled, marker coordinates are scaled automatically
@@ -184,6 +216,7 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
   1) screened GridSquares overlay, 2) all squares with EPU category overlay, and 3) raw atlas (no overlay).
 - Category overlays use semi-transparent markers (50% opacity).
 - **Important:** EPU category colors are currently arbitrary and do **not** match the EPU GUI color code.
+- Current category palette in this app: `0 = turquoise`, `1 = orange`, `2 = blue`, `3 = yellow`, `4 = pink`.
 - If no atlas metadata is found, the app falls back to plain atlas images.
   Use `--no-atlas-overlay` to disable atlas marker overlays.
 - In the Windows launcher, this behavior maps to:
@@ -205,3 +238,8 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
   page before downloading reports.
 
 Use the web UI to download the combined report once you finish reviewing.
+
+## Acknowledgements
+
+- Max Wilkinson (`wilkinm@mskcc.org`) shared code that helped with mapping
+  FoilHole positions onto GridSquare images.

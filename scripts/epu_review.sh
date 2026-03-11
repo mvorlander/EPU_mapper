@@ -7,7 +7,7 @@ DEFAULT_PORT=${PORT_OVERRIDE:-8000}
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") --epu-dir /path/to/session_root [--atlas /path/to/atlas.jpg] [options] [-- review_app args]
+Usage: $(basename "$0") --epu-dir /path/to/session_root [--atlas /path/to/Atlas] [options] [-- review_app args]
 
 Required:
   --epu-dir PATH      Path to the session root that contains EpuSession.dm,
@@ -16,7 +16,8 @@ Required:
                       be written next to the EPU data.
 
 Common optional:
-  --atlas PATH        Path to the atlas screenshot (absolute or relative).
+  --atlas PATH        Path to the atlas directory or atlas screenshot
+                      (absolute or relative).
   --session-label TXT Prefix added to generated PDF filenames.
   --no-overlay        Skip automatic creation/display of foil overlays (enabled by default).
   --details-only      Generate the detailed PDF for every GridSquare and exit (no web UI).

@@ -228,8 +228,12 @@ class ReviewLauncher:
         self.launch_btn = ttk.Button(btn_row, text="Start review", command=self.start_server)
         self.launch_btn.grid(row=0, column=0, sticky="w")
         ttk.Button(btn_row, text="Stop", command=self.stop_server).grid(row=0, column=1, padx=(10, 0))
-        self.details_btn = ttk.Button(btn_row, text="Export detailed PDF", command=self.export_details)
+        self.details_btn = ttk.Button(btn_row, text="Export detailed PDF without review", command=self.export_details)
         self.details_btn.grid(row=0, column=2, padx=(10, 0))
+        ttk.Label(
+            frm,
+            text="This export runs immediately for all GridSquares and skips the interactive review UI.",
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         output_frame = ttk.LabelFrame(self.root, text="Server log", padding=6)
         output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
@@ -478,7 +482,7 @@ class ReviewLauncher:
 
     def _run_details_job(self, cmd: list[str], session_path: str, transform: str) -> None:
         env = self._build_env()
-        self._log("Generating detailed PDF for all GridSquares…\n")
+        self._log("Generating detailed PDF for all GridSquares without interactive review…\n")
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -501,7 +505,13 @@ class ReviewLauncher:
             self._log("Detailed PDF export finished.\n")
             self.root.after(0, lambda: self._remember_session(session_path))
             self.root.after(0, lambda: self._persist_preferences(transform))
-            self.root.after(0, lambda: messagebox.showinfo("Export complete", "Detailed PDF generated successfully."))
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Export complete",
+                    "Detailed PDF generated successfully without interactive review.",
+                ),
+            )
         else:
             self._log(f"Detailed export failed (exit code {ret}).\n")
             self.root.after(0, lambda: messagebox.showerror("Export failed", f"review_app exited with code {ret}"))
