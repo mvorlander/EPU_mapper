@@ -347,11 +347,11 @@ def _load_image(path: Path, mode: str | None = None) -> Image.Image | None:
 _ATLAS_MAPPING_CACHE: dict[Path, tuple[dict[str, dict], float | None, float | None]] = {}
 _EPU_CATEGORY_COLORS: dict[int, tuple[int, int, int]] = {
     -1: (148, 163, 184),
-    0: (96, 165, 250),
-    1: (74, 222, 128),
-    2: (250, 204, 21),
-    3: (251, 146, 60),
-    4: (239, 68, 68),
+    0: (64, 224, 208),
+    1: (249, 115, 22),
+    2: (59, 130, 246),
+    3: (250, 204, 21),
+    4: (236, 72, 153),
     5: (192, 132, 252),
     6: (217, 70, 239),
 }
