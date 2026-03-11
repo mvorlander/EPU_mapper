@@ -11,7 +11,7 @@ The screenshot shows the reviewing app.
 - Shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. You can adjust contrast via **Show MRC for selected image** on the right. Zoom stays inside the viewer window, and **Pan** lets you drag around the zoomed image.
 
 **Right panel:**
-- Lets you add comments and a rating for the current GridSquare. If you tick **Include this GridSquare in the final report**, detailed pages for that square are added to the final PDF.
+- Lets you add comments and a rating for the current GridSquare. **Include this GridSquare in the final report** is enabled by default, so you only need to untick it for squares you want to leave out of the final PDF.
 
 **Bottom pannel:**
 - Shows FoilHoles next to Data images
@@ -196,7 +196,7 @@ PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
 ## Outputs
 
 - `Screening_report.pdf` – combined PDF with overview on page 1, followed by
-  detailed pages for selected GridSquares.
+  detailed pages for included GridSquares.
 - `Screening_details.pdf` – optional details-only export (e.g. via
   `--details-only` / `--export-all-details`), including foil/data thumbnails plus metadata.
 - `review_responses.json` – the persisted ratings, comments, and inclusion

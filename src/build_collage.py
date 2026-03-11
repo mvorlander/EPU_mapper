@@ -2183,11 +2183,11 @@ def _build_overview_page_image(
     draw.text((margin, stats_y), color_note, fill=(80, 88, 108), font=fonts["small"])
     stats_y += line_h
     reviewed_count = sum(1 for resp in responses.values() if resp)
-    selected_count = sum(1 for resp in responses.values() if resp and bool(resp.get("include")))
+    selected_count = sum(1 for resp in responses.values() if resp and bool(resp.get("include", True)))
     stats_lines = [
         f"Total GridSquares: {len(grids)}",
         f"Reviewed GridSquares: {reviewed_count}",
-        f"Selected GridSquares: {selected_count}",
+        f"Included GridSquares: {selected_count}",
     ]
     for text in stats_lines:
         draw.text((margin, stats_y), text, fill=0, font=fonts["body"])
@@ -2199,7 +2199,7 @@ def _build_overview_page_image(
         resp = responses.get(name)
         rating = resp.get("rating", "—") if resp else "—"
         comment = (resp.get("comment", "") if resp else "").strip()
-        include_flag = "Yes" if resp and resp.get("include") else "No"
+        include_flag = "Yes" if resp and resp.get("include", True) else "No"
         category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
         rows.append(
             (
@@ -2231,7 +2231,7 @@ def _build_overview_page_image(
 
     legend = (
         "Each row lists the GridSquare order, EPU category score, rating (0 means skipped), "
-        "reviewer notes, and whether it was marked for detailed review."
+        "reviewer notes, and whether it remained included in the detailed report."
     )
     for chunk in textwrap.wrap(legend, width=120):
         draw.text((margin, y_offset), chunk, fill=0, font=fonts["body"])
@@ -2289,7 +2289,7 @@ def _append_selected_report_pages(
     include_list = []
     for idx, (gid, gdir) in enumerate(grids, start=1):
         resp = responses.get(gdir.name)
-        if resp and bool(resp.get("include")):
+        if resp and bool(resp.get("include", True)):
             include_list.append((idx, gid, gdir, resp))
     failed: list[tuple[str, str]] = []
     summary_text = (global_summary or "").strip()
@@ -2297,7 +2297,7 @@ def _append_selected_report_pages(
         summary_lines = textwrap.wrap(summary_text, width=100) or [summary_text]
         _draw_pdf_message_page(pdf, summary_lines, title="Session Summary")
     if not include_list:
-        _draw_pdf_message_page(pdf, ["No GridSquares selected for this report."])
+        _draw_pdf_message_page(pdf, ["No GridSquares included in this report."])
     else:
         for idx, gid, gdir, resp in include_list:
             grid_name = gdir.name
@@ -2355,7 +2355,7 @@ def _append_selected_report_pages(
                 print(f"[selected_report] skipping {grid_name}: {exc}")
                 continue
     if failed:
-        lines = ["Some selected GridSquares were skipped:"]
+        lines = ["Some included GridSquares were skipped:"]
         for name, reason in failed[:12]:
             lines.append(f"- {name}: {reason}")
         if len(failed) > 12:

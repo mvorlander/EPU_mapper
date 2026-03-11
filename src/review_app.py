@@ -940,7 +940,7 @@ def create_app(
     def _item_key(idx: int) -> str:
         return items[idx]["dir"].name
 
-    def _normalize_review_entry(payload: dict, default_include: bool = False) -> dict:
+    def _normalize_review_entry(payload: dict, default_include: bool = True) -> dict:
         rating_raw = payload.get("rating", 0)
         try:
             rating = int(rating_raw)
@@ -1052,14 +1052,14 @@ def create_app(
         rows: list[dict] = []
         for idx_item, item in enumerate(items):
             name = item["dir"].name
-            response = _normalize_review_entry(responses.get(name, {}), default_include=False)
+            response = _normalize_review_entry(responses.get(name, {}), default_include=True)
             rows.append(
                 {
                     "index": idx_item + 1,
                     "gridsquare_id": item["id"],
                     "gridsquare_dir": name,
                     "gridsquare_image": item["name"],
-                    "include": bool(response.get("include", False)),
+                    "include": bool(response.get("include", True)),
                     "rating": int(response.get("rating", 0)),
                     "comment": str(response.get("comment", "")),
                     "foil_count": len(item["foils"]),
@@ -1352,7 +1352,8 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <li>Ctrl/Cmd+Enter: submit current GridSquare</li>
 </ul>
 <div class=\"section-title\">Report</div>
-<label class=\"note\"><input type=\"checkbox\" id=\"include-report\"> Include this GridSquare in the final report</label>
+<label class=\"note\"><input type=\"checkbox\" id=\"include-report\" checked> Include this GridSquare in the final report</label>
+<div class=\"note\">Clear this to leave the GridSquare out of the PDF.</div>
 <div>Selected rating: <span id=\"selected\">3</span></div>
 <div>Comments:</div>
 <textarea id=\"comment\" rows=\"4\"></textarea>
@@ -2059,7 +2060,7 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
             idx = -1
         if idx < 0 or idx >= len(items):
             return JSONResponse({"error": "invalid idx"}, status_code=400)
-        entry = _normalize_review_entry(payload, default_include=False)
+        entry = _normalize_review_entry(payload, default_include=True)
         item_name = _item_key(idx)
         with drafts_lock:
             drafts[item_name] = entry
@@ -2079,7 +2080,7 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
                 idx = -1
             if idx < 0 or idx >= len(items):
                 return JSONResponse({"next": None})
-            normalized = _normalize_review_entry(data, default_include=False)
+            normalized = _normalize_review_entry(data, default_include=True)
             rating = normalized["rating"]
             comment = normalized["comment"]
             include = normalized["include"]
@@ -2256,7 +2257,7 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 <label class="summary-label" for="global-summary">Session summary (one sentence, optional)</label>
 <textarea id="global-summary" rows="2" maxlength="__SUMMARY_MAX_LEN__"></textarea>
 <div><button type="button" class="btn" id="save-summary">Save summary</button></div>
-<div class="note">Then generate the full PDF report (overview first, followed by detailed selected GridSquares).</div>
+<div class="note">Then generate the full PDF report (overview first, followed by detailed included GridSquares).</div>
 <a class="btn" id="report-link" href="#">Generate full PDF report</a>
 <div class="note">Export structured review data:</div>
 <a class="btn secondary" id="export-csv" href="/export.csv">Download CSV</a>
