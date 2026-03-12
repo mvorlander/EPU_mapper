@@ -148,7 +148,7 @@ class ReviewLauncher:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        ttk.Label(frm, text="Session root or Images-Disc folder:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text="EPU session output folder:").grid(row=0, column=0, sticky="w")
         self.session_var = tk.StringVar(value=self.preferences.get("last_session", ""))
         session_entry = ttk.Entry(frm, textvariable=self.session_var, width=70)
         session_entry.grid(row=1, column=0, sticky="we")
@@ -243,7 +243,7 @@ class ReviewLauncher:
         self.log_text.configure(state="disabled")
 
     def browse_session(self) -> None:
-        path = filedialog.askdirectory(title="Select session root or Images-Disc folder")
+        path = filedialog.askdirectory(title="Select EPU session output folder")
         if path:
             self.session_var.set(path)
 
@@ -298,10 +298,10 @@ class ReviewLauncher:
             return
         session_path = self.session_var.get().strip()
         if not session_path:
-            messagebox.showerror("Missing path", "Please select a session root or Images-Disc folder.")
+            messagebox.showerror("Missing path", "Please select the EPU session output folder.")
             return
         if not Path(session_path).exists():
-            messagebox.showerror("Invalid path", "The selected session path does not exist.")
+            messagebox.showerror("Invalid path", "The selected EPU session output folder does not exist.")
             return
         self._store_atlas_input()
         atlas_path = self._current_atlas_path()
@@ -358,10 +358,10 @@ class ReviewLauncher:
             return
         session_path = self.session_var.get().strip()
         if not session_path:
-            messagebox.showerror("Missing path", "Please select a session root or Images-Disc folder.")
+            messagebox.showerror("Missing path", "Please select the EPU session output folder.")
             return
         if not Path(session_path).exists():
-            messagebox.showerror("Invalid path", "The selected session path does not exist.")
+            messagebox.showerror("Invalid path", "The selected EPU session output folder does not exist.")
             return
         self._store_atlas_input()
         atlas_path = self._current_atlas_path()

@@ -18,33 +18,26 @@ The screenshot shows the main review page.
 
 ## What You Need
 
-- Point the app at the **session root** (the directory that contains `EpuSession.dm`,
-`Metadata/`, and one or more `Images-Disc*` subfolders).
-- Atlas input (optional but strongly recommended):
-  - **Preferred (new mode):** an **Atlas root directory** that contains `Atlas_*.jpg` (or `.png`) plus metadata (`.dm`; optional `.mrc` for contrast).
-  - **Legacy mode:** a static atlas screenshot (`.jpg`/`.png`) without metadata-based highlighting.
+- Point the app at the same folder you set as the EPU **Output folder**.
+- If you use the recommended atlas mode, point the Atlas field at the `Atlas/`
+  folder that EPU created when generating the atlases.
 
 ## Which Paths To Provide In The GUI
 
-Use the same path types that the launcher labels ask for:
+- `EPU session output folder:` use the same path as the **Output folder** in
+  EPU. It should contain `EpuSession.dm`, `Metadata/`, and one or more
+  `Images-Disc*` folders.
 
-| GUI field | What you should provide | Correct example | Do not provide |
-| --- | --- | --- | --- |
-| `Session root or Images-Disc folder:` | Prefer the **session root**. This is the folder that contains `EpuSession.dm`, `Metadata/`, and `Images-Disc1/` (and possibly `Images-Disc2/`, etc.). | `/data/20260220_screening/` | `Metadata/`, `Atlas/`, or an individual `GridSquare_12345/` unless you are debugging |
-| `Atlas mode: Use EPU atlas data (Recommended)` and `Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):` | The **Atlas folder itself**. This folder should contain `Atlas_*.jpg` or `Atlas_*.png`, plus the corresponding `.dm`; `.mrc` is optional for contrast control. | `/data/20260220_screening/Atlas/` | The individual `Atlas_123456.jpg` file in this mode |
-| `Atlas mode: Use atlas screenshot with screened GridSquares` and `Atlas screenshot file (JPG/PNG):` | A single atlas image file (`.jpg` or `.png`). Use this only if you do not want metadata-based atlas mapping. | `/data/20260220_screening/Atlas/Atlas_123456.jpg` | The whole `Atlas/` folder in this mode |
+![EPU session setup](images/EPU_session_setup.png)
 
-The safest choice for most users is:
+- The launcher field layout is shown here:
 
-1. Put the **session root** into `Session root or Images-Disc folder:`
-2. Leave atlas mode on **Use EPU atlas data (Recommended)**
-3. Put the **Atlas folder** into `Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):`
+![EPU Mapper launcher](images/EPU_mapper_GUI.png)
 
-Common mistakes:
-
-- Do not point the first field at `Metadata/` or `Atlas/`.
-- In **Use EPU atlas data** mode, do not pick the atlas JPEG itself; pick the folder containing the atlas files.
-- Only point directly at an `Images-Disc*` folder or a single `GridSquare_*` folder if you intentionally want a reduced/debugging scope.
+- `Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):` use the `Atlas/`
+  folder that EPU created when it generated the atlases.
+- Only if you switch to **Use atlas screenshot with screened GridSquares**
+  should you select a single atlas JPG/PNG file instead of the Atlas folder.
 
 <details>
 <summary>Advanced path options</summary>
@@ -84,7 +77,7 @@ directory.
    Python, so no extra dependencies are needed).
 3. Launch **EPU Mapper Review** from the Start Menu shortcut.
 4. Fill the launcher fields exactly as described in [Which Paths To Provide In The GUI](#which-paths-to-provide-in-the-gui):
-   - `Session root or Images-Disc folder:` → usually the **session root**
+   - `EPU session output folder:` → the same path as the EPU **Output folder**
    - `Use EPU atlas data (Recommended)` → choose the **Atlas folder**
    - `Use atlas screenshot with screened GridSquares` → choose the **atlas JPG/PNG file**
 5. Click **Start review**.
