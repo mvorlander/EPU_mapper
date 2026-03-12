@@ -2,95 +2,44 @@
 
 The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth following up. It renders every square, lets you add per-square ratings/comments, and exports PDF reports.
 
-# UI overview
-The screenshot shows the main review page.
+## Why use it
+- Inspect GridSquare, FoilHole, and Data images in one page.
+- Map the acquired FoilHoles onto the GridSquare and the current GridSquare
+  position on the atlas to pick the best areas.
+- Switch between JPEG and MRC, adjust contrast, zoom, and pan inside the main
+  viewer.
+- Rate each GridSquare, add reviewer comments, and choose whether it stays in
+  the final report.
 
-![UI overview](images/UI_overview.JPG)
 
-**Left side:**
-- The main viewer shows the Atlas by default (when available); otherwise it starts on the current GridSquare image. Clicking any Atlas/GridSquare/FoilHole/Data image updates this viewer to the last-clicked item. When foil overlays are enabled, the current GridSquare overlay is shown next to the viewer.
+![Annotated web app](images/webapp_annotated.png)
 
-**Right panel:**
-- Shows the Atlas card, background-task status, rating buttons, report inclusion checkbox, comment box, and viewer controls. You can switch between JPEG/MRC here, adjust contrast, zoom within the viewer, and enable **Pan** to drag the zoomed image.
+### Export summaries to guide your data collection set-up
 
-**Bottom panel:**
-- Shows FoilHole thumbnails next to their Data images. Clicking any thumbnail updates the main viewer.
+The app generates a PDF with a high-level summary and detailed per-grid-square
+images. The overview is useful to quickly decide on the best squares when
+setting up your high-res data collection:
 
-## What You Need
+![PDF overview](images/EPU_mapper_PDF_overview.png)
 
-- Point the app at the same folder you set as the EPU **Output folder**.
-- If you use the recommended atlas mode, point the Atlas field at the `Atlas/`
-  folder that EPU created when generating the atlases.
+- The combined PDF starts with atlas overviews, EPU category overview, session
+  summary, and the review table with ratings and comments.
+- Detailed pages then show each selected GridSquare in context, including atlas
+  location, foil overlay, matched FoilHole/Data images, and acquisition
+  metadata.
 
-## Which Paths To Provide In The GUI
+## Installation
 
-- `EPU session output folder:` use the same path as the **Output folder** in
-  EPU. It should contain `EpuSession.dm`, `Metadata/`, and one or more
-  `Images-Disc*` folders.
-
-![EPU session setup](images/EPU_session_setup.png)
-
-- The launcher field layout is shown here:
-
-![EPU Mapper launcher](images/EPU_mapper_GUI.png)
-
-- `Atlas root directory (contains Atlas_*.jpg/.dm/.mrc):` use the `Atlas/`
-  folder that EPU created when it generated the atlases.
-- Only if you switch to **Use atlas screenshot with screened GridSquares**
-  should you select a single atlas JPG/PNG file instead of the Atlas folder.
-
-<details>
-<summary>Advanced path options</summary>
-
-- The app picks the first disc automatically; override it with
-  `--images-subdir Images-Disc2` or `IMAGES_SUBDIR=Images-Disc2`.
-- Power users can still point directly at an `Images-Disc*` folder (or even a
-  single `GridSquare_<ID>` directory) when debugging individual squares, but
-  the session root keeps all metadata together and remains the recommended
-  default.
-
-</details>
-
-To draw foil overlays, keep the session metadata next to the disc:
-
-```
-Images-Disc1/
-├── GridSquare_19828383/
-│   ├── GridSquare_20260220_132420.jpg
-│   ├── FoilHoles/FoilHole_19919351_20260220_132420.jpg (+ .xml)
-│   └── Data/FoilHole_19919351_Data_20260220_132420.jpg (+ .xml)
-├── Metadata/
-│   └── GridSquare_19828383.dm
-├── EpuSession.dm
-└── review_responses.json / PDFs   # written by the app
-```
-
-The `.dm` files inside `Metadata/` plus the top-level `EpuSession.dm` are used to plot the FoilHole positions onto the GridSquare images.
-For atlas mapping, pass `--atlas` as either an atlas image path or an atlas
-directory.
-
-## Windows Installer
+### Windows installer
 
 1. Download the latest `EPUMapperReviewInstaller_<version>.exe` from the
    [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
 2. Double-click the installer and accept the defaults (the installer bundles
    Python, so no extra dependencies are needed).
 3. Launch **EPU Mapper Review** from the Start Menu shortcut.
-4. Fill the launcher fields exactly as described in [Which Paths To Provide In The GUI](#which-paths-to-provide-in-the-gui):
-   - `EPU session output folder:` → the same path as the EPU **Output folder**
-   - `Use EPU atlas data (Recommended)` → choose the **Atlas folder**
-   - `Use atlas screenshot with screened GridSquares` → choose the **atlas JPG/PNG file**
-5. Click **Start review**.
-   If you want the launcher to skip the browser-based review entirely, use
-   **Export detailed PDF without review** instead. That button immediately
-   generates the detailed PDF for all GridSquares.
-6. Overlay transform is now under **Show advanced settings** (hidden by
-   default in the launcher).
 
-Advanced packaging details for maintainers are documented separately in
-`windows/README.md`.
 
-## Run Locally (conda)
+### Install in conda env (for macOS or Linux)
 
 Use the provided `environment.yml` to create a reproducible Conda environment.
 
@@ -105,26 +54,64 @@ conda activate epu-mapper
 **Usage**
 
 ```bash
-./scripts/run_review_app.sh /path/to/session_root --atlas /path/to/Atlas --host 127.0.0.1 --port 8000 --open
+./scripts/run_review_app.sh //offloaddata/path/to/session/output --atlas /path/to/Atlas --host 127.0.0.1 --port 8000 --open
 ```
 
-This uses the same recommended inputs as the GUI: session root for the main
-path, Atlas directory for `--atlas`.
+This uses the same recommended inputs as the GUI: the EPU session output folder
+for the main path, and the Atlas directory for `--atlas`.
 
-<details>
-If you prefer to target a specific disc directly, replace `/path/to/session_root`
-with `/path/to/Images-Disc1` (or another disc) and drop `--images-subdir`. When
-the session root contains multiple discs, add `--images-subdir Images-Disc2` (or
-set `IMAGES_SUBDIR=Images-Disc2`) to pick one explicitly. Remove `--overlay` (or
-add `--no-overlay`) if the metadata files are missing or you only want raw JPEGs.
 
-Prefer running through `scripts/run_review_app.sh` whenever possible—it keeps
-`PYTHONPATH` pointed at `src/` and mirrors the exact invocation the container
-and Windows builds use.
-</details>
+## Step-by-step walkthrough
 
-### Optional helpers
+### 1. Find the EPU output folder
 
+![EPU session setup](images/EPU_screen_setup.png)
+
+Use the same folder shown as `Output folder` in the EPU session setup. This is the path you should paste into the app as the `EPU session output folder`, and it should contain one or more `Images-Disc*` folders with a structure like this:
+
+```
+Images-Disc1/
+├── GridSquare_19828383/
+│   ├── GridSquare_20260220_132420.jpg
+│   ├── FoilHoles/FoilHole_19919351_20260220_132420.jpg (+ .xml)
+│   └── Data/FoilHole_19919351_Data_20260220_132420.jpg (+ .xml)
+├── Metadata/
+│   └── GridSquare_19828383.dm
+├── EpuSession.dm
+└── review_responses.json / PDFs   # written by the app
+```
+
+
+### 2. Start the launcher and fill the launcher fields
+
+![EPU Mapper launcher](images/EPU_mapper_Launcher.png)
+
+- `EPU session output folder:` use the EPU `Output folder` path shown above.
+- `Use EPU atlas data (Recommended):` point this to the `Atlas/` folder that EPU created when generating the atlases.
+- `Session/Grid label (optional):` adds a prefix to the exported PDF filenames.
+- `Start review:` launches the web app.
+- `Export detailed PDF without review:` skips the interactive UI and generates a
+  detailed PDF for all GridSquares immediately.
+
+### 3. The start page
+
+![EPU Mapper first page](images/EPU_mapper_1st_page.png)
+
+The start page runs preflight checks, confirms that the session folders were found, and shows three atlas previews: screened GridSquares, all atlas squares by EPU category, and the raw atlas.
+
+### 4. Review GridSquares in the web app
+
+Use the annotated screenshot in the `Why use it` section as the reference for the main interactive workflow. This is where you inspect images, adjust MRC  contrast, rate each GridSquare, and add reviewer comments.
+
+### 5. Export the detailed pages
+
+![PDF details](images/EPU_mapper_PDF_details.png)
+
+Each detailed page shows the current GridSquare in context: atlas location,
+GridSquare image, foil overlay, matched FoilHole/Data images, and acquisition
+metadata.
+
+## Additional info
 - **Prefix PDF names** – provide a session/grid label once and reuse it for
   generated reports. Either set `SESSION_LABEL=MyRun` (or `GRID_LABEL` / `REPORT_PREFIX`)
   before launching, or pass `--grid-label MyRun` / `--session-label MyRun` to
@@ -166,58 +153,6 @@ The Apptainer workflow used on the VBC cluster is documented in
 `scripts/build_and_copy_epu_mapper.sh` and running the `epu_review.sh` wrapper.
 Most users outside VBC can ignore this section.
 
-## Foil Overlay Utilities
-
-- The main app writes `foil_overlay.png` beside each grid automatically (use
-  `--no-overlay` if you prefer to disable this). If the required `Metadata/`
-  or `EpuSession.dm` files are missing, overlays are skipped gracefully and a
-  banner explains why.
-- Overlays default to the `identity` transform (matching EPU’s orientation). In case you find the plotted positions don't match, there are options to force rotating the GridSquare image.
-
-<details>
-<summary>GridSquare rotation options</summary>
-
-- If you know a specific rotation/flip is needed, supply
-  `--overlay-transform rot90` (or `rot180`, `rot270`, `mirror_x`,
-  `mirror_y`, `mirror_diag`, `mirror_diag_inv`) or use `--overlay-transform auto`
-  to let the tool pick the best match on the fly.
-- To debug mapping logic on a single square:
-
-```bash
-PYTHONPATH=src MPLCONFIGDIR=/tmp/mplcache FONTCONFIG_PATH=/tmp/mplcache \
-  python scripts/plot_foilhole_positions.py \
-    Example_data/prefloated/Images-Disc1/GridSquare_19828383 \
-    --output /tmp/GridSquare_19828383_overlay.png \
-    --dump-transforms /tmp/outdir
-```
-
-  That command also saves diagnostic PNGs for each tested rotation/mirror in
-  `/tmp/outdir`.
-
-</details>
-
-## Atlas Marker Overlay
-
-- When you provide an atlas path via `--atlas` (image file or atlas directory),
-  the app tries to read `Atlas.dm` from the same folder and marks GridSquares
-  directly on atlas views.
-- `--atlas` accepts either an atlas image file or an atlas directory. If you
-  pass a directory, the app auto-picks the latest matching `Atlas_*.jpg/.png`.
-- If the atlas JPG is downsampled, marker coordinates are scaled automatically
-  (using `Atlas_*.mrc` dimensions when present).
-- The app start page now shows three atlas overview panels when atlas metadata is available:
-  1) screened GridSquares overlay, 2) all squares with EPU category overlay, and 3) raw atlas (no overlay).
-- Category overlays use semi-transparent markers (50% opacity).
-- **Important:** EPU category colors are currently arbitrary and do **not** match the EPU GUI color code.
-- Current category palette in this app: `0 = turquoise`, `1 = orange`, `2 = blue`, `3 = yellow`, `4 = pink`.
-- If no atlas metadata is found, the app falls back to plain atlas images.
-  Use `--no-atlas-overlay` to disable atlas marker overlays.
-- In the Windows launcher, this behavior maps to:
-  - **Use EPU atlas data** → metadata-based atlas overlays in UI/PDF
-  - **Use atlas screenshot with screened GridSquares** → static atlas mode
-- The atlas panel is clickable: selecting it enables `Show MRC` (if
-  `Atlas_*.mrc` is present), the same contrast sliders, and zoom controls
-  (`Zoom -`, `Zoom +`, `Reset zoom`) used for the main image viewer.
 
 ## Outputs
 
