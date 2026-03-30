@@ -517,6 +517,7 @@ def _preflight_checks(
     overlay_requested: bool,
     overlay_enabled: bool,
     atlas_overlay: bool,
+    skip_foil_processing: bool = False,
 ) -> dict[str, list[str]]:
     checks: dict[str, list[str]] = {"errors": [], "warnings": [], "info": []}
     checks["info"].append(f"Detected {len(grids)} GridSquare directories under {base_dir}.")
@@ -530,7 +531,11 @@ def _preflight_checks(
     else:
         checks["warnings"].append("Metadata folder not detected in parent folders.")
 
-    if overlay_requested and not overlay_enabled:
+    if skip_foil_processing:
+        checks["info"].append("FoilHole processing skipped; atlas/GridSquare-only mode enabled.")
+        if overlay_requested:
+            checks["info"].append("Foil overlays disabled in atlas/GridSquare-only mode.")
+    elif overlay_requested and not overlay_enabled:
         checks["warnings"].append("Foil overlay was requested but disabled due to missing session metadata.")
     elif overlay_requested and overlay_enabled:
         checks["info"].append("Foil overlay generation enabled.")
@@ -755,6 +760,7 @@ def create_app(
     overlay_transform: str | None = "identity",
     session_label: str | None = None,
     atlas_overlay: bool = True,
+    skip_foil_processing: bool = False,
 ) -> FastAPI:
     _OVERLAY_EVENTS.clear()
     _configure_overlay_transform(overlay_transform)
@@ -762,7 +768,13 @@ def create_app(
     label_prefix = _prefix_from_label(session_label)
     overlay_enabled = bool(overlay)
     overlay_notice_html = ""
-    if overlay_enabled:
+    if skip_foil_processing:
+        overlay_enabled = False
+        overlay_notice_html = (
+            "<div class=\"note\">Atlas/GridSquare-only mode is active: "
+            "FoilHole scanning and foil overlay generation are skipped.</div>"
+        )
+    elif overlay_enabled:
         session_root, metadata_dir = _find_session_components(base_dir)
         missing_bits: list[str] = []
         if session_root is None:
@@ -784,6 +796,7 @@ def create_app(
         overlay_requested=bool(overlay),
         overlay_enabled=overlay_enabled,
         atlas_overlay=atlas_overlay,
+        skip_foil_processing=skip_foil_processing,
     )
     if preflight_state["errors"]:
         detail = "\n".join(f"- {msg}" for msg in preflight_state["errors"])
@@ -823,24 +836,28 @@ def create_app(
                         break
             if atlas_overlay and atlas_center_key is None and atlas_centers and atlas_overlay_message is None:
                 atlas_overlay_message = "GridSquare not found in Atlas metadata."
-        foils, datas = gather_foil_and_data(gdir)
-        foils = _latest_only(foils)
-        datas = _latest_only(datas)
         foil_list = []
-        for foil_id in sorted(foils.keys()):
-            for foil_path in foils[foil_id]:
-                foil_list.append({"id": foil_id, "path": foil_path, "mrc": _find_mrc_for_jpg(foil_path)})
         data_list = []
-        for data_id in sorted(datas.keys()):
-            for data_path in datas[data_id]:
-                if data_id in foils:
-                    meta_lines = []
-                    xml_path = data_path.with_suffix(".xml")
-                    if xml_path.is_file():
-                        meta_lines = _format_meta(parse_metadata(xml_path))
-                    data_list.append(
-                        {"id": data_id, "path": data_path, "mrc": _find_mrc_for_jpg(data_path), "meta": meta_lines}
-                    )
+        foil_processing_note = None
+        if skip_foil_processing:
+            foil_processing_note = "FoilHole processing skipped in Atlas/GridSquare-only mode."
+        else:
+            foils, datas = gather_foil_and_data(gdir)
+            foils = _latest_only(foils)
+            datas = _latest_only(datas)
+            for foil_id in sorted(foils.keys()):
+                for foil_path in foils[foil_id]:
+                    foil_list.append({"id": foil_id, "path": foil_path, "mrc": _find_mrc_for_jpg(foil_path)})
+            for data_id in sorted(datas.keys()):
+                for data_path in datas[data_id]:
+                    if data_id in foils:
+                        meta_lines = []
+                        xml_path = data_path.with_suffix(".xml")
+                        if xml_path.is_file():
+                            meta_lines = _format_meta(parse_metadata(xml_path))
+                        data_list.append(
+                            {"id": data_id, "path": data_path, "mrc": _find_mrc_for_jpg(data_path), "meta": meta_lines}
+                        )
         overlay_path = None
         overlay_message = None
         if overlay_enabled:
@@ -862,6 +879,7 @@ def create_app(
                 "epu_category_score": epu_category_score,
                 "overlay": overlay_path,
                 "overlay_message": overlay_message,
+                "foil_processing_note": foil_processing_note,
                 "foils": foil_list,
                 "data": data_list,
             }
@@ -1114,6 +1132,7 @@ def create_app(
                     overlay=overlay_enabled,
                     atlas_overlay=atlas_overlay,
                     global_summary=summary_state["text"],
+                    skip_foil_processing=skip_foil_processing,
                 )
             elif job_kind == "details":
                 write_selected_report(
@@ -1124,6 +1143,7 @@ def create_app(
                     overlay=overlay_enabled,
                     atlas_overlay=atlas_overlay,
                     global_summary=summary_state["text"],
+                    skip_foil_processing=skip_foil_processing,
                 )
             else:
                 raise ValueError(f"unknown report kind: {job_kind}")
@@ -1147,7 +1167,9 @@ def create_app(
     def review_html(idx: int) -> str:
         item = items[idx]
         has_data = bool(item["data"])
-        nodata_html = "" if has_data else "<div class=\"note warn\">No screening data available for this GridSquare.</div>"
+        nodata_html = ""
+        if not has_data and not item.get("foil_processing_note"):
+            nodata_html = "<div class=\"note warn\">No screening data available for this GridSquare.</div>"
         grid_has_mrc = bool(item["mrc"])
         grid_mrc_json = "true" if grid_has_mrc else "false"
         atlas_has_mrc = bool(item.get("atlas_mrc"))
@@ -1190,6 +1212,7 @@ def create_app(
         data_by_id = {}
         for d in item["data"]:
             data_by_id.setdefault(d["id"], []).append(d)
+        thumb_card_html = ""
         if item["foils"]:
             groups = []
             for f in item["foils"]:
@@ -1211,8 +1234,9 @@ def create_app(
                 data_block = f"<div class=\"thumb-grid\">{''.join(data_imgs)}</div>" if data_imgs else "<div class=\"note\">No data images for this FoilHole.</div>"
                 groups.append(f"<div class=\"foil-group\"><div class=\"foil-row\">{foil_thumb}<div class=\"data-block\">{data_block}</div></div></div>")
             thumb_html = "<div class=\"section-title\">Foil holes and data</div>" + "".join(groups)
-        else:
-            thumb_html = "<div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div>"
+            thumb_card_html = f"<div class=\"card\">{thumb_html}</div>"
+        elif not item.get("foil_processing_note"):
+            thumb_card_html = "<div class=\"card\"><div class=\"section-title\">Foil holes and data</div><div class=\"note\">No foil images found.</div></div>"
         overlay_banner = overlay_notice_html or ""
         warning_items = preflight_state.get("warnings", [])[:4]
         info_items = preflight_state.get("info", [])[:2]
@@ -1304,7 +1328,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div class=\"layout\">
 <div class=\"left\">
 {grid_section_html}
-<div class=\"card\">{thumb_html}</div>
+{thumb_card_html}
 </div>
 <div class=\"right\">
 <div class=\"card\">
@@ -2387,6 +2411,7 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
+                skip_foil_processing=skip_foil_processing,
             )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
@@ -2399,6 +2424,7 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
+                skip_foil_processing=skip_foil_processing,
             )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate full report: {exc}"}, status_code=500)
@@ -2417,6 +2443,7 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
+                skip_foil_processing=skip_foil_processing,
             )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
@@ -2429,6 +2456,7 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
+                skip_foil_processing=skip_foil_processing,
             )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate selected report: {exc}"}, status_code=500)
@@ -2447,6 +2475,7 @@ def generate_details_report(
     overlay: bool,
     overlay_transform: str | None,
     atlas_overlay: bool = True,
+    skip_foil_processing: bool = False,
 ) -> Path:
     base_dir = base_dir.resolve()
     _configure_overlay_transform(overlay_transform)
@@ -2469,6 +2498,7 @@ def generate_details_report(
         overlay=overlay,
         atlas_overlay=atlas_overlay,
         global_summary=summary_text,
+        skip_foil_processing=skip_foil_processing,
     )
     return target_path
 
@@ -2519,6 +2549,11 @@ def main():
         help="Overlay rotation/mirror transform when --overlay is enabled (default: identity; choose 'auto' to detect)",
     )
     parser.add_argument(
+        "--skip-foil-processing",
+        action="store_true",
+        help="skip FoilHole/data discovery and only map GridSquares onto the atlas for faster loading on large sessions",
+    )
+    parser.add_argument(
         "--atlas-overlay",
         dest="atlas_overlay",
         action="store_true",
@@ -2557,6 +2592,7 @@ def main():
                 args.overlay,
                 overlay_transform,
                 atlas_overlay=args.atlas_overlay,
+                skip_foil_processing=args.skip_foil_processing,
             )
         except RuntimeError as exc:
             print(f"[review_app] {exc}", file=sys.stderr)
@@ -2574,6 +2610,7 @@ def main():
         overlay_transform,
         session_label=args.session_label,
         atlas_overlay=args.atlas_overlay,
+        skip_foil_processing=args.skip_foil_processing,
     )
     if args.open:
         url = f"http://{args.host}:{args.port}"

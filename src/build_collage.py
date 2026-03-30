@@ -822,6 +822,8 @@ def _draw_grid_summary_page(
     grid_image_name: str,
     overlay_img: Image.Image | None = None,
     category_score: int | None = None,
+    foil_section_note: str | None = None,
+    show_foil_section: bool = True,
 ) -> None:
     """Render a GridSquare summary directly onto a ReportLab canvas."""
     _ensure_pdf_fonts()
@@ -895,8 +897,7 @@ def _draw_grid_summary_page(
         + info_card_height
         + section_gap
         + hero_card_height
-        + section_gap
-        + (rows_height if row_entries else 320)
+        + (section_gap + (rows_height if row_entries else 320) if show_foil_section else 0)
         + base_margin
     )
     page_height = max(total_height, _PDF_MIN_HEIGHT)
@@ -959,68 +960,73 @@ def _draw_grid_summary_page(
         c.drawString(x, img_y + 30, label)
     y -= hero_card_height + section_gap
 
-    thumb_w = (card_width - 2 * card_inner_pad - thumb_gap) / 2
-    if not row_entries:
-        c.setFillColor(card_color)
-        c.roundRect(base_margin, y - 280, card_width, 280, 30, stroke=0, fill=1)
-        c.setFillColor(text_color)
-        c.setFont(_PDF_FONT_REGULAR, 42)
-        c.drawString(base_margin + card_inner_pad, y - 180, 'No FoilHole imagery available for this GridSquare.')
-        y -= 280 + row_gap
-    else:
-        for entry in row_entries:
-            card_height = _row_height(entry)
+    if show_foil_section:
+        thumb_w = (card_width - 2 * card_inner_pad - thumb_gap) / 2
+        if not row_entries:
             c.setFillColor(card_color)
-            c.roundRect(base_margin, y - card_height, card_width, card_height, 34, stroke=0, fill=1)
-            label_y = y - card_inner_pad - 60
-            c.setFont(_PDF_FONT_BOLD, 46)
+            c.roundRect(base_margin, y - 280, card_width, 280, 30, stroke=0, fill=1)
             c.setFillColor(text_color)
-            hole_idx = entry['hole_index']
-            shot_idx = entry['shot_index']
-            foil_caption = f"Hole #{hole_idx}" if hole_idx else 'FoilHole'
-            if shot_idx:
-                foil_caption += f" · shot {shot_idx}"
-            data_caption = f"Data · hole #{hole_idx}" if hole_idx else 'Screening data'
-            foil_x = base_margin + card_inner_pad
-            data_x = base_margin + card_inner_pad + thumb_w + thumb_gap
-            c.drawString(foil_x, label_y, foil_caption)
-            c.drawString(data_x, label_y, data_caption)
-            img_y = y - card_inner_pad - 80 - thumb_h
-            placeholder_color = _pdf_color(233, 236, 244)
-            if entry['foil_reader']:
-                c.drawImage(entry['foil_reader'], foil_x, img_y, width=thumb_w, height=thumb_h, preserveAspectRatio=True, mask='auto')
-            else:
-                c.setFillColor(placeholder_color)
-                c.rect(foil_x, img_y, thumb_w, thumb_h, fill=1, stroke=0)
+            c.setFont(_PDF_FONT_REGULAR, 42)
+            c.drawString(
+                base_margin + card_inner_pad,
+                y - 180,
+                foil_section_note or 'No FoilHole imagery available for this GridSquare.',
+            )
+            y -= 280 + row_gap
+        else:
+            for entry in row_entries:
+                card_height = _row_height(entry)
+                c.setFillColor(card_color)
+                c.roundRect(base_margin, y - card_height, card_width, card_height, 34, stroke=0, fill=1)
+                label_y = y - card_inner_pad - 60
+                c.setFont(_PDF_FONT_BOLD, 46)
+                c.setFillColor(text_color)
+                hole_idx = entry['hole_index']
+                shot_idx = entry['shot_index']
+                foil_caption = f"Hole #{hole_idx}" if hole_idx else 'FoilHole'
+                if shot_idx:
+                    foil_caption += f" · shot {shot_idx}"
+                data_caption = f"Data · hole #{hole_idx}" if hole_idx else 'Screening data'
+                foil_x = base_margin + card_inner_pad
+                data_x = base_margin + card_inner_pad + thumb_w + thumb_gap
+                c.drawString(foil_x, label_y, foil_caption)
+                c.drawString(data_x, label_y, data_caption)
+                img_y = y - card_inner_pad - 80 - thumb_h
+                placeholder_color = _pdf_color(233, 236, 244)
+                if entry['foil_reader']:
+                    c.drawImage(entry['foil_reader'], foil_x, img_y, width=thumb_w, height=thumb_h, preserveAspectRatio=True, mask='auto')
+                else:
+                    c.setFillColor(placeholder_color)
+                    c.rect(foil_x, img_y, thumb_w, thumb_h, fill=1, stroke=0)
+                    c.setFillColor(muted_color)
+                    c.setFont(_PDF_FONT_SMALL, 32)
+                    c.drawCentredString(foil_x + thumb_w / 2, img_y + thumb_h / 2, "Foil image missing")
+                if entry['data_reader']:
+                    c.drawImage(entry['data_reader'], data_x, img_y, width=thumb_w, height=thumb_h, preserveAspectRatio=True, mask='auto')
+                else:
+                    c.setFillColor(placeholder_color)
+                    c.rect(data_x, img_y, thumb_w, thumb_h, fill=1, stroke=0)
+                    c.setFillColor(muted_color)
+                    c.setFont(_PDF_FONT_SMALL, 32)
+                    c.drawCentredString(data_x + thumb_w / 2, img_y + thumb_h / 2, "Data image missing")
                 c.setFillColor(muted_color)
-                c.setFont(_PDF_FONT_SMALL, 32)
-                c.drawCentredString(foil_x + thumb_w / 2, img_y + thumb_h / 2, "Foil image missing")
-            if entry['data_reader']:
-                c.drawImage(entry['data_reader'], data_x, img_y, width=thumb_w, height=thumb_h, preserveAspectRatio=True, mask='auto')
-            else:
-                c.setFillColor(placeholder_color)
-                c.rect(data_x, img_y, thumb_w, thumb_h, fill=1, stroke=0)
-                c.setFillColor(muted_color)
-                c.setFont(_PDF_FONT_SMALL, 32)
-                c.drawCentredString(data_x + thumb_w / 2, img_y + thumb_h / 2, "Data image missing")
-            c.setFillColor(muted_color)
-            c.setFont(_PDF_FONT_SMALL, 30)
-            foil_label_lines = _wrap_text_lines(entry.get('foil_name', '') or '', 30, thumb_w)
-            data_label_lines = _wrap_text_lines(entry.get('data_name', '') or '', 30, thumb_w)
-            label_spacing = 32
-            offset = 22
-            for idx, line in enumerate(foil_label_lines):
-                c.drawString(foil_x, img_y - offset - idx * label_spacing, line)
-            for idx, line in enumerate(data_label_lines):
-                c.drawString(data_x, img_y - offset - idx * label_spacing, line)
-            extra_offset = offset + max(len(foil_label_lines), len(data_label_lines)) * label_spacing + 10
-            if entry['meta_lines']:
-                meta_y = img_y - extra_offset
-                c.setFont(_PDF_FONT_SMALL, 32)
-                for line in entry['meta_lines']:
-                    c.drawString(data_x, meta_y, line)
-                    meta_y -= 34
-            y -= card_height + row_gap
+                c.setFont(_PDF_FONT_SMALL, 30)
+                foil_label_lines = _wrap_text_lines(entry.get('foil_name', '') or '', 30, thumb_w)
+                data_label_lines = _wrap_text_lines(entry.get('data_name', '') or '', 30, thumb_w)
+                label_spacing = 32
+                offset = 22
+                for idx, line in enumerate(foil_label_lines):
+                    c.drawString(foil_x, img_y - offset - idx * label_spacing, line)
+                for idx, line in enumerate(data_label_lines):
+                    c.drawString(data_x, img_y - offset - idx * label_spacing, line)
+                extra_offset = offset + max(len(foil_label_lines), len(data_label_lines)) * label_spacing + 10
+                if entry['meta_lines']:
+                    meta_y = img_y - extra_offset
+                    c.setFont(_PDF_FONT_SMALL, 32)
+                    for line in entry['meta_lines']:
+                        c.drawString(data_x, meta_y, line)
+                        meta_y -= 34
+                y -= card_height + row_gap
 
     c.showPage()
 
@@ -2282,6 +2288,7 @@ def _append_selected_report_pages(
     atlas_overlay: bool = True,
     global_summary: str | None = None,
     include_summary_page: bool = True,
+    skip_foil_processing: bool = False,
 ) -> None:
     grids = _collect_grids(base_dir)
     if not grids:
@@ -2329,14 +2336,20 @@ def _append_selected_report_pages(
                         )
             category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
             overlay_img_local = None
-            if overlay:
+            if overlay and not skip_foil_processing:
                 overlay_path = _find_overlay_image(gdir, base_dir)
                 if overlay_path:
                     overlay_img_local = _load_image(overlay_path, "RGB")
             heading = f"GridSquare {idx}: {grid_image_path.name}"
-            foils, datas = gather_foil_and_data(gdir)
-            foils = _latest_only(foils)
-            datas = _latest_only(datas)
+            foil_section_note = None
+            if skip_foil_processing:
+                foils = {}
+                datas = {}
+                foil_section_note = "FoilHole processing was skipped in Atlas/GridSquare-only mode."
+            else:
+                foils, datas = gather_foil_and_data(gdir)
+                foils = _latest_only(foils)
+                datas = _latest_only(datas)
             try:
                 _draw_grid_summary_page(
                     pdf,
@@ -2349,6 +2362,8 @@ def _append_selected_report_pages(
                     grid_image_path.name,
                     overlay_img_local,
                     category_score=category_score,
+                    foil_section_note=foil_section_note,
+                    show_foil_section=not skip_foil_processing,
                 )
             except Exception as exc:
                 failed.append((grid_name, f"render error: {exc}"))
@@ -2390,6 +2405,7 @@ def write_selected_report(
     overlay: bool = False,
     atlas_overlay: bool = True,
     global_summary: str | None = None,
+    skip_foil_processing: bool = False,
 ):
     """Generate a detailed PDF with only the included GridSquares."""
     _ensure_pdf_fonts()
@@ -2403,6 +2419,7 @@ def write_selected_report(
         atlas_overlay=atlas_overlay,
         global_summary=global_summary,
         include_summary_page=True,
+        skip_foil_processing=skip_foil_processing,
     )
     pdf.save()
 
@@ -2415,6 +2432,7 @@ def write_combined_report(
     overlay: bool = False,
     atlas_overlay: bool = True,
     global_summary: str | None = None,
+    skip_foil_processing: bool = False,
 ):
     """Generate one merged PDF: overview first, then included GridSquare details."""
     _ensure_pdf_fonts()
@@ -2436,6 +2454,7 @@ def write_combined_report(
         atlas_overlay=atlas_overlay,
         global_summary=global_summary,
         include_summary_page=False,
+        skip_foil_processing=skip_foil_processing,
     )
     pdf.save()
 

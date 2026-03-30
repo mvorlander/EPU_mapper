@@ -72,6 +72,7 @@ def _review_command(
     atlas_path: str,
     atlas_overlay: bool,
     overlay_enabled: bool,
+    skip_foil_processing: bool,
     transform: str,
     *,
     session_label: str | None = None,
@@ -94,6 +95,8 @@ def _review_command(
         cmd.append("--overlay")
     else:
         cmd.append("--no-overlay")
+    if skip_foil_processing:
+        cmd.append("--skip-foil-processing")
     if session_label:
         cmd.extend(["--session-label", session_label])
     if details_only:
@@ -202,7 +205,15 @@ class ReviewLauncher:
         self.port_var = tk.StringVar(value=self.preferences.get("port", DEFAULT_PORT))
         ttk.Entry(options_row, textvariable=self.port_var, width=8).grid(row=0, column=3, padx=(4, 12))
         self.overlay_var = tk.BooleanVar(value=self.preferences.get("overlay", True))
-        ttk.Checkbutton(options_row, text="Generate foil overlays", variable=self.overlay_var).grid(row=0, column=4)
+        self.overlay_check = ttk.Checkbutton(options_row, text="Generate foil overlays", variable=self.overlay_var)
+        self.overlay_check.grid(row=0, column=4)
+        self.skip_foil_processing_var = tk.BooleanVar(value=self.preferences.get("skip_foil_processing", False))
+        ttk.Checkbutton(
+            frm,
+            text="Atlas/GridSquare only (skip FoilHole processing)",
+            variable=self.skip_foil_processing_var,
+            command=self._sync_foil_controls,
+        ).grid(row=11, column=0, sticky="w", pady=(8, 0))
 
         self.advanced_var = tk.BooleanVar(value=bool(self.preferences.get("show_advanced", False)))
         ttk.Checkbutton(
@@ -210,10 +221,10 @@ class ReviewLauncher:
             text="Show advanced settings",
             variable=self.advanced_var,
             command=self._toggle_advanced,
-        ).grid(row=11, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=12, column=0, sticky="w", pady=(10, 0))
 
         self.advanced_frame = ttk.Frame(frm)
-        self.advanced_frame.grid(row=12, column=0, columnspan=2, sticky="we")
+        self.advanced_frame.grid(row=13, column=0, columnspan=2, sticky="we")
         ttk.Label(self.advanced_frame, text="Overlay transform:").grid(row=0, column=0, sticky="w")
         transform_labels = [label for label, _ in TRANSFORM_OPTIONS]
         transform_pref = self._transform_label(self.preferences.get("transform", "identity"))
@@ -224,7 +235,7 @@ class ReviewLauncher:
         self._toggle_advanced()
 
         btn_row = ttk.Frame(frm)
-        btn_row.grid(row=13, column=0, columnspan=2, pady=(12, 0), sticky="we")
+        btn_row.grid(row=14, column=0, columnspan=2, pady=(12, 0), sticky="we")
         self.launch_btn = ttk.Button(btn_row, text="Start review", command=self.start_server)
         self.launch_btn.grid(row=0, column=0, sticky="w")
         ttk.Button(btn_row, text="Stop", command=self.stop_server).grid(row=0, column=1, padx=(10, 0))
@@ -233,7 +244,7 @@ class ReviewLauncher:
         ttk.Label(
             frm,
             text="This export runs immediately for all GridSquares and skips the interactive review UI.",
-        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         output_frame = ttk.LabelFrame(self.root, text="Server log", padding=6)
         output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
@@ -241,6 +252,7 @@ class ReviewLauncher:
         self.log_text = tk.Text(output_frame, height=15, wrap="word")
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
+        self._sync_foil_controls()
 
     def browse_session(self) -> None:
         path = filedialog.askdirectory(title="Select EPU session output folder")
@@ -279,6 +291,10 @@ class ReviewLauncher:
             self.advanced_frame.grid()
         else:
             self.advanced_frame.grid_remove()
+
+    def _sync_foil_controls(self) -> None:
+        state = "disabled" if self.skip_foil_processing_var.get() else "normal"
+        self.overlay_check.configure(state=state)
 
     def browse_atlas(self) -> None:
         if self._atlas_mode() == ATLAS_MODE_EPU:
@@ -328,6 +344,7 @@ class ReviewLauncher:
             atlas_path,
             atlas_overlay,
             self.overlay_var.get(),
+            self.skip_foil_processing_var.get(),
             transform,
             session_label=label or None,
         )
@@ -387,6 +404,7 @@ class ReviewLauncher:
             atlas_path,
             atlas_overlay,
             self.overlay_var.get(),
+            self.skip_foil_processing_var.get(),
             transform,
             session_label=label or None,
             details_only=True,
@@ -449,6 +467,7 @@ class ReviewLauncher:
             "port": self.port_var.get().strip() or DEFAULT_PORT,
             "transform": transform,
             "overlay": bool(self.overlay_var.get()),
+            "skip_foil_processing": bool(self.skip_foil_processing_var.get()),
             "last_session": self.session_var.get().strip(),
             "atlas_mode": self._atlas_mode(),
             "last_atlas_root": self.atlas_root_var.get().strip(),

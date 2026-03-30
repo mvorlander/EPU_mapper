@@ -90,6 +90,9 @@ Images-Disc1/
 - `Use EPU atlas data (Recommended):` point this to the `Atlas/` folder that EPU created when generating the atlases.
 - `Session/Grid label (optional):` adds a prefix to the exported PDF filenames.
 - `Start review:` launches the web app.
+- `Atlas/GridSquare only (skip FoilHole processing):` loads just the atlas and
+  GridSquare mapping, which is much faster for sessions with very large numbers
+  of FoilHoles.
 - `Export detailed PDF without review:` skips the interactive UI and generates a
   detailed PDF for all GridSquares immediately.
 
@@ -107,9 +110,10 @@ Use the annotated screenshot in the `Why use it` section as the reference for th
 
 ![PDF details](images/EPU_mapper_PDF_details.png)
 
-Each detailed page shows the current GridSquare in context: atlas location,
-GridSquare image, foil overlay, matched FoilHole/Data images, and acquisition
-metadata.
+Each detailed page shows the current GridSquare in context: atlas location and
+GridSquare image, plus foil overlay / matched FoilHole-data imagery when you
+run the full review mode. In `Atlas/GridSquare only` mode those FoilHole
+sections are omitted entirely.
 
 ## Additional info
 - **Prefix PDF names** – provide a session/grid label once and reuse it for
@@ -125,6 +129,9 @@ metadata.
   *every* GridSquare, then exit immediately. The Windows launcher exposes the
   same behavior via **Export detailed PDF without review**. Use
   `--details-output path/to/out.pdf` if you want to override the default filename.
+- **Atlas/GridSquare-only mode** – add `--skip-foil-processing` if you only
+  want to see which GridSquares were collected on the atlas and do not need
+  FoilHole/data discovery.
 
 ### GridSquare Order
 
