@@ -174,6 +174,12 @@ Most users outside VBC can ignore this section.
 
 Use the web UI to download the combined report once you finish reviewing.
 
+## License
+
+EPU Mapper is released under the [MIT License](LICENSE). You may use, copy,
+modify, distribute, sublicense, and sell it for academic, commercial, or other
+purposes, subject to the license terms.
+
 ## Acknowledgements
 
 - Max Wilkinson (`wilkinm@mskcc.org`) shared code that helped with mapping
