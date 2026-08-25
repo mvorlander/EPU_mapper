@@ -23,7 +23,9 @@ setting up your high-res data collection:
 ![PDF overview](images/EPU_mapper_PDF_overview.png)
 
 - The combined PDF starts with atlas overviews, EPU category overview, session
-  summary, and the review table with ratings and comments.
+  summary, and the review table with ratings and comments. Screened GridSquares
+  on the atlas are color-coded by user rating (1–5), with skipped or unrated
+  squares shown in blue.
 - Detailed pages then show each selected GridSquare in context, including atlas
   location, foil overlay, matched FoilHole/Data images, and acquisition
   metadata.

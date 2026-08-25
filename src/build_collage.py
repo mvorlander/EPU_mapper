@@ -53,6 +53,18 @@ _PDF_FONT_REGULAR = "Helvetica"
 _PDF_FONT_BOLD = "Helvetica-Bold"
 _PDF_FONT_SMALL = "Helvetica"
 
+# User-rating colors used for screened GridSquare markers in PDF atlas panels.
+# Rating 0 and invalid/missing values deliberately retain the legacy blue so
+# an unrated square cannot be mistaken for a low-rated one.
+_RATING_MARKER_COLORS: dict[int, tuple[int, int, int]] = {
+    1: (198, 40, 40),
+    2: (239, 108, 0),
+    3: (249, 168, 37),
+    4: (124, 179, 66),
+    5: (46, 125, 50),
+}
+_UNRATED_MARKER_COLOR = (36, 109, 217)
+
 
 def _first_existing(paths):
     for candidate in paths:
@@ -558,10 +570,32 @@ def _category_marker_color(category: int | None) -> tuple[int, int, int]:
     return _EPU_CATEGORY_COLORS.get(category, (99, 102, 241))
 
 
+def _normalized_rating(value) -> int | None:
+    try:
+        rating = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return rating if rating in _RATING_MARKER_COLORS else None
+
+
+def _rating_marker_color(value) -> tuple[int, int, int]:
+    rating = _normalized_rating(value)
+    if rating is None:
+        return _UNRATED_MARKER_COLOR
+    return _RATING_MARKER_COLORS[rating]
+
+
+def _marker_text_color(rgb: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    # Use dark text on the yellow/green markers and white on darker colors.
+    luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    return (20, 28, 44, 235) if luminance >= 145 else (255, 255, 255, 240)
+
+
 def _atlas_with_grid_markers(
     atlas_img: Image.Image,
     atlas_path: Path | None,
-    marker_items: list[tuple[int, Path, int | float | None, bool]],
+    marker_items: list[tuple],
+    show_rating_legend: bool = False,
 ) -> Image.Image:
     if atlas_path is None or not marker_items:
         return atlas_img
@@ -578,7 +612,11 @@ def _atlas_with_grid_markers(
     ring_width = max(2, radius // 5)
     font = _get_font(max(16, int(radius * 1.2))) or ImageFont.load_default()
 
-    for label_idx, grid_dir, grid_id, highlight in marker_items:
+    for marker_item in marker_items:
+        # Accept the original four fields for compatibility with callers that
+        # do not yet provide a rating.
+        label_idx, grid_dir, grid_id, highlight = marker_item[:4]
+        rating = marker_item[4] if len(marker_item) > 4 else None
         center = _atlas_center_for_grid(nodes, grid_dir, grid_id)
         if center is None:
             continue
@@ -586,8 +624,9 @@ def _atlas_with_grid_markers(
         cy = center[1] * scale_y
         if not (0 <= cx < width and 0 <= cy < height):
             continue
-        fill_rgba = (220, 55, 55, 128) if highlight else (36, 109, 217, 128)
-        edge_rgba = (145, 24, 24, 128) if highlight else (14, 68, 151, 128)
+        marker_rgb = _rating_marker_color(rating)
+        fill_rgba = (*marker_rgb, 175)
+        edge_rgba = (20, 28, 44, 235) if highlight else (20, 28, 44, 190)
         draw.ellipse(
             (cx - radius, cy - radius, cx + radius, cy + radius),
             fill=fill_rgba,
@@ -603,8 +642,49 @@ def _atlas_with_grid_markers(
             text_w, text_h = font.getsize(text)
         tx = cx - text_w / 2
         ty = cy - text_h / 2
-        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0, 128), font=font)
-        draw.text((tx, ty), text, fill=(255, 255, 255, 128), font=font)
+        text_rgba = _marker_text_color(marker_rgb)
+        shadow_rgba = (255, 255, 255, 170) if text_rgba[0] < 100 else (0, 0, 0, 170)
+        draw.text((tx + 1, ty + 1), text, fill=shadow_rgba, font=font)
+        draw.text((tx, ty), text, fill=text_rgba, font=font)
+
+    if show_rating_legend:
+        legend_items = [(rating, color) for rating, color in sorted(_RATING_MARKER_COLORS.items())]
+        legend_items.append((None, _UNRATED_MARKER_COLOR))
+        legend_font = _get_font(max(14, int(radius * 1.05))) or ImageFont.load_default()
+        pad = max(10, int(radius * 0.8))
+        row_h = max(20, int(radius * 1.55))
+        title_h = row_h
+        legend_w = max(190, int(width * 0.18))
+        legend_h = pad * 2 + title_h + row_h * len(legend_items)
+        x0 = max(8, width - legend_w - 14)
+        y0 = max(8, height - legend_h - 14)
+        if hasattr(draw, "rounded_rectangle"):
+            draw.rounded_rectangle(
+                (x0, y0, x0 + legend_w, y0 + legend_h),
+                radius=10,
+                fill=(255, 255, 255, 220),
+                outline=(173, 184, 204, 240),
+                width=2,
+            )
+        else:
+            draw.rectangle(
+                (x0, y0, x0 + legend_w, y0 + legend_h),
+                fill=(255, 255, 255, 220),
+                outline=(173, 184, 204, 240),
+                width=2,
+            )
+        draw.text((x0 + pad, y0 + pad), "User rating", fill=(20, 28, 44, 255), font=legend_font)
+        for legend_idx, (rating, color) in enumerate(legend_items):
+            y = y0 + pad + title_h + legend_idx * row_h
+            swatch = max(10, int(radius * 0.9))
+            draw.ellipse(
+                (x0 + pad, y + 1, x0 + pad + swatch, y + 1 + swatch),
+                fill=(*color, 230),
+                outline=(20, 28, 44, 230),
+                width=1,
+            )
+            label = "0 / unrated" if rating is None else str(rating)
+            draw.text((x0 + pad + swatch + 8, y), label, fill=(20, 28, 44, 255), font=legend_font)
 
     return rendered
 
@@ -2154,10 +2234,23 @@ def _build_overview_page_image(
         atlas_screened = atlas_img.convert("RGB")
         if atlas_overlay and atlas_path_for_report is not None:
             marker_items = [
-                (idx, gdir, gid, False)
+                (
+                    idx,
+                    gdir,
+                    gid,
+                    False,
+                    responses.get(gdir.name, {}).get("rating")
+                    if isinstance(responses.get(gdir.name), dict)
+                    else None,
+                )
                 for idx, (gid, gdir) in enumerate(grids, start=1)
             ]
-            atlas_screened = _atlas_with_grid_markers(atlas_screened, atlas_path_for_report, marker_items)
+            atlas_screened = _atlas_with_grid_markers(
+                atlas_screened,
+                atlas_path_for_report,
+                marker_items,
+                show_rating_legend=True,
+            )
         atlas_screened.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
         ox = (atlas_panel_w - atlas_screened.width) // 2
         oy = (atlas_box_h - atlas_screened.height) // 2
@@ -2170,7 +2263,7 @@ def _build_overview_page_image(
         atlas_category_panel.paste(atlas_category, (ox, oy))
     atlas_screened_panel = _label_image(
         atlas_screened_panel,
-        "Atlas: screened GridSquares" if atlas_img is not None else "No atlas available",
+        "Atlas: screened GridSquares by user rating" if atlas_img is not None else "No atlas available",
     )
     atlas_category_panel = _label_image(
         atlas_category_panel,
@@ -2332,7 +2425,7 @@ def _append_selected_report_pages(
                         atlas_img_local = _atlas_with_grid_markers(
                             atlas_img_local,
                             atlas_path_local,
-                            [(idx, gdir, gid, True)],
+                            [(idx, gdir, gid, True, resp.get("rating"))],
                         )
             category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
             overlay_img_local = None
