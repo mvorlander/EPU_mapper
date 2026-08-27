@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['review_app', 'build_collage', 'scripts.plot_foilhole_positions', 'matplotlib.backends.backend_tkagg']
+hiddenimports = ['review_app', 'build_collage', 'portable_session', 'scripts.plot_foilhole_positions', 'matplotlib.backends.backend_tkagg']
 hiddenimports += collect_submodules('matplotlib')
 
 

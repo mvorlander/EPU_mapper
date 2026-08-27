@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -24,6 +26,16 @@ except Exception:  # pragma: no cover - only hit on systems without Tk support
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
+SRC_DIR = REPO_ROOT / "src"
+if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+from portable_session import (  # noqa: E402
+    PORTABLE_SESSION_FILENAME,
+    export_portable_session,
+    load_portable_session,
+    portable_bundle_name,
+    portable_session_source,
+)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8000"
 DEFAULT_LABEL = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX") or ""
@@ -53,12 +65,14 @@ def _browser_host(host: str) -> str:
 def _startup_page_html(target_url: str) -> str:
     target_json = json.dumps(target_url).replace("</", "<\\/")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper is preparing</title>
-<style>:root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{width:min(520px,calc(100vw - 36px));background:#fff;border:1px solid #dfe5ee;border-radius:16px;padding:28px;box-shadow:0 18px 50px rgba(26,39,67,.12)}}.mark{{width:42px;height:42px;border-radius:12px;background:linear-gradient(145deg,#5eead4,#3b82f6);display:grid;place-items:center;font-weight:850;color:#10213b;margin-bottom:18px}}h1{{font-size:21px;margin:0 0 8px}}p{{font-size:13px;line-height:1.55;color:#657289;margin:0}}.progress{{height:5px;background:#e8edf5;border-radius:9px;overflow:hidden;margin:22px 0 14px}}.progress span{{display:block;width:35%;height:100%;background:#2563eb;border-radius:9px;animation:move 1.4s ease-in-out infinite}}#status{{font-size:11px;color:#7a8799}}@keyframes move{{0%{{transform:translateX(-110%)}}100%{{transform:translateX(330%)}}}}</style></head>
-<body><main><div class="mark">E</div><h1>Preparing the screening dashboard</h1><p>EPU Mapper is reading the session and atlas. Sessions on OffloadData can take a few minutes; this page will open the dashboard automatically.</p><div class="progress"><span></span></div><div id="status">Waiting for the local server…</div></main>
-<script>const target={target_json};async function poll(){{try{{const response=await fetch('/ready?t='+Date.now(),{{cache:'no-store'}});const state=await response.json();if(state.ready){{location.replace(state.url);return}}if(state.error){{document.getElementById('status').textContent=state.error;return}}}}catch(_error){{}}setTimeout(poll,1000)}}poll();</script></body></html>"""
+<style>:root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{width:min(560px,calc(100vw - 36px));background:#fff;border:1px solid #dfe5ee;border-radius:16px;padding:28px;box-shadow:0 18px 50px rgba(26,39,67,.12)}}main.error{{border:2px solid #e11d48;background:#fff7f8}}.mark{{width:42px;height:42px;border-radius:12px;background:linear-gradient(145deg,#5eead4,#3b82f6);display:grid;place-items:center;font-weight:850;color:#10213b;margin-bottom:18px}}main.error .mark{{background:#e11d48;color:#fff}}h1{{font-size:21px;margin:0 0 8px}}p{{font-size:13px;line-height:1.55;color:#657289;margin:0}}.progress{{height:5px;background:#e8edf5;border-radius:9px;overflow:hidden;margin:22px 0 14px}}.progress span{{display:block;width:35%;height:100%;background:#2563eb;border-radius:9px;animation:move 1.4s ease-in-out infinite}}#status{{font-size:12px;color:#7a8799;white-space:pre-wrap;line-height:1.5}}main.error #status{{margin-top:18px;padding:14px;border-radius:10px;background:#ffe4e6;color:#9f1239;font-size:14px;font-weight:700}}main.error .progress{{display:none}}@keyframes move{{0%{{transform:translateX(-110%)}}100%{{transform:translateX(330%)}}}}</style></head>
+<body><main id="launch-card"><div class="mark" id="launch-mark">E</div><h1 id="launch-title">Preparing the screening dashboard</h1><p id="launch-description">EPU Mapper is reading the session and atlas. Sessions on OffloadData can take a few minutes; this page will open the dashboard automatically.</p><div class="progress"><span></span></div><div id="status">Waiting for the local server…</div></main>
+<script>const target={target_json};async function poll(){{try{{const response=await fetch('/ready?t='+Date.now(),{{cache:'no-store'}});const state=await response.json();if(state.ready){{location.replace(state.url);return}}if(state.error){{document.getElementById('launch-card').classList.add('error');document.getElementById('launch-mark').textContent='!';document.getElementById('launch-title').textContent='Server launch failed';document.getElementById('launch-description').textContent='Return to the EPU Mapper launcher for the full error and troubleshooting log.';document.getElementById('status').textContent=state.error;return}}}}catch(_error){{}}setTimeout(poll,1000)}}poll();</script></body></html>"""
 
 
-def _start_browser_wait_page(proc: subprocess.Popen[str], host: str, port: str) -> tuple[ThreadingHTTPServer, str]:
+def _start_browser_wait_page(
+    proc: subprocess.Popen[str], host: str, port: str, error_state: dict[str, str | None] | None = None
+) -> tuple[ThreadingHTTPServer, str]:
     connect_host = _browser_host(host)
     target_url = f"http://{connect_host}:{port}"
     page = _startup_page_html(target_url).encode("utf-8")
@@ -70,7 +84,9 @@ def _start_browser_wait_page(proc: subprocess.Popen[str], host: str, port: str) 
                 ready = False
                 exit_code = proc.poll()
                 if exit_code is not None:
-                    error = f"EPU Mapper stopped before the server was ready (exit code {exit_code}). Check the launcher log."
+                    error = (error_state or {}).get("message") or (
+                        f"EPU Mapper stopped before the server was ready (exit code {exit_code}). Check the launcher log."
+                    )
                 else:
                     try:
                         with socket.create_connection((connect_host, int(port)), timeout=0.25):
@@ -100,6 +116,20 @@ def _start_browser_wait_page(proc: subprocess.Popen[str], host: str, port: str) 
     threading.Thread(target=server.serve_forever, daemon=True).start()
     wait_url = f"http://127.0.0.1:{server.server_address[1]}"
     return server, wait_url
+
+
+def _server_failure_message(exit_code: int, output_lines: list[str], during_launch: bool) -> str:
+    heading = "The local server failed during launch." if during_launch else "The local server stopped unexpectedly."
+    ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    useful = [ansi_escape.sub("", line).strip() for line in output_lines if line.strip()]
+    detail = "\n".join(useful[-10:])
+    if len(detail) > 1800:
+        detail = detail[-1800:]
+    message = f"{heading}\n\nExit code: {exit_code}"
+    if detail:
+        message += f"\n\nLast server messages:\n{detail}"
+    message += f"\n\nFull log:\n{_server_log_file()}"
+    return message
 
 
 def _open_url(url: str) -> None:
@@ -151,6 +181,19 @@ def _suggest_atlas_root(session_path: str) -> Path | None:
     return None
 
 
+def _dialog_initial_directory(value: str | None) -> Path:
+    """Return the closest existing directory for a file/folder dialog."""
+    candidate = Path(value).expanduser() if value else Path.home()
+    if candidate.is_file():
+        return candidate.parent
+    if candidate.is_dir():
+        return candidate
+    for parent in candidate.parents:
+        if parent.is_dir():
+            return parent
+    return Path.home()
+
+
 def _default_python() -> str:
     return sys.executable or "python"
 
@@ -166,9 +209,9 @@ def _runtime_cwd() -> Path:
 
 
 def _ensure_src_path() -> None:
-    src_dir = REPO_ROOT / "src"
-    if src_dir.is_dir() and str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
+    for runtime_path in (REPO_ROOT / "src", REPO_ROOT):
+        if runtime_path.is_dir() and str(runtime_path) not in sys.path:
+            sys.path.insert(0, str(runtime_path))
 
 
 def _review_command(
@@ -235,6 +278,25 @@ def _run_review_app(review_args: list[str]) -> int:
         sys.argv = old_argv
 
 
+def _run_frozen_smoke_test() -> int:
+    """Verify that the packaged Windows executable contains its runtime modules."""
+    _ensure_src_path()
+    try:
+        from build_collage import find_grid_image  # noqa: F401
+        from portable_session import export_portable_session as portable_export  # noqa: F401
+        from review_app import create_app  # noqa: F401
+        from scripts.plot_foilhole_positions import compute_markers  # noqa: F401
+
+        if tk is None or ttk is None:
+            raise RuntimeError("Tkinter is unavailable")
+        if not all(callable(value) for value in (find_grid_image, portable_export, create_app, compute_markers)):
+            raise RuntimeError("A packaged runtime entry point is not callable")
+    except Exception as exc:
+        print(f"[launcher] Windows smoke test failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 class ReviewLauncher:
     def __init__(self) -> None:
         if tk is None or ttk is None or messagebox is None or filedialog is None:
@@ -244,11 +306,16 @@ class ReviewLauncher:
             )
         self.proc: subprocess.Popen[str] | None = None
         self.startup_server: ThreadingHTTPServer | None = None
+        self.server_ready = False
+        self.stop_requested = False
+        self.startup_error_state: dict[str, str | None] = {"message": None}
         self.preferences = self._load_preferences()
         self.session_history = list(self.preferences.get("sessions", []))
         saved_atlas_by_session = self.preferences.get("atlas_by_session", {})
         self.atlas_by_session = dict(saved_atlas_by_session) if isinstance(saved_atlas_by_session, dict) else {}
         self._details_running = False
+        self._portable_running = False
+        self.last_portable_manifest = str(self.preferences.get("last_portable_manifest", "") or "")
         self.root = tk.Tk()
         self.root.title("EPU Mapper")
         self._build_form()
@@ -355,10 +422,32 @@ class ReviewLauncher:
         ttk.Button(btn_row, text="Stop", command=self.stop_server).grid(row=0, column=1, padx=(10, 0))
         self.details_btn = ttk.Button(btn_row, text="Export detailed PDF without review", command=self.export_details)
         self.details_btn.grid(row=0, column=2, padx=(10, 0))
+        self.portable_open_btn = ttk.Button(btn_row, text="Open portable session…", command=self.open_portable_session)
+        self.portable_open_btn.grid(row=1, column=0, pady=(9, 0), sticky="w")
+        self.portable_export_btn = ttk.Button(
+            btn_row,
+            text="Export portable session…",
+            command=self.export_portable_session,
+        )
+        self.portable_export_btn.grid(row=1, column=1, columnspan=2, padx=(10, 0), pady=(9, 0), sticky="w")
         ttk.Label(
             frm,
-            text="This export runs immediately for all GridSquares and skips the interactive review UI.",
+            text="Portable export copies the complete EPU session, Atlas, reviews, and a relocatable .epumap file.",
         ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.server_status_var = tk.StringVar(value="Server stopped")
+        self.server_status = tk.Label(
+            frm,
+            textvariable=self.server_status_var,
+            anchor="w",
+            justify="left",
+            padx=12,
+            pady=10,
+            bg="#e2e8f0",
+            fg="#334155",
+            font=("TkDefaultFont", 11, "bold"),
+        )
+        self.server_status.grid(row=16, column=0, columnspan=2, sticky="we", pady=(12, 0))
 
         output_frame = ttk.LabelFrame(self.root, text="Server log", padding=6)
         output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
@@ -369,10 +458,165 @@ class ReviewLauncher:
         self._sync_foil_controls()
 
     def browse_session(self) -> None:
-        path = filedialog.askdirectory(title="Select EPU session output folder")
+        initial_dir = _dialog_initial_directory(self.session_var.get().strip() or self.preferences.get("last_session", ""))
+        path = filedialog.askdirectory(title="Select EPU session output folder", initialdir=str(initial_dir))
         if path:
             self.session_var.set(path)
             self._apply_session_atlas(path)
+            self._remember_session(path)
+            self._persist_preferences(self._transform_value(self.transform_var.get()))
+
+    def open_portable_session(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            messagebox.showerror("Server running", "Stop the current review server before opening another session.")
+            return
+        initial_value = self.last_portable_manifest or self.session_var.get().strip()
+        path = filedialog.askopenfilename(
+            title="Open portable EPU Mapper session",
+            initialdir=str(_dialog_initial_directory(initial_value)),
+            filetypes=[("EPU Mapper session", "*.epumap"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            loaded = load_portable_session(Path(path))
+        except Exception as exc:
+            messagebox.showerror("Portable session could not be opened", str(exc), parent=self.root)
+            return
+        session_path = str(loaded["session_path"])
+        atlas_path = str(loaded["atlas_path"] or "")
+        atlas_mode = str(loaded.get("atlas_mode", ATLAS_MODE_EPU))
+        if atlas_mode not in (ATLAS_MODE_EPU, ATLAS_MODE_STATIC):
+            atlas_mode = ATLAS_MODE_EPU
+        self.session_var.set(session_path)
+        self.atlas_mode_var.set(atlas_mode)
+        if atlas_mode == ATLAS_MODE_EPU:
+            self.atlas_root_var.set(atlas_path)
+        else:
+            self.atlas_file_var.set(atlas_path)
+        self._on_atlas_mode_change(remember_current=False)
+        self.atlas_var.set(atlas_path)
+        label = str(loaded.get("session_label", "") or "")
+        if len(label) <= 80 and "\n" not in label and "\r" not in label:
+            self.label_var.set(label)
+        options = loaded.get("options", {})
+        self.overlay_var.set(bool(options.get("overlay", True)))
+        self.skip_foil_processing_var.set(bool(options.get("skip_foil_processing", False)))
+        self.transform_var.set(self._transform_label(str(options.get("transform", "identity"))))
+        self._sync_foil_controls()
+        self.last_portable_manifest = str(Path(path).resolve())
+        self._remember_session(session_path)
+        if atlas_mode == ATLAS_MODE_EPU and atlas_path:
+            self.atlas_by_session[str(Path(session_path).expanduser())] = atlas_path
+        self._persist_preferences(self._transform_value(self.transform_var.get()))
+        self._log(f"Opened portable session: {path}\n")
+        messagebox.showinfo(
+            "Portable session loaded",
+            "The portable session paths are ready. Click Start review to open it.",
+            parent=self.root,
+        )
+
+    def export_portable_session(self) -> None:
+        if self._portable_running:
+            messagebox.showinfo("Please wait", "A portable session export is already running.")
+            return
+        if self.proc and self.proc.poll() is None:
+            messagebox.showerror(
+                "Stop review first",
+                "Stop the review server before exporting so review files cannot change during the copy.",
+            )
+            return
+        session_value = self.session_var.get().strip()
+        if not session_value or not Path(session_value).expanduser().is_dir():
+            messagebox.showerror("Invalid session", "Select an existing EPU session folder first.")
+            return
+        self._store_atlas_input()
+        atlas_value = self._current_atlas_path()
+        if atlas_value and not Path(atlas_value).expanduser().exists():
+            messagebox.showerror("Invalid Atlas", "The selected Atlas path does not exist.")
+            return
+        try:
+            label = self._validated_session_label()
+        except ValueError as exc:
+            messagebox.showerror("Invalid session label", str(exc))
+            return
+        initial_value = self.last_portable_manifest or session_value
+        destination = filedialog.askdirectory(
+            title="Choose the parent folder for the portable session",
+            initialdir=str(_dialog_initial_directory(initial_value)),
+        )
+        if not destination:
+            return
+        session_source = portable_session_source(Path(session_value))
+        bundle_name = portable_bundle_name(label, session_source)
+        if not messagebox.askyesno(
+            "Export complete EPU session?",
+            f"This will copy all session and Atlas data into:\n\n{Path(destination) / bundle_name}\n\n"
+            "Large sessions can take a long time and require substantial free disk space.",
+            parent=self.root,
+        ):
+            return
+        options = {
+            "overlay": bool(self.overlay_var.get()),
+            "skip_foil_processing": bool(self.skip_foil_processing_var.get()),
+            "transform": self._transform_value(self.transform_var.get()),
+        }
+        self._set_portable_running(True)
+        threading.Thread(
+            target=self._run_portable_export,
+            args=(
+                Path(session_value),
+                Path(atlas_value) if atlas_value else None,
+                self._atlas_mode(),
+                Path(destination),
+                label,
+                options,
+            ),
+            daemon=True,
+        ).start()
+
+    def _run_portable_export(
+        self,
+        session_path: Path,
+        atlas_path: Path | None,
+        atlas_mode: str,
+        destination: Path,
+        label: str,
+        options: dict,
+    ) -> None:
+        try:
+            manifest_path = export_portable_session(
+                session_path,
+                atlas_path,
+                atlas_mode,
+                destination,
+                label,
+                options,
+                self._log,
+            )
+        except Exception as exc:
+            self._log(f"Portable export failed: {exc}\n")
+            self.root.after(
+                0,
+                lambda message=str(exc): messagebox.showerror(
+                    "Portable export failed",
+                    message,
+                    parent=self.root,
+                ),
+            )
+        else:
+            self.last_portable_manifest = str(manifest_path)
+            self.root.after(0, lambda: self._persist_preferences(self._transform_value(self.transform_var.get())))
+            self.root.after(
+                0,
+                lambda path=str(manifest_path): messagebox.showinfo(
+                    "Portable export complete",
+                    f"Portable session created successfully:\n\n{path}",
+                    parent=self.root,
+                ),
+            )
+        finally:
+            self._set_portable_running(False)
 
     def _apply_session_atlas(self, session_path: str) -> None:
         if self._atlas_mode() != ATLAS_MODE_EPU or not session_path:
@@ -427,11 +671,14 @@ class ReviewLauncher:
         self.overlay_check.configure(state=state)
 
     def browse_atlas(self) -> None:
+        current = self.atlas_var.get().strip()
+        initial_dir = _dialog_initial_directory(current)
         if self._atlas_mode() == ATLAS_MODE_EPU:
-            path = filedialog.askdirectory(title="Select atlas root directory")
+            path = filedialog.askdirectory(title="Select atlas root directory", initialdir=str(initial_dir))
         else:
             path = filedialog.askopenfilename(
                 title="Select atlas screenshot",
+                initialdir=str(initial_dir),
                 filetypes=[("Images", "*.jpg *.jpeg *.png"), ("All", "*.*")],
             )
         if path:
@@ -439,6 +686,7 @@ class ReviewLauncher:
             self._store_atlas_input()
             if self._atlas_mode() == ATLAS_MODE_EPU and self.session_var.get().strip():
                 self.atlas_by_session[str(Path(self.session_var.get().strip()).expanduser())] = path
+            self._persist_preferences(self._transform_value(self.transform_var.get()))
 
     def start_server(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -498,8 +746,14 @@ class ReviewLauncher:
                 env=env,
             )
         except Exception as exc:
+            self._set_server_status("error", f"Launch failed: {exc}")
             messagebox.showerror("Failed to launch", f"Could not start review_app: {exc}")
             return
+        self.server_ready = False
+        self.stop_requested = False
+        self.startup_error_state = {"message": None}
+        self.log_text.configure(background="#ffffff")
+        self._set_server_status("starting", "Starting server - reading session and Atlas data…")
         self._remember_session(session_path)
         self._persist_preferences(transform)
         self.launch_btn.configure(state="disabled")
@@ -507,7 +761,9 @@ class ReviewLauncher:
         self._log(f"Persistent server log: {_server_log_file()}\n")
         try:
             self._stop_startup_server()
-            self.startup_server, wait_url = _start_browser_wait_page(self.proc, host, port)
+            self.startup_server, wait_url = _start_browser_wait_page(
+                self.proc, host, port, self.startup_error_state
+            )
             _open_url(wait_url)
             self._log(f"Preparing the session for {host}:{port}; opened a browser waiting page.\n")
         except Exception as exc:
@@ -567,11 +823,38 @@ class ReviewLauncher:
 
     def stop_server(self) -> None:
         if self.proc and self.proc.poll() is None:
+            self.stop_requested = True
             self.proc.terminate()
             self._log("Stopping server...\n")
         self.proc = None
         self._stop_startup_server()
         self.launch_btn.configure(state="normal")
+        self._set_server_status("stopped", "Server stopped")
+
+    def _set_server_status(self, state: str, message: str) -> None:
+        colors = {
+            "stopped": ("#e2e8f0", "#334155"),
+            "starting": ("#dbeafe", "#1e40af"),
+            "running": ("#d1fae5", "#065f46"),
+            "error": ("#ffe4e6", "#9f1239"),
+        }
+        background, foreground = colors.get(state, colors["stopped"])
+        self.server_status_var.set(message)
+        self.server_status.configure(bg=background, fg=foreground)
+
+    def _show_server_error(self, message: str, during_launch: bool) -> None:
+        title = "Server launch failed" if during_launch else "Server stopped unexpectedly"
+        first_line = message.splitlines()[0] if message else title
+        self._set_server_status("error", f"⚠ {first_line} See the dialog and server log below.")
+        self.log_text.configure(background="#fff1f2")
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(500, lambda: self.root.attributes("-topmost", False))
+        except Exception:
+            pass
+        messagebox.showerror(title, message, parent=self.root)
 
     def _validated_session_label(self) -> str:
         label = self.label_var.get().strip()
@@ -640,6 +923,7 @@ class ReviewLauncher:
             "atlas_by_session": self.atlas_by_session,
             "session_label": self.label_var.get().strip(),
             "show_advanced": bool(self.advanced_var.get()),
+            "last_portable_manifest": self.last_portable_manifest,
         }
         path = self._prefs_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -659,6 +943,7 @@ class ReviewLauncher:
     def _stream_output(self) -> None:
         proc = self.proc
         assert proc and proc.stdout
+        output_tail: deque[str] = deque(maxlen=30)
         log_path = _server_log_file()
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -670,7 +955,18 @@ class ReviewLauncher:
             log_handle.write(header)
             log_handle.flush()
         for line in proc.stdout:
+            output_tail.append(line.rstrip())
             self._log(line)
+            if not self.server_ready and line.strip():
+                clean_line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip()
+                self.startup_error_state["message"] = (
+                    "EPU Mapper stopped before the server was ready.\n\n"
+                    f"Last server message: {clean_line}\n\n"
+                    "Return to the launcher for the full error log."
+                )
+            if not self.server_ready and ("Uvicorn running on" in line or "Application startup complete" in line):
+                self.server_ready = True
+                self.root.after(0, lambda: self._set_server_status("running", "Server running - dashboard is ready"))
             if log_handle:
                 log_handle.write(line)
                 log_handle.flush()
@@ -682,6 +978,16 @@ class ReviewLauncher:
             log_handle.close()
         if self.proc is proc:
             self.proc = None
+        during_launch = not self.server_ready
+        if not self.stop_requested:
+            failure_message = _server_failure_message(exit_code, list(output_tail), during_launch)
+            self.startup_error_state["message"] = failure_message
+            self.root.after(
+                0,
+                lambda message=failure_message, startup=during_launch: self._show_server_error(message, startup),
+            )
+        else:
+            self.root.after(0, lambda: self._set_server_status("stopped", "Server stopped"))
         self.root.after(0, lambda: self.launch_btn.configure(state="normal"))
 
     def _run_details_job(self, cmd: list[str], session_path: str, transform: str) -> None:
@@ -728,6 +1034,16 @@ class ReviewLauncher:
             self.details_btn.configure(state=state)
         self.root.after(0, toggle)
 
+    def _set_portable_running(self, running: bool) -> None:
+        self._portable_running = running
+
+        def toggle() -> None:
+            state = "disabled" if running else "normal"
+            self.portable_export_btn.configure(state=state, text="Exporting portable session…" if running else "Export portable session…")
+            self.portable_open_btn.configure(state=state)
+
+        self.root.after(0, toggle)
+
     def _log(self, text: str) -> None:
         def append() -> None:
             self.log_text.configure(state="normal")
@@ -737,12 +1053,20 @@ class ReviewLauncher:
         self.root.after(0, append)
 
     def on_close(self) -> None:
+        if self._portable_running:
+            messagebox.showwarning(
+                "Portable export running",
+                "Wait for the portable session export to finish before closing EPU Mapper.",
+                parent=self.root,
+            )
+            return
         if self.proc and self.proc.poll() is None:
             if messagebox.askyesno("Quit", "Server is still running. Stop it?"):
                 self.stop_server()
             else:
                 return
         self._stop_startup_server()
+        self._persist_preferences(self._transform_value(self.transform_var.get()))
         self.root.destroy()
 
     def run(self) -> None:
@@ -750,6 +1074,8 @@ class ReviewLauncher:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--smoke-test":
+        raise SystemExit(_run_frozen_smoke_test())
     if len(sys.argv) > 1 and sys.argv[1] == "--run-review":
         raise SystemExit(_run_review_app(sys.argv[2:]))
     app = ReviewLauncher()

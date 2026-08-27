@@ -106,6 +106,7 @@ $pyiArgs = @(
     "--paths", $repoRoot,
     "--hidden-import", "review_app",
     "--hidden-import", "build_collage",
+    "--hidden-import", "portable_session",
     "--hidden-import", "scripts.plot_foilhole_positions",
     "--hidden-import", "matplotlib.backends.backend_tkagg",
     "--collect-submodules", "matplotlib",

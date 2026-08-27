@@ -18,10 +18,13 @@ handled correctly.  The output file defaults to `<base>.pdf`.
 """
 
 import argparse
+import base64
+import html
 import http.server
 import io
 import json
 import queue
+import re
 import socketserver
 import threading
 import urllib.parse
@@ -64,6 +67,11 @@ _RATING_MARKER_COLORS: dict[int, tuple[int, int, int]] = {
     5: (46, 125, 50),
 }
 _UNRATED_MARKER_COLOR = (36, 109, 217)
+_SUITABILITY_MARKER_COLORS: dict[str, tuple[int, int, int]] = {
+    "suitable": (5, 150, 105),
+    "unsuitable": (220, 38, 38),
+    "unmarked": (100, 116, 139),
+}
 
 
 def _first_existing(paths):
@@ -144,19 +152,66 @@ def _format_category_score(value) -> str:
 
 
 def find_grid_image(grid_dir: Path) -> Path:
-    for entry in grid_dir.iterdir():
-        if entry.is_file() and entry.suffix.lower() in (".jpg", ".jpeg"):
-            if entry.name.startswith("GridSquare_"):
-                return entry
+    candidates = [
+        entry
+        for entry in grid_dir.iterdir()
+        if entry.is_file()
+        and entry.suffix.lower() in (".jpg", ".jpeg")
+        and entry.name.startswith("GridSquare_")
+    ]
+    if candidates:
+        # Link the GridSquare acquisition to its screening run. When a square
+        # was revisited, use the last GridSquare image acquired before the
+        # first FoilHole image, rather than an unrelated later revisit.
+        foil_timestamps = [
+            timestamp
+            for path in (grid_dir / "FoilHoles").glob("FoilHole_*.jpg")
+            if (timestamp := _media_timestamp_from_name(path.name)) is not None
+        ]
+        if foil_timestamps:
+            first_foil = min(foil_timestamps)
+            preceding = [
+                path
+                for path in candidates
+                if (timestamp := _media_timestamp_from_name(path.name)) is not None and timestamp <= first_foil
+            ]
+            if preceding:
+                return max(preceding, key=_grid_media_sort_key)
+        # No screening timestamps are available: choose the latest acquisition
+        # deterministically instead of relying on filesystem iteration order.
+        return max(candidates, key=_grid_media_sort_key)
     raise FileNotFoundError(f"no grid square JPG found in {grid_dir}")
 
 
 def find_grid_mrc(grid_dir: Path) -> Path | None:
-    for entry in grid_dir.iterdir():
-        if entry.is_file() and entry.suffix.lower() == ".mrc":
-            if entry.name.startswith("GridSquare_"):
-                return entry
-    return None
+    try:
+        selected_image = find_grid_image(grid_dir)
+    except FileNotFoundError:
+        selected_image = None
+    if selected_image is not None:
+        matching = selected_image.with_suffix(".mrc")
+        if matching.is_file():
+            return matching
+    candidates = [
+        entry
+        for entry in grid_dir.iterdir()
+        if entry.is_file() and entry.suffix.lower() == ".mrc" and entry.name.startswith("GridSquare_")
+    ]
+    return max(candidates, key=_grid_media_sort_key) if candidates else None
+
+
+def _grid_media_sort_key(path: Path) -> tuple[str, str, float, str]:
+    timestamp = _grid_timestamp_from_name(path.name) or ("", "")
+    try:
+        modified = path.stat().st_mtime
+    except Exception:
+        modified = 0.0
+    return timestamp[0], timestamp[1], modified, path.name
+
+
+def _media_timestamp_from_name(name: str) -> tuple[str, str] | None:
+    match = re.search(r"_(\d{8})_(\d{6})(?:\D|$)", Path(name).stem)
+    return (match.group(1), match.group(2)) if match else None
 
 
 def _mrc_to_image(path: Path, low: float = 2.0, high: float = 98.0) -> Image.Image | None:
@@ -585,10 +640,57 @@ def _rating_marker_color(value) -> tuple[int, int, int]:
     return _RATING_MARKER_COLORS[rating]
 
 
+def _normalized_collection_status(response: dict | None) -> str:
+    if not isinstance(response, dict):
+        return "unmarked"
+    status = str(response.get("collection_status", "") or "").strip().lower()
+    if status in ("suitable", "unsuitable"):
+        return status
+    return "suitable" if bool(response.get("collect", False)) else "unmarked"
+
+
 def _marker_text_color(rgb: tuple[int, int, int]) -> tuple[int, int, int, int]:
     # Use dark text on the yellow/green markers and white on darker colors.
     luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
     return (20, 28, 44, 235) if luminance >= 145 else (255, 255, 255, 240)
+
+
+def _load_manual_collection_targets(base_dir: Path) -> list[dict]:
+    path = base_dir / "manual_collection_targets.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    return [value for value in payload.values() if isinstance(value, dict)]
+
+
+def _atlas_with_manual_targets(atlas_img: Image.Image, targets: list[dict]) -> Image.Image:
+    if not targets:
+        return atlas_img
+    rendered = atlas_img.convert("RGB").copy()
+    width, height = rendered.size
+    draw = ImageDraw.Draw(rendered, "RGBA")
+    radius = max(11, int(min(width, height) * 0.015))
+    font = _get_font(max(13, int(radius * 1.05))) or ImageFont.load_default()
+    for target in targets:
+        position = target.get("position")
+        if not isinstance(position, dict):
+            continue
+        try:
+            cx = float(position["x"]) / 100.0 * width
+            cy = float(position["y"]) / 100.0 * height
+        except Exception:
+            continue
+        points = [(cx, cy - radius), (cx + radius, cy), (cx, cy + radius), (cx - radius, cy)]
+        draw.polygon(points, fill=(8, 145, 178, 210), outline=(255, 255, 255, 255))
+        label = "T"
+        box = draw.textbbox((0, 0), label, font=font)
+        draw.text((cx - (box[2] - box[0]) / 2, cy - (box[3] - box[1]) / 2), label, fill=(255, 255, 255, 255), font=font)
+    return rendered
 
 
 def _atlas_with_grid_markers(
@@ -617,6 +719,9 @@ def _atlas_with_grid_markers(
         # do not yet provide a rating.
         label_idx, grid_dir, grid_id, highlight = marker_item[:4]
         rating = marker_item[4] if len(marker_item) > 4 else None
+        suitability = marker_item[5] if len(marker_item) > 5 else "unmarked"
+        if suitability not in _SUITABILITY_MARKER_COLORS:
+            suitability = "unmarked"
         center = _atlas_center_for_grid(nodes, grid_dir, grid_id)
         if center is None:
             continue
@@ -626,12 +731,14 @@ def _atlas_with_grid_markers(
             continue
         marker_rgb = _rating_marker_color(rating)
         fill_rgba = (*marker_rgb, 175)
-        edge_rgba = (20, 28, 44, 235) if highlight else (20, 28, 44, 190)
+        suitability_rgb = _SUITABILITY_MARKER_COLORS[suitability]
+        edge_rgba = (*suitability_rgb, 255)
+        marker_ring_width = max(ring_width + (2 if highlight else 0), int(radius * 0.28))
         draw.ellipse(
             (cx - radius, cy - radius, cx + radius, cy + radius),
             fill=fill_rgba,
             outline=edge_rgba,
-            width=ring_width,
+            width=marker_ring_width,
         )
         text = str(label_idx)
         if hasattr(draw, "textbbox"):
@@ -646,6 +753,29 @@ def _atlas_with_grid_markers(
         shadow_rgba = (255, 255, 255, 170) if text_rgba[0] < 100 else (0, 0, 0, 170)
         draw.text((tx + 1, ty + 1), text, fill=shadow_rgba, font=font)
         draw.text((tx, ty), text, fill=text_rgba, font=font)
+        status_label = {"suitable": "S", "unsuitable": "U", "unmarked": "-"}[suitability]
+        badge_r = max(7, int(radius * 0.42))
+        badge_cx = cx + int(radius * 0.78)
+        badge_cy = cy - int(radius * 0.78)
+        draw.ellipse(
+            (badge_cx - badge_r, badge_cy - badge_r, badge_cx + badge_r, badge_cy + badge_r),
+            fill=(*suitability_rgb, 245),
+            outline=(255, 255, 255, 245),
+            width=max(1, badge_r // 4),
+        )
+        badge_font = _get_font(max(10, int(badge_r * 1.15))) or ImageFont.load_default()
+        if hasattr(draw, "textbbox"):
+            badge_box = draw.textbbox((0, 0), status_label, font=badge_font)
+            badge_w = badge_box[2] - badge_box[0]
+            badge_h = badge_box[3] - badge_box[1]
+        else:
+            badge_w, badge_h = badge_font.getsize(status_label)
+        draw.text(
+            (badge_cx - badge_w / 2, badge_cy - badge_h / 2),
+            status_label,
+            fill=(255, 255, 255, 255),
+            font=badge_font,
+        )
 
     if show_rating_legend:
         legend_items = [(rating, color) for rating, color in sorted(_RATING_MARKER_COLORS.items())]
@@ -654,8 +784,13 @@ def _atlas_with_grid_markers(
         pad = max(10, int(radius * 0.8))
         row_h = max(20, int(radius * 1.55))
         title_h = row_h
-        legend_w = max(190, int(width * 0.18))
-        legend_h = pad * 2 + title_h + row_h * len(legend_items)
+        legend_w = max(270, int(width * 0.25))
+        suitability_items = [
+            ("Suitable (S)", _SUITABILITY_MARKER_COLORS["suitable"]),
+            ("Unsuitable (U)", _SUITABILITY_MARKER_COLORS["unsuitable"]),
+            ("Unmarked (-)", _SUITABILITY_MARKER_COLORS["unmarked"]),
+        ]
+        legend_h = pad * 2 + title_h * 2 + row_h * (len(legend_items) + len(suitability_items))
         x0 = max(8, width - legend_w - 14)
         y0 = max(8, height - legend_h - 14)
         if hasattr(draw, "rounded_rectangle"):
@@ -685,8 +820,76 @@ def _atlas_with_grid_markers(
             )
             label = "0 / unrated" if rating is None else str(rating)
             draw.text((x0 + pad + swatch + 8, y), label, fill=(20, 28, 44, 255), font=legend_font)
+        suitability_title_y = y0 + pad + title_h + row_h * len(legend_items)
+        draw.text((x0 + pad, suitability_title_y), "Collection suitability", fill=(20, 28, 44, 255), font=legend_font)
+        for legend_idx, (label, color) in enumerate(suitability_items):
+            y = suitability_title_y + title_h + legend_idx * row_h
+            swatch = max(10, int(radius * 0.9))
+            draw.ellipse(
+                (x0 + pad, y + 1, x0 + pad + swatch, y + 1 + swatch),
+                fill=(255, 255, 255, 235),
+                outline=(*color, 255),
+                width=max(2, swatch // 4),
+            )
+            draw.text((x0 + pad + swatch + 8, y), label, fill=(20, 28, 44, 255), font=legend_font)
 
     return rendered
+
+
+def _build_report_marker_legend(width: int, height: int) -> Image.Image:
+    """Render a standalone legend card so microscopy images remain unobscured."""
+    legend = Image.new("RGB", (width, height), (247, 249, 252))
+    draw = ImageDraw.Draw(legend)
+    title_font = _get_font(38) or ImageFont.load_default()
+    body_font = _get_font(28) or ImageFont.load_default()
+    note_font = _get_font(22) or ImageFont.load_default()
+    pad = 42
+    y = 54
+    draw.text((pad, y), "Atlas marker legend", fill=(20, 28, 44), font=title_font)
+    y += 76
+    draw.text((pad, y), "Marker fill: reviewer rating", fill=(20, 28, 44), font=body_font)
+    y += 58
+    x = pad
+    for rating, color in sorted(_RATING_MARKER_COLORS.items()):
+        radius = 24
+        draw.ellipse((x, y, x + radius * 2, y + radius * 2), fill=color, outline=(20, 28, 44), width=2)
+        draw.text((x + radius * 2 + 10, y + 6), str(rating), fill=(20, 28, 44), font=body_font)
+        x += 145
+    unrated_x = x
+    draw.ellipse((unrated_x, y, unrated_x + 48, y + 48), fill=_UNRATED_MARKER_COLOR, outline=(20, 28, 44), width=2)
+    draw.text((unrated_x + 58, y + 6), "0 / unrated", fill=(20, 28, 44), font=body_font)
+    y += 112
+    draw.text((pad, y), "Marker outline and badge: collection suitability", fill=(20, 28, 44), font=body_font)
+    y += 64
+    for label, badge, color in (
+        ("Suitable for collection", "S", _SUITABILITY_MARKER_COLORS["suitable"]),
+        ("Not suitable for collection", "U", _SUITABILITY_MARKER_COLORS["unsuitable"]),
+        ("Unmarked", "-", _SUITABILITY_MARKER_COLORS["unmarked"]),
+    ):
+        radius = 25
+        draw.ellipse((pad, y, pad + radius * 2, y + radius * 2), fill=(255, 255, 255), outline=color, width=7)
+        badge_x = pad + 40
+        badge_y = y - 12
+        draw.ellipse((badge_x, badge_y, badge_x + 34, badge_y + 34), fill=color, outline=(255, 255, 255), width=2)
+        badge_box = draw.textbbox((0, 0), badge, font=note_font)
+        draw.text(
+            (badge_x + 17 - (badge_box[2] - badge_box[0]) / 2, badge_y + 17 - (badge_box[3] - badge_box[1]) / 2),
+            badge,
+            fill=(255, 255, 255),
+            font=note_font,
+        )
+        draw.text((pad + 100, y + 7), label, fill=(20, 28, 44), font=body_font)
+        y += 82
+    radius = 25
+    cx = pad + radius
+    cy = y + radius
+    draw.polygon([(cx, cy - radius), (cx + radius, cy), (cx, cy + radius), (cx - radius, cy)], fill=(8, 145, 178), outline=(255, 255, 255))
+    draw.text((pad + 100, y + 7), "Manually selected unscreened target (T)", fill=(20, 28, 44), font=body_font)
+    y += 82
+    y += 20
+    draw.text((pad, y), "Numbers inside markers follow GridSquare acquisition order.", fill=(80, 88, 108), font=note_font)
+    draw.text((pad, y + 42), "The legend is kept separate so it never covers Atlas data.", fill=(80, 88, 108), font=note_font)
+    return _label_image(legend, "Marker interpretation")
 
 
 def _atlas_with_category_markers(
@@ -708,7 +911,6 @@ def _atlas_with_category_markers(
     outline_width = max(1, radius // 4)
     font = _get_font(max(11, int(radius * 1.1))) or ImageFont.load_default()
 
-    seen_categories: set[int | None] = set()
     for entry in nodes.values():
         if not isinstance(entry, dict):
             continue
@@ -724,7 +926,6 @@ def _atlas_with_category_markers(
             category_value = int(category_value) if category_value is not None else None
         except Exception:
             category_value = None
-        seen_categories.add(category_value)
         r, g, b = _category_marker_color(category_value)
         draw.ellipse(
             (cx - radius, cy - radius, cx + radius, cy + radius),
@@ -741,38 +942,6 @@ def _atlas_with_category_markers(
             else:
                 text_w, text_h = font.getsize(label)
             draw.text((cx - text_w / 2, cy - text_h / 2), label, fill=(255, 255, 255, 128), font=font)
-
-    if seen_categories:
-        legend_items = sorted(
-            [cat for cat in seen_categories if cat is not None],
-            key=lambda value: int(value),
-        )
-        if None in seen_categories:
-            legend_items.append(None)
-        legend_font = _get_font(max(14, int(radius * 1.3))) or ImageFont.load_default()
-        pad = max(10, int(radius * 1.4))
-        row_h = max(18, int(radius * 2.0))
-        legend_w = max(230, int(width * 0.26))
-        legend_h = pad * 2 + row_h * len(legend_items)
-        x0 = max(8, width - legend_w - 14)
-        y0 = max(8, height - legend_h - 14)
-        if hasattr(draw, "rounded_rectangle"):
-            draw.rounded_rectangle(
-                (x0, y0, x0 + legend_w, y0 + legend_h),
-                radius=10,
-                fill=(255, 255, 255, 215),
-                outline=(173, 184, 204, 235),
-                width=2,
-            )
-        else:
-            draw.rectangle((x0, y0, x0 + legend_w, y0 + legend_h), fill=(255, 255, 255, 215), outline=(173, 184, 204, 235), width=2)
-        for idx, category_value in enumerate(legend_items):
-            y = y0 + pad + idx * row_h
-            r, g, b = _category_marker_color(category_value)
-            sw = max(10, int(radius * 1.2))
-            draw.rectangle((x0 + pad, y + 2, x0 + pad + sw, y + sw), fill=(r, g, b, 220), outline=(20, 28, 44, 230), width=1)
-            label = "N/A" if category_value is None else str(category_value)
-            draw.text((x0 + pad + sw + 8, y), f"EPU {label}", fill=(20, 28, 44, 255), font=legend_font)
 
     return rendered
 
@@ -1577,7 +1746,6 @@ def build_pdf(base_dir: Path, output_file: Path, atlas_name: str | None, no_mark
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
-
     pages = []
     for index, (_gid, grid_dir) in enumerate(grids, start=1):
         try:
@@ -2187,6 +2355,7 @@ def _build_overview_page_image(
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
+    manual_targets = _load_manual_collection_targets(base_dir)
 
     def _ensure_font(size: int, fallback=None):
         font = _get_font(size)
@@ -2197,11 +2366,11 @@ def _build_overview_page_image(
                 return fallback
         return font
 
-    page_w, page_h = 2400, 2300
+    page_w, page_h = 2400, 3000
     margin = 40
     atlas_gap = 24
-    atlas_panel_w = int((page_w - 2 * margin - atlas_gap * 2) / 3)
-    atlas_box_h = 520
+    atlas_panel_w = int((page_w - 2 * margin - atlas_gap) / 2)
+    atlas_box_h = 820
     page = Image.new("RGB", (page_w, page_h), color=(255, 255, 255))
     draw = ImageDraw.Draw(page)
     fonts = {
@@ -2248,6 +2417,7 @@ def _build_overview_page_image(
                     responses.get(gdir.name, {}).get("rating")
                     if isinstance(responses.get(gdir.name), dict)
                     else None,
+                    _normalized_collection_status(responses.get(gdir.name)),
                 )
                 for idx, (gid, gdir) in enumerate(grids, start=1)
             ]
@@ -2255,8 +2425,9 @@ def _build_overview_page_image(
                 atlas_screened,
                 atlas_path_for_report,
                 marker_items,
-                show_rating_legend=True,
+                show_rating_legend=False,
             )
+        atlas_screened = _atlas_with_manual_targets(atlas_screened, manual_targets)
         atlas_screened.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
         ox = (atlas_panel_w - atlas_screened.width) // 2
         oy = (atlas_box_h - atlas_screened.height) // 2
@@ -2269,7 +2440,7 @@ def _build_overview_page_image(
         atlas_category_panel.paste(atlas_category, (ox, oy))
     atlas_screened_panel = _label_image(
         atlas_screened_panel,
-        "Atlas: screened GridSquares by user rating" if atlas_img is not None else "No atlas available",
+        "Screened GridSquares: fill = rating, outline/badge = collection suitability" if atlas_img is not None else "No atlas available",
     )
     atlas_category_panel = _label_image(
         atlas_category_panel,
@@ -2277,30 +2448,37 @@ def _build_overview_page_image(
     )
     atlas_raw_panel = _label_image(
         atlas_raw_panel,
-        "Atlas: raw (no overlay)" if atlas_img is not None else "No atlas available",
+        "Raw Atlas: no overlays or annotations" if atlas_img is not None else "No atlas available",
     )
+    atlas_legend_panel = _build_report_marker_legend(atlas_panel_w, atlas_box_h)
     page.paste(atlas_screened_panel, (margin, margin))
     page.paste(atlas_category_panel, (margin + atlas_panel_w + atlas_gap, margin))
-    page.paste(atlas_raw_panel, (margin + 2 * (atlas_panel_w + atlas_gap), margin))
+    second_row_y = margin + atlas_box_h + atlas_gap
+    page.paste(atlas_raw_panel, (margin, second_row_y))
+    page.paste(atlas_legend_panel, (margin + atlas_panel_w + atlas_gap, second_row_y))
 
-    stats_y = margin + atlas_box_h + 24
+    stats_y = second_row_y + atlas_box_h + 24
     color_note = "Note: category colors are arbitrary and currently do not match the EPU GUI color code."
     draw.text((margin, stats_y), color_note, fill=(80, 88, 108), font=fonts["small"])
     stats_y += line_h
     reviewed_count = sum(1 for resp in responses.values() if resp and bool(resp.get("reviewed", True)))
     selected_count = sum(1 for resp in responses.values() if resp and bool(resp.get("include", True)))
-    suitable_count = sum(
-        1
-        for resp in responses.values()
-        if resp and (resp.get("collection_status") == "suitable" or (not resp.get("collection_status") and bool(resp.get("collect", False))))
+    suitable_count = sum(1 for resp in responses.values() if _normalized_collection_status(resp) == "suitable")
+    unsuitable_count = sum(1 for resp in responses.values() if _normalized_collection_status(resp) == "unsuitable")
+    representative = _representative_suitable_grid(grids, responses)
+    representative_text = (
+        f"GridSquare {representative[1]} (rating {_normalized_rating(representative[3].get('rating')) or 0})"
+        if representative is not None
+        else "None - no included GridSquare is marked suitable"
     )
-    unsuitable_count = sum(1 for resp in responses.values() if resp and resp.get("collection_status") == "unsuitable")
     stats_lines = [
         f"Total GridSquares: {len(grids)}",
         f"Reviewed GridSquares: {reviewed_count}",
         f"Included GridSquares: {selected_count}",
         f"Suitable for collection: {suitable_count}",
         f"Unsuitable for collection: {unsuitable_count}",
+        f"Manual unscreened collection targets: {len(manual_targets)}",
+        f"Detailed screening page: {representative_text}",
     ]
     for text in stats_lines:
         draw.text((margin, stats_y), text, fill=0, font=fonts["body"])
@@ -2310,12 +2488,12 @@ def _build_overview_page_image(
     for idx, (gid, gdir) in enumerate(grids, start=1):
         name = gdir.name
         resp = responses.get(name)
-        rating = resp.get("rating", "—") if resp else "—"
+        rating = resp.get("rating", "-") if resp else "-"
         comment = (resp.get("comment", "") if resp else "").strip()
         include_flag = "Yes" if resp and resp.get("include", True) else "No"
         collection_status = str(resp.get("collection_status", "") if resp else "").strip().lower()
         if collection_status not in ("suitable", "unsuitable"):
-            collection_status = "Suitable" if resp and resp.get("collect", False) else "—"
+            collection_status = "Suitable" if resp and resp.get("collect", False) else "-"
         else:
             collection_status = collection_status.title()
         category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
@@ -2326,7 +2504,7 @@ def _build_overview_page_image(
                 str(rating),
                 include_flag,
                 collection_status,
-                comment or "—",
+                comment or "-",
             )
         )
     summary_text = (global_summary or "").strip()
@@ -2378,7 +2556,7 @@ def _build_overview_page_image(
         draw.text((rating_col, y_offset), rating_text, fill=0, font=fonts["table"])
         draw.text((include_col, y_offset), include_text, fill=0, font=fonts["table"])
         draw.text((collect_col, y_offset), collect_text, fill=0, font=fonts["table"])
-        comment_lines = textwrap.wrap(comment_text, width=58) or ["—"]
+        comment_lines = textwrap.wrap(comment_text, width=58) or ["-"]
         comment_y = y_offset
         for c_line in comment_lines:
             draw.text((comment_col, comment_y), c_line, fill=0, font=fonts["table"])
@@ -2395,6 +2573,26 @@ def _append_pil_page(pdf: pdf_canvas.Canvas, page_image: Image.Image) -> None:
     pdf.showPage()
 
 
+def _representative_suitable_grid(
+    grids: list[tuple[int | float, Path]],
+    responses: dict,
+) -> tuple[int, int | float, Path, dict] | None:
+    """Choose one included suitable GridSquare, preferring the highest rating."""
+    candidates: list[tuple[int, int, int | float, Path, dict]] = []
+    for idx, (gid, gdir) in enumerate(grids, start=1):
+        response = responses.get(gdir.name)
+        if not isinstance(response, dict) or not bool(response.get("include", True)):
+            continue
+        if _normalized_collection_status(response) != "suitable":
+            continue
+        rating = _normalized_rating(response.get("rating")) or 0
+        candidates.append((-rating, idx, gid, gdir, response))
+    if not candidates:
+        return None
+    _negative_rating, idx, gid, gdir, response = min(candidates, key=lambda row: (row[0], row[1]))
+    return idx, gid, gdir, response
+
+
 def _append_selected_report_pages(
     pdf: pdf_canvas.Canvas,
     base_dir: Path,
@@ -2405,22 +2603,33 @@ def _append_selected_report_pages(
     global_summary: str | None = None,
     include_summary_page: bool = True,
     skip_foil_processing: bool = False,
+    representative_suitable_only: bool = False,
 ) -> None:
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
     include_list = []
-    for idx, (gid, gdir) in enumerate(grids, start=1):
-        resp = responses.get(gdir.name)
-        if resp and bool(resp.get("include", True)):
-            include_list.append((idx, gid, gdir, resp))
+    if representative_suitable_only:
+        representative = _representative_suitable_grid(grids, responses)
+        if representative is not None:
+            include_list.append(representative)
+    else:
+        for idx, (gid, gdir) in enumerate(grids, start=1):
+            resp = responses.get(gdir.name)
+            if resp and bool(resp.get("include", True)):
+                include_list.append((idx, gid, gdir, resp))
     failed: list[tuple[str, str]] = []
     summary_text = (global_summary or "").strip()
     if include_summary_page and summary_text:
         summary_lines = textwrap.wrap(summary_text, width=100) or [summary_text]
         _draw_pdf_message_page(pdf, summary_lines, title="Session Summary")
     if not include_list:
-        _draw_pdf_message_page(pdf, ["No GridSquares included in this report."])
+        message = (
+            "No included GridSquare is marked suitable for collection; no screening-data page was added."
+            if representative_suitable_only
+            else "No GridSquares included in this report."
+        )
+        _draw_pdf_message_page(pdf, [message])
     else:
         for idx, gid, gdir, resp in include_list:
             grid_name = gdir.name
@@ -2448,7 +2657,7 @@ def _append_selected_report_pages(
                         atlas_img_local = _atlas_with_grid_markers(
                             atlas_img_local,
                             atlas_path_local,
-                            [(idx, gdir, gid, True, resp.get("rating"))],
+                            [(idx, gdir, gid, True, resp.get("rating"), _normalized_collection_status(resp))],
                         )
             category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
             overlay_img_local = None
@@ -2571,8 +2780,178 @@ def write_combined_report(
         global_summary=global_summary,
         include_summary_page=False,
         skip_foil_processing=skip_foil_processing,
+        representative_suitable_only=True,
     )
     pdf.save()
+
+
+def _embedded_image_uri(image: Image.Image | None, max_size: int = 1800) -> str:
+    if image is None:
+        return ""
+    rendered = image.convert("RGB").copy()
+    rendered.thumbnail((max_size, max_size), Image.LANCZOS)
+    buffer = io.BytesIO()
+    rendered.save(buffer, format="PNG", compress_level=6)
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _embedded_path_uri(path: Path | None, max_size: int = 1800) -> str:
+    if path is None:
+        return ""
+    return _embedded_image_uri(_load_image(path, "RGB"), max_size=max_size)
+
+
+def build_embedded_html_report(
+    base_dir: Path,
+    atlas_name: str | None,
+    responses: dict,
+    overlay: bool = False,
+    atlas_overlay: bool = True,
+    global_summary: str | None = None,
+    skip_foil_processing: bool = False,
+) -> str:
+    """Build a self-contained HTML report with all displayed images embedded."""
+    grids = _collect_grids(base_dir)
+    if not grids:
+        raise RuntimeError(f"no GridSquare directories found in {base_dir}")
+    manual_targets = _load_manual_collection_targets(base_dir)
+
+    atlas_path = None
+    atlas_image = None
+    if atlas_name:
+        for _gid, grid_dir in grids:
+            candidate = _resolve_atlas_path(atlas_name, grid_dir, base_dir)
+            if candidate:
+                atlas_path = candidate
+                atlas_image = _load_image(candidate, "RGB")
+                if atlas_image is not None:
+                    break
+    marker_items = [
+        (
+            idx,
+            grid_dir,
+            grid_id,
+            False,
+            responses.get(grid_dir.name, {}).get("rating") if isinstance(responses.get(grid_dir.name), dict) else None,
+            _normalized_collection_status(responses.get(grid_dir.name)),
+        )
+        for idx, (grid_id, grid_dir) in enumerate(grids, start=1)
+    ]
+    screened_atlas = (
+        _atlas_with_grid_markers(atlas_image, atlas_path, marker_items, show_rating_legend=False)
+        if atlas_overlay and atlas_image is not None
+        else atlas_image
+    )
+    if screened_atlas is not None:
+        screened_atlas = _atlas_with_manual_targets(screened_atlas, manual_targets)
+    category_atlas = _atlas_with_category_markers(atlas_image, atlas_path) if atlas_image is not None else None
+
+    atlas_cards = []
+    for title, image in (
+        ("Screened Atlas", screened_atlas),
+        ("EPU category Atlas", category_atlas),
+        ("Raw Atlas - no overlays", atlas_image),
+    ):
+        uri = _embedded_image_uri(image)
+        body = f'<img src="{uri}" alt="{html.escape(title)}">' if uri else '<div class="empty">Atlas unavailable</div>'
+        atlas_cards.append(f'<article class="image-card"><h2>{html.escape(title)}</h2>{body}</article>')
+
+    table_rows = []
+    for idx, (grid_id, grid_dir) in enumerate(grids, start=1):
+        response = responses.get(grid_dir.name) if isinstance(responses.get(grid_dir.name), dict) else {}
+        status = _normalized_collection_status(response)
+        table_rows.append(
+            "<tr>"
+            f"<td>{idx}</td><td>{html.escape(str(grid_id))}</td><td>{html.escape(str(response.get('rating', 0) or 0))}</td>"
+            f"<td><span class=\"status {status}\">{html.escape(status.title())}</span></td>"
+            f"<td>{'Yes' if bool(response.get('include', True)) else 'No'}</td>"
+            f"<td>{html.escape(str(response.get('comment', '') or ''))}</td>"
+            "</tr>"
+        )
+
+    representative = _representative_suitable_grid(grids, responses)
+    detail_html = '<section class="section"><h2>Screening data</h2><div class="empty">No included GridSquare is marked suitable for collection.</div></section>'
+    if representative is not None:
+        idx, grid_id, grid_dir, response = representative
+        try:
+            grid_path = find_grid_image(grid_dir)
+        except FileNotFoundError:
+            grid_path = None
+        overlay_path = _find_overlay_image(grid_dir, base_dir) if overlay and not skip_foil_processing else None
+        primary_path = overlay_path or grid_path
+        primary_uri = _embedded_path_uri(primary_path)
+        pairs = []
+        if not skip_foil_processing:
+            foils, datas = gather_foil_and_data(grid_dir)
+            foils = _latest_only(foils)
+            datas = _latest_only(datas)
+            for foil_id in sorted(foils):
+                foil_path = foils[foil_id][-1] if foils[foil_id] else None
+                data_path = datas.get(foil_id, [])[-1] if datas.get(foil_id) else None
+                foil_uri = _embedded_path_uri(foil_path)
+                data_uri = _embedded_path_uri(data_path)
+                pairs.append(
+                    '<div class="pair">'
+                    f'<article class="image-card"><h3>FoilHole {html.escape(str(foil_id))}</h3>'
+                    + (f'<img src="{foil_uri}" alt="FoilHole {html.escape(str(foil_id))}">' if foil_uri else '<div class="empty">FoilHole image unavailable</div>')
+                    + '</article>'
+                    f'<article class="image-card"><h3>Data - FoilHole {html.escape(str(foil_id))}</h3>'
+                    + (f'<img src="{data_uri}" alt="Data image for FoilHole {html.escape(str(foil_id))}">' if data_uri else '<div class="empty">No matching Data image</div>')
+                    + '</article></div>'
+                )
+        detail_html = (
+            '<section class="section"><h2>Screening data - one suitable GridSquare</h2>'
+            f'<div class="review-summary"><strong>GridSquare {html.escape(str(grid_id))}</strong>'
+            f'<span>Rating {html.escape(str(response.get("rating", 0) or 0))}</span><span>Suitable for collection</span>'
+            f'<p>{html.escape(str(response.get("comment", "") or ""))}</p></div>'
+            + (f'<article class="image-card primary"><h3>GridSquare with foil overlay</h3><img src="{primary_uri}" alt="GridSquare {html.escape(str(grid_id))}"></article>' if primary_uri else '<div class="empty">GridSquare image unavailable</div>')
+            + ''.join(pairs)
+            + '</section>'
+        )
+
+    summary = html.escape((global_summary or "").strip())
+    target_rows = "".join(
+        f"<li>Atlas GridSquare {html.escape(str(target.get('gridsquare_id') or target.get('key') or 'unknown'))}"
+        f" - EPU category {html.escape(str(target.get('category') if target.get('category') is not None else 'N/A'))}</li>"
+        for target in manual_targets
+    )
+    manual_target_html = (
+        f'<section class="section"><h2>Manual unscreened collection targets</h2><ul>{target_rows}</ul></section>'
+        if manual_targets
+        else '<section class="section"><h2>Manual unscreened collection targets</h2><p class="muted">None selected.</p></section>'
+    )
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper screening report</title>
+<style>body{{margin:0;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{max-width:1500px;margin:auto;padding:28px}}h1{{margin-bottom:5px}}h2,h3{{margin:0 0 12px}}.muted{{color:#68758b}}.atlas-grid,.pair{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:18px 0}}.image-card,.section,.legend,.review-summary{{background:#fff;border:1px solid #dfe5ee;border-radius:14px;padding:16px;box-shadow:0 2px 8px rgba(26,39,67,.05)}}.image-card img{{display:block;width:100%;max-height:760px;object-fit:contain;background:#101827;border-radius:10px}}.image-card.primary{{margin:18px 0}}.legend{{display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin:18px 0}}.legend-group{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.dot{{width:18px;height:18px;border-radius:50%;display:inline-grid;place-items:center;color:#fff;font-size:9px;font-weight:800;border:4px solid #64748b}}.r1{{background:#c62828}}.r2{{background:#ef6c00}}.r3{{background:#f9a825}}.r4{{background:#7cb342}}.r5{{background:#2e7d32}}.suitable{{border-color:#059669}}.unsuitable{{border-color:#dc2626}}.unmarked{{border-color:#64748b}}.target{{border-radius:3px;background:#0891b2;border-color:#a5f3fc}}table{{width:100%;border-collapse:collapse;background:#fff;margin:18px 0}}th,td{{border-bottom:1px solid #e3e8ef;padding:10px;text-align:left;vertical-align:top}}th{{background:#eef2f7}}.status{{display:inline-block;padding:3px 7px;border-radius:999px;border:2px solid}}.empty{{min-height:180px;display:grid;place-items:center;color:#68758b;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px}}.review-summary{{display:flex;gap:18px;align-items:center;flex-wrap:wrap}}.review-summary p{{flex-basis:100%;margin:0}}@media(max-width:800px){{.atlas-grid,.pair{{grid-template-columns:1fr}}main{{padding:14px}}}}</style></head><body><main>
+<h1>EPU Mapper screening report</h1><div class="muted">Self-contained HTML export; all images are embedded.</div>{f'<p>{summary}</p>' if summary else ''}
+<section class="legend"><strong>Atlas marker legend (kept outside images)</strong><span class="legend-group">Rating <span class="dot r1">1</span><span class="dot r2">2</span><span class="dot r3">3</span><span class="dot r4">4</span><span class="dot r5">5</span></span><span class="legend-group"><span class="dot suitable">S</span>Suitable <span class="dot unsuitable">U</span>Not suitable <span class="dot unmarked">-</span>Unmarked</span><span class="legend-group"><span class="dot target">T</span>Unscreened target</span></section>
+<section class="atlas-grid">{''.join(atlas_cards)}</section>
+{manual_target_html}
+<section class="section"><h2>GridSquare review summary</h2><table><thead><tr><th>Order</th><th>GridSquare</th><th>Rating</th><th>Collection</th><th>Included</th><th>Comment</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></section>
+{detail_html}</main></body></html>"""
+
+
+def write_embedded_html_report(
+    base_dir: Path,
+    report_file: Path,
+    atlas_name: str | None,
+    responses: dict,
+    overlay: bool = False,
+    atlas_overlay: bool = True,
+    global_summary: str | None = None,
+    skip_foil_processing: bool = False,
+) -> None:
+    report_file.write_text(
+        build_embedded_html_report(
+            base_dir,
+            atlas_name,
+            responses,
+            overlay=overlay,
+            atlas_overlay=atlas_overlay,
+            global_summary=global_summary,
+            skip_foil_processing=skip_foil_processing,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _make_report_grid_page(grid_img: Image.Image, label: str, resp: dict | None) -> Image.Image:

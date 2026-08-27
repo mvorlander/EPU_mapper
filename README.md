@@ -7,13 +7,17 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 - Use the atlas-first dashboard to jump directly to any screened GridSquare and
   browse all of its associated images without leaving the overview.
 - Hover screened atlas squares for a large GridSquare preview. Click a square
-  to open its large GridSquare view, then hover a screened FoilHole to compare
-  the FoilHole and matched Data images side by side.
+  to open only the GridSquare foil-overlay view. Hover a screened FoilHole to
+  show its matched Data image beside the GridSquare and its FoilHole image
+  underneath.
 - Map the acquired FoilHoles onto the GridSquare and the current GridSquare
   position on the atlas to pick the best areas.
 - Load fast PNG previews by default, request an MRC only for the particular
   atlas, GridSquare, FoilHole, or Data image that needs closer inspection, and
-  zoom or pan continuously (scroll to zoom, then drag—no separate pan tool).
+  adjust contrast, zoom, or pan continuously (scroll to zoom, then drag—no
+  separate pan tool) once the MRC is loaded.
+- Spot GridSquares without screening Data immediately: their atlas markers and
+  acquisition-list cards carry an amber warning state.
 - Rate each GridSquare, add reviewer comments, mark it suitable or unsuitable
   for collection, and choose whether it stays in the final report.
 
@@ -48,9 +52,13 @@ install it into your user Applications folder:
 ```
 
 Open **EPU Mapper** from Finder or Spotlight. The launcher remembers recent
-sessions and atlas locations, starts the local dashboard, and provides a Stop
+sessions and their atlas locations, reopens browse dialogs at the last-used
+input location, starts the local dashboard, and provides a Stop
 button plus access to details-only PDF export. A browser preparation page opens
 immediately and redirects to the dashboard when session scanning is complete.
+If the server fails during launch, the waiting page and launcher both show a
+prominent red error. The launcher dialog includes the final server messages and
+the path to the persistent log.
 Keep the launcher open while using the dashboard; its **Stop server** button or
 quitting the launcher stops the local site. Server output is also retained at
 `~/Library/Logs/EPUMapper/server.log` for troubleshooting.
@@ -122,6 +130,12 @@ Images-Disc1/
   of FoilHoles.
 - `Export detailed PDF without review:` skips the interactive UI and generates a
   detailed PDF for all GridSquares immediately.
+- `Export portable session…:` copies the complete EPU session, Atlas, review
+  annotations, and manual targets into a self-contained folder. Its
+  `EPUMapperSession.epumap` manifest contains only relative paths.
+- `Open portable session…:` loads an `.epumap` manifest and resolves the copied
+  session and Atlas relative to its new folder, so the bundle can be moved to
+  another disk or computer.
 
 ### 3. The start page
 
@@ -130,12 +144,33 @@ Images-Disc1/
 The start page is an interactive screening dashboard. It runs preflight checks,
 confirms that the session folders were found, and loads PNG previews by default.
 Hover a numbered screened-square marker to preview its GridSquare, then click it
-to open a large GridSquare and screened-hole overlay directly below the atlas.
-Hover a screened hole for a large side-by-side FoilHole/Data comparison. Rating,
-comment, report inclusion, and suitable/unsuitable collection controls are in
-the same workspace. Use **Load MRC** only when a specific full-resolution source
-is needed. Suitable marks are amber, unsuitable marks are red, and both save
-immediately.
+to open the linked workspace. The screened GridSquare list remains in a compact
+left rail, Atlas/GridSquare and FoilHole/Data form the central 2x2 image area,
+and rating, suitability, report inclusion, and comments remain visible in a
+right review rail. The first matched FoilHole/Data pair appears automatically; hover or
+click another numbered hole, or use **Previous hole** / **Next hole** below the
+Data viewer, to update both lower viewers. Press
+Command+Enter on macOS (or Ctrl+Enter elsewhere) to save and advance to the
+next GridSquare.
+
+Use **Previous GridSquare** / **Next GridSquare** directly under the GridSquare
+viewer to step through the acquisition order. That viewer also exposes its
+**Load GridSquare MRC**, zoom/pan, reset, and MRC contrast controls. The
+dashboard's **Export portable session** button copies the full session to a
+destination folder while showing background progress; the same export remains
+available from the desktop launcher.
+
+Every viewer loads a PNG by default, supports scroll-to-zoom and drag-to-pan,
+and offers MRC loading plus contrast controls when an MRC exists. Atlas markers
+update live: fill color represents rating, while a green, red, or gray outline
+and S/U/- badge represents collection suitability. The legend is outside the
+Atlas image so it never hides image data.
+
+After screening, choose **Add unscreened targets** in the Atlas header (or use
+the shortcut on the review-complete page) and click unscreened Atlas squares to
+add/remove them as manual collection targets. These choices persist in
+`manual_collection_targets.json` and are included in JSON, PDF, and embedded
+HTML reports as cyan diamond markers.
 
 ### 4. Review GridSquares in the web app
 
@@ -198,13 +233,25 @@ Most users outside VBC can ignore this section.
 
 ## Outputs
 
-- `Screening_report.pdf` – combined PDF with overview on page 1, followed by
-  detailed pages for included GridSquares.
+- `Screening_report.pdf` – combined PDF with large screened, EPU-category, and
+  raw Atlas views on page 1. The marker legend is a separate panel and never
+  covers an Atlas image.
+  Screened positions use their rating color as the marker fill and their
+  collection status as a green suitable, red unsuitable, or gray unmarked
+  outline/badge. The report then shows screening data for exactly one included
+  GridSquare marked suitable for collection, choosing the highest rating and
+  then acquisition order when ratings tie.
+- `Screening_report.html` – self-contained HTML version of the combined report.
+  All displayed images are embedded in the file, so it can be copied and opened
+  without the EPU Mapper server or its source data paths.
 - `Screening_details.pdf` – optional details-only export (e.g. via
-  `--details-only` / `--export-all-details`), including foil/data thumbnails plus metadata.
+  `--details-only` / `--export-all-details`), including all included
+  GridSquares with foil/data thumbnails plus metadata.
 - `review_responses.json` – the persisted ratings, comments, inclusion flags,
   and suitable/unsuitable collection decisions, written next to the disc so
   you can resume later.
+- `manual_collection_targets.json` – manually selected unscreened Atlas
+  GridSquares to target during collection.
 - `review_summary.txt` – optional one-line session summary entered on the final
   page before downloading reports.
 

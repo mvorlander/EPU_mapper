@@ -40,6 +40,16 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_exe.ps1 -Version "${env:VERSION}"
 
+      - name: Smoke test Windows executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path ".\dist\EPUMapperReview\EPUMapperReview.exe"
+          $process = Start-Process -FilePath $exe -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "EPUMapperReview.exe smoke test failed with exit code $($process.ExitCode)."
+          }
+          Write-Host "Windows executable smoke test passed."
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:

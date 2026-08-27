@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import urllib.parse
 import time
@@ -31,11 +32,13 @@ from build_collage import (
     _latest_only,
     _mrc_to_image,
     write_combined_report,
+    write_embedded_html_report,
     write_selected_report,
     _resolve_atlas_path,
     parse_metadata,
     parse_grid_info,
 )
+from portable_session import export_portable_session, load_portable_session, portable_session_source
 
 
 def _find_mrc_for_jpg(path: Path) -> Path | None:
@@ -422,8 +425,6 @@ def _render_atlas_category_overview(
     radius = max(8, int(min(width, height) * 0.011))
     ring_width = max(1, radius // 4)
     font = ImageFont.load_default()
-    seen_categories: set[int | None] = set()
-
     for key, center in centers.items():
         cx = center[0] * scale_x
         cy = center[1] * scale_y
@@ -434,7 +435,6 @@ def _render_atlas_category_overview(
             category_value = int(category_value) if category_value is not None else None
         except Exception:
             category_value = None
-        seen_categories.add(category_value)
         r, g, b = _category_marker_color(category_value)
         draw.ellipse(
             (cx - radius, cy - radius, cx + radius, cy + radius),
@@ -451,28 +451,6 @@ def _render_atlas_category_overview(
             else:
                 text_w, text_h = font.getsize(label)
             draw.text((cx - text_w / 2, cy - text_h / 2), label, fill=(255, 255, 255, 128), font=font)
-
-    if seen_categories:
-        legend_items = sorted([cat for cat in seen_categories if cat is not None])
-        if None in seen_categories:
-            legend_items.append(None)
-        pad = max(8, int(radius * 1.2))
-        row_h = max(16, int(radius * 1.9))
-        legend_w = max(180, int(width * 0.2))
-        legend_h = pad * 2 + row_h * len(legend_items)
-        x0 = max(8, width - legend_w - 12)
-        y0 = max(8, height - legend_h - 12)
-        if hasattr(draw, "rounded_rectangle"):
-            draw.rounded_rectangle((x0, y0, x0 + legend_w, y0 + legend_h), radius=9, fill=(255, 255, 255, 220), outline=(173, 184, 204, 240), width=2)
-        else:
-            draw.rectangle((x0, y0, x0 + legend_w, y0 + legend_h), fill=(255, 255, 255, 220), outline=(173, 184, 204, 240), width=2)
-        for idx, category_value in enumerate(legend_items):
-            y = y0 + pad + idx * row_h
-            r, g, b = _category_marker_color(category_value)
-            sw = max(8, int(radius * 1.2))
-            draw.rectangle((x0 + pad, y + 2, x0 + pad + sw, y + sw), fill=(r, g, b, 230), outline=(20, 28, 44, 235), width=1)
-            label = "N/A" if category_value is None else str(category_value)
-            draw.text((x0 + pad + sw + 7, y), f"EPU {label}", fill=(20, 28, 44, 255), font=font)
 
     buf = io.BytesIO()
     atlas_rgb.save(buf, format="PNG")
@@ -696,7 +674,7 @@ def _overlay_tools():
 
 
 def _generate_overlay_image(gdir: Path) -> tuple[Path | None, list[dict]]:
-    """Generate foil_overlay.png inside `gdir` using the standalone helper."""
+    """Generate a session-specific overlay in a writable cache directory."""
     tools = _overlay_tools()
     if not tools:
         return None, []
@@ -720,7 +698,19 @@ def _generate_overlay_image(gdir: Path) -> tuple[Path | None, list[dict]]:
         }
         for px, py, in_bounds, label, path in markers
     ]
-    out_path = gdir / "foil_overlay.png"
+    try:
+        selected_grid = find_grid_image(gdir)
+        grid_stat = selected_grid.stat()
+        grid_xml = selected_grid.with_suffix(".xml")
+        xml_mtime = grid_xml.stat().st_mtime_ns if grid_xml.is_file() else 0
+        foil_dir = gdir / "FoilHoles"
+        foil_mtime = foil_dir.stat().st_mtime_ns if foil_dir.is_dir() else 0
+        cache_source = f"{gdir.resolve()}|{grid_stat.st_size}|{grid_stat.st_mtime_ns}|{xml_mtime}|{foil_mtime}"
+    except Exception:
+        cache_source = str(gdir.resolve())
+    cache_root = Path(tempfile.gettempdir()) / "EPUMapperOverlayCache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    out_path = cache_root / f"{hashlib.sha1(cache_source.encode('utf-8')).hexdigest()}.png"
     try:
         plot_overlay(grid_img, markers, title=gdir.name, output=out_path, dpi=180)
     except Exception as exc:
@@ -942,9 +932,13 @@ def create_app(
     atlas_screened_preview: bytes | None = None
     atlas_category_preview: bytes | None = None
     atlas_raw_preview: bytes | None = None
-    atlas_mrc_preview: bytes | None = None
+    atlas_mrc_previews: dict[tuple[float, float], bytes] = {}
     atlas_preview_message: str | None = None
     atlas_preview_path: Path | None = None
+    atlas_centers_all: dict[str, tuple[float, float]] = {}
+    atlas_categories_all: dict[str, int | None] = {}
+    atlas_ref_w_all: float | None = None
+    atlas_ref_h_all: float | None = None
     atlas_sample_item = next(
         (
             item
@@ -956,6 +950,10 @@ def create_app(
     if atlas_sample_item is not None:
         atlas_preview_path = atlas_sample_item["atlas"]
         centers, categories, ref_w, ref_h, atlas_msg = _load_atlas_mapping(atlas_preview_path)
+        atlas_centers_all = centers
+        atlas_categories_all = categories
+        atlas_ref_w_all = ref_w
+        atlas_ref_h_all = ref_h
         atlas_raw_preview = _render_atlas_raw(atlas_preview_path)
         screened_items: list[tuple[str, str]] = []
         for idx_item, item in enumerate(items, start=1):
@@ -982,6 +980,7 @@ def create_app(
         atlas_preview_message = "Atlas image not found; atlas overview previews are unavailable."
 
     responses_file = base_dir / "review_responses.json"
+    manual_targets_file = base_dir / "manual_collection_targets.json"
     drafts_file = _drafts_file_path(base_dir)
     summary_state = {"text": _load_review_summary(base_dir)}
     session_storage_key = hashlib.sha1(str(base_dir).encode("utf-8")).hexdigest()[:16]
@@ -990,6 +989,7 @@ def create_app(
     thumb_cache_dir.mkdir(parents=True, exist_ok=True)
     drafts_lock = threading.Lock()
     report_jobs_lock = threading.Lock()
+    portable_jobs_lock = threading.Lock()
     thumb_cache_lock = threading.Lock()
 
     def _load_responses() -> dict[str, dict]:
@@ -1008,7 +1008,13 @@ def create_app(
 
     responses = _load_responses()
     drafts = _load_drafts()
+    manual_targets = {
+        str(key): value
+        for key, value in _load_json_dict(manual_targets_file).items()
+        if isinstance(value, dict)
+    }
     report_jobs: dict[str, dict] = {}
+    portable_jobs: dict[str, dict] = {}
 
     app = FastAPI()
 
@@ -1189,6 +1195,7 @@ def create_app(
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "summary": summary_state["text"],
             "rows": _export_rows(),
+            "manual_unscreened_collection_targets": list(manual_targets.values()),
         }
 
     def _dashboard_grid_summaries() -> list[dict]:
@@ -1223,6 +1230,29 @@ def create_app(
             )
         return summaries
 
+    def _unscreened_atlas_summaries() -> list[dict]:
+        screened_keys = {str(item["id"]) for item in items}
+        screened_keys.update(str(item.get("atlas_center_key")) for item in items if item.get("atlas_center_key"))
+        summaries: list[dict] = []
+        if not atlas_ref_w_all or not atlas_ref_h_all:
+            return summaries
+        for key, center in atlas_centers_all.items():
+            if str(key) in screened_keys:
+                continue
+            summaries.append(
+                {
+                    "key": str(key),
+                    "id": str(key),
+                    "category": atlas_categories_all.get(key),
+                    "position": {
+                        "x": max(0.0, min(100.0, float(center[0]) / float(atlas_ref_w_all) * 100.0)),
+                        "y": max(0.0, min(100.0, float(center[1]) / float(atlas_ref_h_all) * 100.0)),
+                    },
+                    "selected": str(key) in manual_targets,
+                }
+            )
+        return summaries
+
     def _hole_preview_records(idx: int, item: dict) -> list[dict]:
         foil_by_name = {entry["path"].name: entry for entry in item["foils"]}
         data_by_id: dict[str, list[dict]] = {}
@@ -1244,11 +1274,11 @@ def create_app(
                     "marker_label": marker.get("label"),
                     "foil_id": str(foil["id"]),
                     "foil_name": foil_name,
-                    "foil_preview": f"/preview.png?idx={idx}&kind=foil&name={urllib.parse.quote(foil_name)}&size=1400&session={session_cache_key}",
+                    "foil_preview": f"/preview.png?idx={idx}&kind=foil&name={urllib.parse.quote(foil_name)}&size=2048&session={session_cache_key}",
                     "foil_has_mrc": bool(foil.get("mrc")),
                     "data_name": data_name,
                     "data_preview": (
-                        f"/preview.png?idx={idx}&kind=data&name={urllib.parse.quote(data_name)}&size=1400&session={session_cache_key}"
+                        f"/preview.png?idx={idx}&kind=data&name={urllib.parse.quote(data_name)}&size=2048&session={session_cache_key}"
                         if data_entry
                         else ""
                     ),
@@ -1324,6 +1354,79 @@ def create_app(
             _update_job(job_id, status="error", progress=100, message=f"Failed to generate report: {exc}", error=str(exc))
             return
         _update_job(job_id, status="done", progress=100, message="Report ready.", path=str(target_path), filename=target_path.name)
+
+    def _portable_job_state(job_id: str) -> dict | None:
+        with portable_jobs_lock:
+            job = portable_jobs.get(job_id)
+            return dict(job) if job is not None else None
+
+    def _update_portable_job(job_id: str, **updates) -> None:
+        with portable_jobs_lock:
+            job = portable_jobs.get(job_id)
+            if job is None:
+                return
+            job.update(updates)
+            job["updated_at"] = time.time()
+
+    def _portable_atlas_source() -> Path | None:
+        if atlas_name:
+            candidate = Path(atlas_name).expanduser()
+            if candidate.exists():
+                return candidate.resolve()
+        return atlas_preview_path.resolve() if atlas_preview_path and atlas_preview_path.exists() else None
+
+    def _refresh_portable_annotations(manifest_path: Path) -> None:
+        """Refresh mutable review files after the bulk session copy completes."""
+        loaded = load_portable_session(manifest_path)
+        source_root = portable_session_source(base_dir)
+        relative_base = base_dir.relative_to(source_root)
+        copied_base = Path(loaded["session_path"]) / relative_base
+        copied_base.mkdir(parents=True, exist_ok=True)
+        for source in (responses_file, manual_targets_file, drafts_file, base_dir / "review_summary.txt"):
+            if source.is_file():
+                shutil.copy2(source, copied_base / source.name)
+
+    def _run_portable_job(job_id: str, destination: Path) -> None:
+        _update_portable_job(job_id, status="running", progress=5, message="Preparing portable session…")
+
+        def log(message: str) -> None:
+            clean = str(message).strip()
+            if clean:
+                _update_portable_job(job_id, progress=45, message=clean)
+
+        try:
+            manifest_path = export_portable_session(
+                session_path=base_dir,
+                atlas_path=_portable_atlas_source(),
+                atlas_mode="epu" if atlas_overlay else "static",
+                destination_parent=destination,
+                label=session_label or portable_session_source(base_dir).name,
+                options={
+                    "overlay": overlay_enabled,
+                    "overlay_transform": overlay_transform or "identity",
+                    "atlas_overlay": atlas_overlay,
+                    "skip_foil_processing": skip_foil_processing,
+                },
+                log=log,
+            )
+            _update_portable_job(job_id, progress=90, message="Refreshing reviews and collection targets…")
+            _refresh_portable_annotations(manifest_path)
+        except Exception as exc:
+            _update_portable_job(
+                job_id,
+                status="error",
+                progress=100,
+                message=f"Portable export failed: {exc}",
+                error=str(exc),
+            )
+            return
+        _update_portable_job(
+            job_id,
+            status="done",
+            progress=100,
+            message="Portable session ready.",
+            path=str(manifest_path),
+        )
 
     def review_html(idx: int) -> str:
         item = items[idx]
@@ -2095,6 +2198,7 @@ setInterval(refreshStatus, 5000);
     @app.get("/")
     def root():
         grid_summaries = _dashboard_grid_summaries()
+        unscreened_summaries = _unscreened_atlas_summaries()
         reviewed_count = sum(1 for entry in grid_summaries if entry["reviewed"])
         mapped_count = sum(1 for entry in grid_summaries if entry["position"])
         image_count = sum(1 + entry["foil_count"] + entry["data_count"] for entry in grid_summaries)
@@ -2112,19 +2216,59 @@ setInterval(refreshStatus, 5000);
 .browser-panel{margin-top:16px}.browser-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.search{width:230px;border:1px solid #d3dbe7;border-radius:8px;padding:8px 10px;font-size:11px;outline:none}.search:focus{border-color:#5b8def;box-shadow:0 0 0 3px rgba(37,99,235,.08)}.grid-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:9px;padding:12px;max-height:300px;overflow:auto}.grid-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px;display:flex;align-items:center;gap:9px;cursor:pointer;text-align:left;color:var(--ink)}.grid-card:hover,.grid-card.active{border-color:#6b93e7;background:#f7faff}.grid-card-index{width:29px;height:29px;flex:0 0 auto;border-radius:8px;background:#eaf0fb;color:#2856ad;display:grid;place-items:center;font-size:10px;font-weight:800}.grid-card.reviewed .grid-card-index{background:#daf5ec;color:#08765a}.grid-card.collection .grid-card-index{background:#fff0d5;color:#a84f05}.grid-card-title{font-size:11px;font-weight:700}.grid-card-meta{font-size:9px;color:var(--muted);margin-top:3px}.button.collection.active{border-color:#d97706;background:#fff7e8;color:#9a4b08}.preflight-pop{display:none;margin:0 30px 16px;padding:10px 13px;border:1px solid #f1d19b;background:#fff9ed;color:#85530d;border-radius:10px;font-size:11px}.preflight-pop.show{display:block}.preflight-pop.err{border-color:#f3b8c1;background:#fff4f5;color:#9f1239}
 .lightbox{position:fixed;inset:0;background:rgba(5,10,20,.88);z-index:20;display:none;align-items:center;justify-content:center;padding:30px}.lightbox.open{display:flex}.lightbox img{max-width:92vw;max-height:88vh;object-fit:contain}.lightbox-close{position:absolute;right:22px;top:18px;border:0;background:rgba(255,255,255,.12);color:#fff;border-radius:8px;width:38px;height:38px;font-size:20px;cursor:pointer}
 .grid-hover-preview{position:fixed;display:none;z-index:15;width:min(560px,calc(100vw - 24px));padding:9px;background:#fff;border:1px solid #cfd8e6;border-radius:14px;box-shadow:0 18px 45px rgba(7,15,30,.34);pointer-events:none}.grid-hover-preview.visible{display:block}.grid-hover-preview img{display:block;width:542px;max-width:100%;height:min(542px,calc(100vh - 100px));object-fit:contain;background:#101827;border-radius:9px}.grid-hover-caption{padding:8px 3px 2px;font-size:12px;font-weight:750;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.portable-dialog{width:min(560px,calc(100vw - 32px));border:1px solid var(--line);border-radius:14px;padding:0;color:var(--ink);box-shadow:0 24px 70px rgba(15,23,42,.28)}.portable-dialog::backdrop{background:rgba(15,23,42,.46);backdrop-filter:blur(2px)}.portable-dialog-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--line)}.portable-dialog-head h2{font-size:16px;margin:0}.portable-dialog-close{border:0;background:transparent;color:var(--muted);font-size:22px;cursor:pointer}.portable-dialog-body{padding:18px}.portable-dialog-body label{display:block;font-size:11px;font-weight:700;margin-bottom:7px}.portable-destination{width:100%;padding:10px 11px;border:1px solid #cfd7e4;border-radius:9px;font-size:12px}.portable-warning{margin-top:10px;color:var(--muted);font-size:11px;line-height:1.45}.portable-status{display:none;margin-top:14px;padding:11px;border-radius:9px;background:#f1f5f9;color:#475569;font-size:11px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}.portable-status.visible{display:block}.portable-status.error{background:#fff1f2;color:#9f1239}.portable-progress{height:5px;background:#dbe3ee;border-radius:99px;margin-top:9px;overflow:hidden}.portable-progress span{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}.portable-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.selected-detail-layout{grid-template-columns:minmax(0,1fr) minmax(320px,.34fr)}.selected-visual-workspace{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(340px,.7fr);gap:16px;min-width:0}.selected-grid-image,#selected-grid-png,#selected-grid-mrc{display:none}.selected-overlay-wrap{width:100%;margin-top:9px}.inline-rating-panel{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}.inline-rating-panel .control-title{margin-top:0}.hole-comparison{display:block;padding:0;min-width:0}.hole-comparison .panel-head{padding:0 0 10px;border-bottom:0}.comparison-grid{grid-template-columns:1fr}.comparison-panel img{height:clamp(280px,28vw,460px)}.comparison-panel.data-panel img{height:clamp(320px,33vw,540px)}.hole-preview-placeholder{min-height:220px;display:grid;place-items:center;text-align:center;color:var(--muted);border:1px dashed #cbd5e1;border-radius:10px;padding:20px;background:#fff}.hole-comparison.has-selection .hole-preview-placeholder{display:none}.comparison-panel{display:none}.hole-comparison.has-selection .comparison-panel{display:block}.review-image-viewport{position:relative;width:100%;height:clamp(280px,28vw,460px);overflow:hidden;background:#101827;border-radius:9px;touch-action:none;cursor:default}.data-panel .review-image-viewport{height:clamp(320px,33vw,540px)}.review-image-viewport.zoomable{cursor:grab}.review-image-viewport.dragging{cursor:grabbing}.review-image-viewport img{width:100%;height:100%;object-fit:contain;transform-origin:center center;will-change:transform}.mrc-viewer-controls{display:none;margin-top:9px;padding:9px;border:1px solid #dbe3ee;border-radius:9px;background:#fff}.mrc-viewer-controls.visible{display:block}.mrc-control-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.mrc-control-row+.mrc-control-row{margin-top:7px}.mrc-control-row label{font-size:10px;color:var(--muted);display:flex;align-items:center;gap:5px;flex:1;min-width:140px}.mrc-control-row input[type=range]{min-width:90px;flex:1}.mrc-zoom-value{font-size:10px;color:var(--muted);min-width:42px;text-align:center}.atlas-mrc-contrast{display:none;position:absolute;right:12px;bottom:58px;width:min(360px,calc(100% - 24px));padding:9px;background:rgba(13,22,38,.93);border-radius:9px;color:#fff}.atlas-mrc-contrast.visible{display:block}.atlas-mrc-contrast label{display:flex;align-items:center;gap:7px;font-size:10px}.atlas-mrc-contrast label+label{margin-top:7px}.atlas-mrc-contrast input{flex:1}.grid-marker.no-data{background:#475569;border-color:#fbbf24;box-shadow:0 0 0 4px rgba(251,191,36,.35),0 3px 10px rgba(0,0,0,.4)}.grid-marker.no-data::after{content:'!';position:absolute;right:-7px;top:-9px;width:16px;height:16px;border-radius:50%;display:grid;place-items:center;background:#fbbf24;color:#422006;font-size:10px;font-weight:900;border:1px solid #fff}.grid-card.no-data{border-color:#f2c96d;background:#fffbeb}.grid-card.no-data .grid-card-index{background:#fef3c7;color:#92400e}
 @media(max-width:1100px){.shell{grid-template-columns:76px minmax(0,1fr)}.sidebar{padding:22px 12px}.brand{margin:0 auto 28px}.brand span:last-child,.nav-item span:last-child,.nav-label,.session-health{display:none}.nav-item{justify-content:center}.selected-detail-layout{grid-template-columns:1fr}.review-controls{position:static}.inspector{min-height:0}.inspector-empty{min-height:220px}.inspector-gallery{max-height:none;grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:720px){.shell{display:block}.sidebar{display:none}.topbar{padding:0 15px}.content{padding:15px}.stats{grid-template-columns:1fr}.top-subtitle{display:none}.workspace{display:block}.inspector{margin-top:12px}.atlas-viewport{height:56vh}.atlas-image{max-height:56vh}.selected-detail-layout{padding:10px}.comparison-grid{grid-template-columns:1fr}.comparison-panel img{height:70vw}.inspector-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.browser-head{align-items:stretch;flex-direction:column}.search{width:100%}}
+@media(max-width:1250px){.selected-visual-workspace{grid-template-columns:1fr}}
+@media(max-width:720px){.shell{display:block}.sidebar{display:none}.topbar{padding:0 15px}.content{padding:15px}.stats{grid-template-columns:1fr}.top-subtitle{display:none}.workspace{display:block}.inspector{margin-top:12px}.atlas-viewport{height:56vh}.atlas-image{max-height:56vh}.selected-detail-layout{padding:10px}.comparison-grid{grid-template-columns:1fr}.comparison-panel img,.comparison-panel.data-panel img,.review-image-viewport,.data-panel .review-image-viewport{height:70vw}.inspector-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.browser-head{align-items:stretch;flex-direction:column}.search{width:100%}}
+/* Linked 2x2 review workspace: Atlas | GridSquare, FoilHole | Data. */
+.workspace{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}.workspace>.panel{min-width:0}
+.atlas-viewport{height:clamp(470px,42vw,690px)}.atlas-image{max-height:clamp(470px,42vw,690px)}
+.atlas-help{left:14px;bottom:14px;max-width:calc(100% - 160px);font-size:13px;font-weight:750;line-height:1.4;padding:10px 13px;background:rgba(13,22,38,.9);border:1px solid rgba(255,255,255,.2);box-shadow:0 8px 24px rgba(0,0,0,.24)}
+.atlas-header-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.atlas-status-legend{position:static;display:flex;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid #dbe3ee;border-radius:9px;background:#f8fafc;color:#334155;font-size:10px;font-weight:750;pointer-events:none}.legend-item{display:flex;align-items:center;gap:5px}.legend-swatch{width:18px;height:18px;border-radius:50%;border:3px solid #64748b;background:#2563eb;display:inline-grid;place-items:center;color:#fff;font-size:8px;font-weight:900}.legend-swatch.suitable{background:#fff;border-color:#059669;color:#059669}.legend-swatch.unsuitable{background:#fff;border-color:#dc2626;color:#dc2626}.legend-swatch.unmarked{background:#fff;border-color:#64748b;color:#64748b}.legend-swatch.no-data{background:#475569;border-color:#fbbf24;color:#fef3c7}.legend-swatch.rating-1{background:#dc2626}.legend-swatch.rating-2{background:#f97316}.legend-swatch.rating-3{background:#facc15;color:#172033}.legend-swatch.rating-4{background:#84cc16;color:#172033}.legend-swatch.rating-5{background:#2e7d32}
+.grid-marker::before{content:attr(data-status-label);position:absolute;right:-8px;top:-9px;width:15px;height:15px;border-radius:50%;display:grid;place-items:center;background:var(--status-color,#64748b);color:#fff;font-size:8px;font-weight:900;border:1px solid #fff}.grid-marker.no-data::after{left:-8px;right:auto}
+.grid-marker.collection{background:#0f9f74;box-shadow:0 0 0 4px rgba(15,159,116,.32),0 3px 10px rgba(0,0,0,.4)}
+.inspector{min-height:0}.inspector-empty{min-height:690px}.selected-summary{padding:12px 14px}.selected-detail-layout{display:block;padding:12px}.selected-media-card{padding:12px;background:#fff}.selected-media-card>.panel-title{font-size:14px}.selected-overlay-wrap{width:100%;margin:9px 0 0}.selected-overlay-image{width:100%;height:100%;object-fit:contain}.selected-grid-image{display:none!important}#selected-grid-png,#selected-grid-mrc{display:inline-flex}
+.review-controls{position:static;margin-top:12px;padding:12px;background:#f8fafc}.review-controls>.panel-title{font-size:14px}.dashboard-comment{min-height:76px}
+.interaction-guide{margin:7px 2px 2px;padding:0;border:0;background:transparent;color:var(--muted);font-size:10px;font-weight:500;line-height:1.35}.hole-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;padding:6px;border:1px solid var(--line);border-radius:9px;background:#fff}.hole-nav-status{font-size:10px;font-weight:650;color:var(--muted);text-align:center;flex:1}.hole-nav .button{min-width:94px}
+.hole-comparison{display:none!important}.linked-image-panel{display:block!important;padding:12px;min-height:540px}.linked-image-panel .comparison-label{font-size:15px}.linked-image-panel .linked-empty{height:clamp(390px,38vw,620px);display:grid;place-items:center;text-align:center;color:var(--muted);border:1px dashed #cbd5e1;border-radius:10px;background:#fff;padding:24px}.linked-image-panel .review-image-viewport{height:clamp(390px,38vw,620px)}body.has-hole .linked-image-panel .linked-empty{display:none}.linked-image-panel.no-image .linked-empty{display:grid!important}.linked-image-panel img{display:none}.has-hole .linked-image-panel:not(.no-image) img{display:block}.linked-image-panel.no-image .review-image-viewport{display:none}
+.review-image-stage{position:relative;width:100%;height:100%;transform-origin:center center;will-change:transform}.review-image-stage img{width:100%;height:100%;object-fit:contain}.review-image-stage .dashboard-hole-layer{inset:0}.review-image-viewport{height:clamp(390px,38vw,620px);cursor:grab}.review-image-viewport.dragging{cursor:grabbing}.review-image-viewport.zoomable{cursor:grab}
+.mrc-viewer-controls{display:block;margin-top:5px;padding:4px 2px;border:0;background:transparent;opacity:.6;transition:opacity .15s}.mrc-viewer-controls:hover,.mrc-viewer-controls:focus-within{opacity:1}.mrc-viewer-controls .mrc-contrast-row{display:none}.mrc-viewer-controls.mrc-active .mrc-contrast-row{display:flex}.mrc-viewer-controls .button{padding:5px 8px;border-color:#e2e8f0;background:#f8fafc;font-size:10px}.mrc-viewer-controls .panel-note{font-size:9px}.mrc-control-row{gap:5px}.comparison-meta{min-height:18px}
+@media(max-width:1250px){.workspace{grid-template-columns:1fr}.atlas-viewport,.atlas-image{height:clamp(500px,68vw,760px);max-height:clamp(500px,68vw,760px)}.inspector-empty{min-height:260px}}
+@media(max-width:720px){.workspace{display:grid;grid-template-columns:1fr}.atlas-help{max-width:calc(100% - 28px);bottom:58px;font-size:12px}.atlas-status-legend{font-size:9px}.linked-image-panel{margin-top:0;min-height:360px}.linked-image-panel .review-image-viewport{height:70vw}.hole-nav .button{min-width:0}.interaction-guide{font-size:13px}}
+/* Review cockpit: GridSquare rail | linked viewers | review rail. */
+.content{max-width:none;padding:18px 22px 36px}.workspace{display:grid;grid-template-columns:220px minmax(680px,1fr) 310px;gap:14px;align-items:start}.workspace>.panel{min-width:0}
+.visual-dashboard{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:start;min-width:0}.visual-dashboard>.panel{min-width:0}
+.browser-panel{margin:0;position:sticky;top:86px;max-height:calc(100vh - 104px);overflow:hidden}.browser-head{display:block;padding:13px}.browser-head .search{width:100%;margin-top:10px}.grid-list{display:grid;grid-template-columns:1fr;gap:8px;padding:10px;max-height:calc(100vh - 205px);overflow:auto}.grid-card{padding:9px}.grid-card-title{font-size:10px}.grid-card-meta{font-size:9px;line-height:1.25}
+.review-rail{position:sticky;top:86px;max-height:calc(100vh - 104px);overflow:auto}.review-controls{position:static;margin:0;padding:16px;border:0;background:#fff}.review-controls>.panel-title{font-size:15px}.dashboard-comment{min-height:150px}.collection-decisions{display:grid;grid-template-columns:1fr}.collection-decisions .button{width:100%}
+.atlas-viewport{height:clamp(330px,27vw,500px)}.atlas-image{height:auto;max-height:clamp(330px,27vw,500px)}.inspector-empty{min-height:390px}.selected-media-card{padding:0;border:0;background:#fff}.selected-media-card .review-image-viewport{height:clamp(330px,27vw,500px)}
+.linked-image-panel{min-height:410px}.linked-image-panel .linked-empty,.linked-image-panel .review-image-viewport{height:330px}.review-image-viewport{height:330px}
+.manual-target-marker{position:absolute;width:18px;height:18px;transform:translate(-50%,-50%) rotate(45deg);border:2px solid #a5f3fc;background:#0891b2;pointer-events:auto;cursor:pointer;box-shadow:0 0 0 3px rgba(34,211,238,.28),0 2px 7px rgba(0,0,0,.4)}.manual-target-marker.candidate{width:34px;height:34px;border:0;background:transparent;box-shadow:none;transform:translate(-50%,-50%);border-radius:7px}.manual-target-marker.selected{background:#0891b2;border-color:#fff}.manual-target-button.active{background:#ecfeff;border-color:#06b6d4;color:#155e75}.legend-swatch.target{border-radius:3px;transform:rotate(45deg);background:#0891b2;border-color:#a5f3fc}
+.atlas-tools{opacity:.58;background:rgba(13,22,38,.48);transition:opacity .15s}.atlas-tools:hover,.atlas-tools:focus-within{opacity:1}.atlas-tools button{width:27px;height:27px;font-size:13px}.atlas-zoom{font-size:9px}.media-actions{gap:5px;margin-top:6px}.media-actions .button{padding:6px 9px;font-size:10px;border-color:#dde4ee;color:#526176}
+.visual-dashboard>.panel:nth-child(-n+2)>.panel-head{min-height:92px}.selected-detail-layout{padding:0}.selected-summary{display:none;border:0;padding:0}.inspector.has-selection .selected-summary{display:flex}.inspector.has-selection .inspector-head-copy{display:none}.selected-media-card>.panel-title{display:none}.selected-overlay-wrap{margin:0}.selected-media-card .review-image-viewport,.atlas-viewport{height:clamp(330px,27vw,500px)}
+@media(max-width:1450px){.workspace{grid-template-columns:200px minmax(560px,1fr) 285px}.shell{grid-template-columns:76px minmax(0,1fr)}.sidebar{padding:22px 12px}.brand{margin:0 auto 28px}.brand span:last-child,.nav-item span:last-child,.nav-label,.session-health{display:none}.nav-item{justify-content:center}}
+@media(max-width:1120px){.workspace{grid-template-columns:200px minmax(0,1fr)}.visual-dashboard{grid-template-columns:1fr}.review-rail{grid-column:2;position:static;max-height:none}.browser-panel{grid-row:1 / span 2}.atlas-viewport,.atlas-image,.selected-media-card .review-image-viewport{height:clamp(420px,62vw,680px);max-height:clamp(420px,62vw,680px)}}
+@media(max-width:720px){.workspace{grid-template-columns:1fr}.browser-panel,.review-rail{position:static;max-height:none;grid-column:1;grid-row:auto}.grid-list{max-height:300px}.visual-dashboard{grid-template-columns:1fr}.linked-image-panel .review-image-viewport{height:70vw}}
+/* Single-page shell and precisely aligned primary viewers. */
+.shell{display:block;min-height:100vh}.main{width:100%;min-width:0}.top-health{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:10px;white-space:nowrap}.top-health .health-light{display:inline-block}.primary-viewer-panel{align-self:start}.primary-viewer-panel>.panel-head{height:108px;min-height:108px;padding:12px 14px;overflow:hidden}.primary-viewer-panel .atlas-viewport,.primary-viewer-panel .selected-media-card .review-image-viewport{height:clamp(360px,28vw,520px)}.primary-viewer-panel .inspector-empty{height:clamp(360px,28vw,520px);min-height:0}.primary-viewer-panel .selected-overlay-wrap{height:auto!important}
+/* Fit media to its true aspect ratio; the stage and hit layer share exact bounds. */
+.review-image-viewport{position:relative;display:block;overflow:hidden}.review-image-stage{position:absolute;left:50%;top:50%;width:1px;height:1px;transform-origin:center center;will-change:transform}.review-image-stage img{display:block;width:100%!important;height:100%!important;max-width:none;max-height:none;object-fit:fill}.review-image-stage .dashboard-hole-layer{position:absolute;inset:0}
+.dashboard-hole-hit{width:32px;height:32px;border:0;background:transparent;box-shadow:none;cursor:pointer}.dashboard-hole-hit:hover,.dashboard-hole-hit:focus-visible{border:1px solid #5eead4;background:rgba(94,234,212,.12);box-shadow:0 0 0 3px rgba(15,23,42,.25)}.dashboard-hole-hit.active:not(:hover):not(:focus-visible){border:0;background:transparent;box-shadow:none}.linked-image-panel .review-image-viewport{background:#101827}.linked-image-panel .review-image-stage{max-width:none;max-height:none}
+.grid-control-dock{display:block!important;visibility:visible!important;position:relative;z-index:3;padding:8px 10px 10px;background:#fff;border-top:1px solid var(--line)}.grid-control-dock>.media-actions{display:flex!important;visibility:visible!important;padding:0 0 6px;margin:0}.selected-media-card #selected-grid-png,.selected-media-card #selected-grid-mrc{display:inline-flex!important;visibility:visible!important;opacity:1!important;font-size:11px;padding:7px 10px}.grid-control-dock>.grid-viewer-controls{display:block!important;visibility:visible!important;margin:0 0 8px;padding:8px 9px;border:1px solid #dbe3ee;border-radius:9px;background:#f8fafc;opacity:1!important}.grid-viewer-controls .viewer-controls-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;color:#475569;font-size:10px;font-weight:750}.grid-viewer-controls .mrc-contrast-row{display:flex!important}.grid-viewer-controls .mrc-contrast-row.disabled{opacity:.42}.grid-viewer-controls .mrc-control-row:last-child{margin-top:5px}.grid-viewer-controls .panel-note{font-size:9px}.grid-control-dock>.grid-nav{display:flex!important;visibility:visible!important;align-items:center;justify-content:space-between;gap:10px;margin:4px 0 0;padding:8px 0 0;border-top:1px solid var(--line)}.grid-nav-status{font-size:10px;font-weight:650;color:var(--muted);text-align:center;flex:1}.grid-nav .button{min-width:112px}
+@media(max-width:1450px){.workspace{grid-template-columns:220px minmax(560px,1fr) 300px}}
+@media(max-width:1120px){.workspace{grid-template-columns:200px minmax(0,1fr)}.primary-viewer-panel>.panel-head{height:96px;min-height:96px}.primary-viewer-panel .atlas-viewport,.primary-viewer-panel .selected-media-card .review-image-viewport,.primary-viewer-panel .inspector-empty{height:clamp(420px,62vw,680px)}}
 </style></head><body>
-<div class="shell"><aside class="sidebar"><div class="brand"><span class="brand-mark">E</span><span>EPU Mapper</span></div><div class="nav-label">Workspace</div><a class="nav-item active" href="/"><span class="nav-dot"></span><span>Atlas overview</span></a><a class="nav-item" href="/review/0"><span class="nav-dot"></span><span>Systematic review</span></a><a class="nav-item" href="/done"><span class="nav-dot"></span><span>Reports & export</span></a><div class="session-health"><div class="health-row"><span id="health-light" class="health-light"></span><span id="health-text">Checking session</span></div><div class="session-name">__SESSION_PATH__</div></div></aside>
-<main class="main"><header class="topbar"><div><div class="top-title">Screening dashboard</div><div class="top-subtitle">Hover to preview; click a square to review it in the workspace below</div></div><div class="top-actions"><a class="button" href="/done">Reports & export</a></div></header><div id="preflight" class="preflight-pop"></div>
+<div class="shell">
+<main class="main"><header class="topbar"><div><div class="top-title">EPU Mapper · Screening dashboard</div><div class="top-subtitle">Atlas → GridSquare → FoilHole → Data; hover or use Previous/Next</div></div><div class="top-actions"><span class="top-health"><span id="health-light" class="health-light"></span><span id="health-text">Checking session</span></span><button id="portable-export-dashboard" type="button" class="button">Export portable session</button><a class="button" href="/report.html">Export HTML</a><a class="button" href="/done">Reports & export</a></div></header><div id="preflight" class="preflight-pop"></div>
 <div class="content"><section class="stats"><div class="stat"><span><span class="stat-value">__TOTAL__</span></span><span class="stat-label">Screened GridSquares</span></div><div class="stat"><span class="stat-value">__REVIEWED__</span><span class="stat-label">Reviewed</span></div><div class="stat"><span class="stat-value">__IMAGES__</span><span class="stat-label">Associated images</span></div></section>
 <section class="workspace"><div class="panel"><div class="panel-head"><div><div class="panel-title">Interactive grid atlas</div><div class="panel-note">__MAPPED__ mapped squares · source: __ATLAS_SOURCE__ · fast PNG by default · load MRC only on request</div></div>__ATLAS_MODES__</div><div id="atlas-viewport" class="atlas-viewport"><div id="atlas-content" class="atlas-content">__ATLAS_CONTENT__</div>__ATLAS_AUX__</div></div>
-<aside id="selected-detail" class="panel inspector"><div class="panel-head"><div><div class="panel-title">Selected GridSquare review</div><div class="panel-note">PNG previews load by default; MRC is loaded only when requested</div></div></div><div id="inspector-empty" class="inspector-empty"><div><div class="empty-target">＋</div><div>Select a numbered atlas marker<br>or a GridSquare below</div></div></div><div id="inspector-body" class="inspector-body"><div class="selected-summary"><div><div id="selected-title" class="selected-title"></div><div id="selected-file" class="selected-file"></div><div id="selected-badges" class="badges"></div></div></div><div class="selected-detail-layout"><div class="selected-media-card"><div class="panel-title">GridSquare</div><img id="selected-grid-image" class="selected-grid-image" alt="Selected GridSquare"><div class="media-actions"><button id="selected-grid-png" type="button" class="button active">PNG preview</button><button id="selected-grid-mrc" type="button" class="button">Load GridSquare MRC</button></div><div id="selected-overlay-wrap" class="selected-overlay-wrap"><img id="selected-overlay-image" class="selected-overlay-image" alt="Screened FoilHole overlay"><div id="dashboard-hole-layer" class="dashboard-hole-layer"></div></div><div id="overlay-note" class="panel-note">Hover a screened FoilHole to compare its FoilHole and Data images.</div></div><aside class="review-controls"><div class="panel-title">Review decision</div><div class="control-title">Rating</div><div id="dashboard-ratings" class="dashboard-ratings"><button type="button" class="dashboard-rating" data-rating="1">1</button><button type="button" class="dashboard-rating" data-rating="2">2</button><button type="button" class="dashboard-rating" data-rating="3">3</button><button type="button" class="dashboard-rating" data-rating="4">4</button><button type="button" class="dashboard-rating" data-rating="5">5</button></div><div class="control-title">Collection suitability</div><div class="collection-decisions"><button id="mark-suitable" type="button" class="button collection-decision suitable">Suitable for collection</button><button id="mark-unsuitable" type="button" class="button collection-decision unsuitable">Unsuitable for collection</button><button id="clear-collection" type="button" class="button collection-decision">Clear</button></div><div class="control-title">Comment</div><textarea id="dashboard-comment" class="dashboard-comment" placeholder="Add notes for this GridSquare…"></textarea><label class="panel-note"><input id="dashboard-include" type="checkbox" checked> Include in final report</label><div id="dashboard-save-state" class="save-state"></div></aside></div><section id="hole-comparison" class="hole-comparison"><div class="panel-head"><div><div id="hole-comparison-title" class="panel-title">FoilHole comparison</div><div class="panel-note">Large PNG previews; request MRC only when needed</div></div></div><div class="comparison-grid"><div class="comparison-panel"><div class="comparison-label">FoilHole image</div><img id="comparison-foil" alt="FoilHole preview"><div class="media-actions"><button id="comparison-foil-png" type="button" class="button">PNG</button><button id="comparison-foil-mrc" type="button" class="button">Load MRC</button></div></div><div class="comparison-panel"><div class="comparison-label">Data image</div><img id="comparison-data" alt="Data preview"><div id="comparison-meta" class="comparison-meta"></div><div class="media-actions"><button id="comparison-data-png" type="button" class="button">PNG</button><button id="comparison-data-mrc" type="button" class="button">Load MRC</button></div></div></div></section></div></aside></section>
+<aside id="selected-detail" class="panel inspector"><div class="panel-head"><div class="inspector-head-copy"><div class="panel-title">Selected GridSquare review</div><div class="panel-note">PNG previews load by default; MRC is loaded only when requested</div></div></div><div id="inspector-empty" class="inspector-empty"><div><div class="empty-target">＋</div><div>Select a numbered atlas marker<br>or a GridSquare on the left</div></div></div><div id="inspector-body" class="inspector-body"><div class="selected-summary"><div><div id="selected-title" class="selected-title"></div><div id="selected-file" class="selected-file"></div><div id="selected-badges" class="badges"></div></div></div><div class="selected-detail-layout"><div class="selected-media-card"><div class="panel-title">GridSquare</div><img id="selected-grid-image" class="selected-grid-image" alt="Selected GridSquare"><div class="media-actions"><button id="selected-grid-png" type="button" class="button active">PNG preview</button><button id="selected-grid-mrc" type="button" class="button">Load GridSquare MRC</button></div><div id="selected-overlay-wrap" class="selected-overlay-wrap"><img id="selected-overlay-image" class="selected-overlay-image" alt="Screened FoilHole overlay"><div id="dashboard-hole-layer" class="dashboard-hole-layer"></div></div><div id="overlay-note" class="panel-note">Hover a screened FoilHole to compare its FoilHole and Data images.</div></div><aside class="review-controls"><div class="panel-title">Review decision</div><div class="control-title">Rating</div><div id="dashboard-ratings" class="dashboard-ratings"><button type="button" class="dashboard-rating" data-rating="1">1</button><button type="button" class="dashboard-rating" data-rating="2">2</button><button type="button" class="dashboard-rating" data-rating="3">3</button><button type="button" class="dashboard-rating" data-rating="4">4</button><button type="button" class="dashboard-rating" data-rating="5">5</button></div><div class="control-title">Collection suitability</div><div class="collection-decisions"><button id="mark-suitable" type="button" class="button collection-decision suitable">Suitable for collection</button><button id="mark-unsuitable" type="button" class="button collection-decision unsuitable">Unsuitable for collection</button><button id="clear-collection" type="button" class="button collection-decision">Clear</button></div><div class="control-title">Comment</div><textarea id="dashboard-comment" class="dashboard-comment" placeholder="Add notes for this GridSquare…"></textarea><label class="panel-note"><input id="dashboard-include" type="checkbox" checked> Include in final report</label><div id="dashboard-save-state" class="save-state"></div></aside></div><section id="hole-comparison" class="hole-comparison"><div class="panel-head"><div><div id="hole-comparison-title" class="panel-title">FoilHole comparison</div><div class="panel-note">Large PNG previews; request MRC only when needed</div></div></div><div class="comparison-grid"><div class="comparison-panel"><div class="comparison-label">FoilHole image</div><img id="comparison-foil" alt="FoilHole preview"><div class="media-actions"><button id="comparison-foil-png" type="button" class="button">PNG</button><button id="comparison-foil-mrc" type="button" class="button">Load MRC</button></div></div><div class="comparison-panel"><div class="comparison-label">Data image</div><img id="comparison-data" alt="Data preview"><div id="comparison-meta" class="comparison-meta"></div><div class="media-actions"><button id="comparison-data-png" type="button" class="button">PNG</button><button id="comparison-data-mrc" type="button" class="button">Load MRC</button></div></div></div></section></div></aside></section>
 <section class="panel browser-panel"><div class="panel-head browser-head"><div><div class="panel-title">All screened GridSquares</div><div class="panel-note">Acquisition order</div></div><input id="grid-search" class="search" type="search" placeholder="Find GridSquare ID…" aria-label="Find GridSquare"></div><div id="grid-list" class="grid-list"></div></section></div></main></div>
 <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Image preview"><button type="button" id="lightbox-close" class="lightbox-close" aria-label="Close">×</button><img id="lightbox-image" alt="Selected microscopy image"></div>
 <div id="grid-hover-preview" class="grid-hover-preview" role="tooltip"><img id="grid-hover-image" alt="GridSquare preview"><div id="grid-hover-caption" class="grid-hover-caption"></div></div>
+<dialog id="portable-dialog" class="portable-dialog"><div class="portable-dialog-head"><h2>Export portable EPU session</h2><button id="portable-dialog-close" type="button" class="portable-dialog-close" aria-label="Close">×</button></div><div class="portable-dialog-body"><label for="portable-destination">Destination folder on this Mac</label><input id="portable-destination" class="portable-destination" type="text" spellcheck="false"><div class="portable-warning">This copies the complete EPU session and Atlas data, so the export can be very large. The resulting <strong>EPUMapperSession.epumap</strong> can be opened from the launcher on another computer.</div><div id="portable-status" class="portable-status"><span id="portable-status-text"></span><div class="portable-progress"><span id="portable-progress-bar"></span></div></div><div class="portable-dialog-actions"><button id="portable-cancel" type="button" class="button">Close</button><button id="portable-start" type="button" class="button primary">Start export</button></div></div></dialog>
 <script>
-const GRIDS=__GRIDS_JSON__;const HAS_ATLAS=__HAS_ATLAS__;const SESSION_STORAGE_KEY=__SESSION_KEY__;const CACHE_KEY=__CACHE_KEY__;const LAST_IDX_KEY='last_idx_'+SESSION_STORAGE_KEY;const atlasViewport=document.getElementById('atlas-viewport');const atlasContent=document.getElementById('atlas-content');const markerLayer=document.getElementById('marker-layer');let selectedIdx=null;let atlasScale=1,atlasX=0,atlasY=0,atlasDragging=false,atlasStartX=0,atlasStartY=0;
+const GRIDS=__GRIDS_JSON__;const UNSCREENED=__UNSCREENED_JSON__;const HAS_ATLAS=__HAS_ATLAS__;const SESSION_STORAGE_KEY=__SESSION_KEY__;const CACHE_KEY=__CACHE_KEY__;const PORTABLE_DEFAULT=__PORTABLE_DEFAULT__;const LAST_IDX_KEY='last_idx_'+SESSION_STORAGE_KEY;const atlasViewport=document.getElementById('atlas-viewport');const atlasContent=document.getElementById('atlas-content');const markerLayer=document.getElementById('marker-layer');let selectedIdx=null;let atlasScale=1,atlasX=0,atlasY=0,atlasDragging=false,atlasStartX=0,atlasStartY=0,atlasMode='screened',atlasLow=1,atlasHigh=99,atlasMrcTimer=null,targetMode=new URLSearchParams(location.search).get('targeting')==='1';
 function esc(value){return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
 const gridHoverPreview=document.getElementById('grid-hover-preview'),gridHoverImage=document.getElementById('grid-hover-image'),gridHoverCaption=document.getElementById('grid-hover-caption');let hoveredGridIdx=null;
 function positionGridHover(event){const gap=18,width=Math.min(560,window.innerWidth-24),height=Math.min(590,window.innerHeight-24);let left=event.clientX+gap,top=event.clientY+gap;if(left+width>window.innerWidth-8)left=event.clientX-width-gap;if(top+height>window.innerHeight-8)top=window.innerHeight-height-8;gridHoverPreview.style.left=Math.max(8,left)+'px';gridHoverPreview.style.top=Math.max(8,top)+'px'}
@@ -2134,27 +2278,117 @@ document.addEventListener('pointerover',event=>{const target=event.target.closes
 document.addEventListener('pointermove',event=>{if(gridHoverPreview.classList.contains('visible'))positionGridHover(event)});
 document.addEventListener('pointerout',event=>{const target=event.target.closest('.grid-marker,.grid-card');if(target&&!target.contains(event.relatedTarget))hideGridHover()});
 document.addEventListener('pointerdown',hideGridHover);
-function renderMarkers(){if(!markerLayer)return;markerLayer.innerHTML='';GRIDS.filter(g=>g.position).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-marker'+(g.reviewed?' reviewed':'')+(!g.include?' excluded':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'');b.dataset.idx=g.idx;b.style.left=g.position.x+'%';b.style.top=g.position.y+'%';b.textContent=String(g.idx+1);const decision=g.collection_status==='suitable'?' · suitable for collection':g.collection_status==='unsuitable'?' · unsuitable for collection':'';b.title='GridSquare '+g.id+decision;b.setAttribute('aria-label','Open GridSquare '+g.id);b.addEventListener('pointerdown',e=>e.stopPropagation());b.onclick=e=>{e.stopPropagation();selectGrid(g.idx)};markerLayer.appendChild(b)})}
-function renderGridList(filter=''){const list=document.getElementById('grid-list');const needle=filter.trim().toLowerCase();list.innerHTML='';GRIDS.filter(g=>!needle||g.id.toLowerCase().includes(needle)||g.name.toLowerCase().includes(needle)).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-card'+(g.reviewed?' reviewed':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'')+(g.idx===selectedIdx?' active':'');b.dataset.idx=g.idx;const decision=g.collection_status==='suitable'?' · suitable':g.collection_status==='unsuitable'?' · unsuitable':'';b.innerHTML='<span class="grid-card-index">'+(g.idx+1)+'</span><span><span class="grid-card-title">GridSquare '+esc(g.id)+'</span><span class="grid-card-meta">'+g.foil_count+' foils · '+g.data_count+' data'+(g.reviewed?' · reviewed':'')+decision+'</span></span>';b.onclick=()=>selectGrid(g.idx);list.appendChild(b)})}
-let selectedGridData=null,dashboardSaveTimer=null,activeHole=null;
+function renderMarkers(){if(!markerLayer)return;markerLayer.innerHTML='';GRIDS.filter(g=>g.position).forEach(g=>{const noData=g.data_count===0,b=document.createElement('button');b.type='button';b.className='grid-marker'+(g.reviewed?' reviewed':'')+(!g.include?' excluded':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'')+(noData?' no-data':'');b.dataset.idx=g.idx;b.style.left=g.position.x+'%';b.style.top=g.position.y+'%';b.textContent=String(g.idx+1);const decision=g.collection_status==='suitable'?' · suitable for collection':g.collection_status==='unsuitable'?' · unsuitable for collection':'',availability=noData?' · NO SCREENING DATA':'';b.title='GridSquare '+g.id+availability+decision;b.setAttribute('aria-label','Open GridSquare '+g.id+(noData?', no screening data':''));b.addEventListener('pointerdown',e=>e.stopPropagation());b.onclick=e=>{e.stopPropagation();selectGrid(g.idx)};markerLayer.appendChild(b)})}
+function renderGridList(filter=''){const list=document.getElementById('grid-list');const needle=filter.trim().toLowerCase();list.innerHTML='';GRIDS.filter(g=>!needle||g.id.toLowerCase().includes(needle)||g.name.toLowerCase().includes(needle)).forEach(g=>{const noData=g.data_count===0,b=document.createElement('button');b.type='button';b.className='grid-card'+(g.reviewed?' reviewed':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'')+(noData?' no-data':'')+(g.idx===selectedIdx?' active':'');b.dataset.idx=g.idx;const decision=g.collection_status==='suitable'?' · suitable':g.collection_status==='unsuitable'?' · unsuitable':'',availability=noData?'No screening data':g.foil_count+' foils · '+g.data_count+' data';b.innerHTML='<span class="grid-card-index">'+(g.idx+1)+'</span><span><span class="grid-card-title">GridSquare '+esc(g.id)+'</span><span class="grid-card-meta">'+availability+(g.reviewed?' · reviewed':'')+decision+'</span></span>';b.onclick=()=>selectGrid(g.idx);list.appendChild(b)})}
+let selectedGridData=null,dashboardSaveTimer=null,activeHole=null,activeHoleIndex=-1,dashboardHoles=[];
 function setDashboardRating(value,save=true){document.querySelectorAll('.dashboard-rating').forEach(button=>button.classList.toggle('active',Number(button.dataset.rating)===Number(value)));if(selectedGridData)selectedGridData.rating=Number(value)||0;if(save)queueDashboardSave()}
 function setDashboardCollectionStatus(status,save=true){if(selectedGridData){selectedGridData.collection_status=status;selectedGridData.collect=status==='suitable'}document.getElementById('mark-suitable').classList.toggle('active',status==='suitable');document.getElementById('mark-unsuitable').classList.toggle('active',status==='unsuitable');if(save)queueDashboardSave()}
 function queueDashboardSave(){if(selectedIdx===null||!selectedGridData)return;const state=document.getElementById('dashboard-save-state');state.textContent='Saving…';if(dashboardSaveTimer)clearTimeout(dashboardSaveTimer);dashboardSaveTimer=setTimeout(saveDashboardReview,450)}
 async function saveDashboardReview(){if(selectedIdx===null||!selectedGridData)return;const payload={idx:selectedIdx,rating:selectedGridData.rating||0,comment:document.getElementById('dashboard-comment').value,include:document.getElementById('dashboard-include').checked,collection_status:selectedGridData.collection_status||'',collect:selectedGridData.collection_status==='suitable'};const state=document.getElementById('dashboard-save-state');try{const response=await fetch('/review_state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!response.ok)throw new Error('HTTP '+response.status);const result=await response.json(),grid=GRIDS.find(entry=>entry.idx===selectedIdx);if(grid){grid.reviewed=true;grid.rating=payload.rating;grid.include=payload.include;grid.collect=payload.collect;grid.collection_status=payload.collection_status}state.textContent='Saved';renderMarkers();renderGridList(document.getElementById('grid-search').value)}catch(error){state.textContent='Save failed — retry after reconnecting'}}
 function pngUrl(kind,name,size=1400){return '/preview.png?idx='+selectedIdx+'&kind='+kind+(name?'&name='+encodeURIComponent(name):'')+'&size='+size+'&session='+encodeURIComponent(CACHE_KEY)}
-function mrcPreviewUrl(kind,name){return '/mrc_file?idx='+selectedIdx+'&kind='+kind+'&name='+encodeURIComponent(name||'')+'&low=2&high=98&t='+Date.now()}
-function positionDashboardHolePreview(hole){activeHole=hole;const section=document.getElementById('hole-comparison');section.classList.add('visible');document.getElementById('hole-comparison-title').textContent='FoilHole '+hole.foil_id+' comparison';document.getElementById('comparison-foil').src=hole.foil_preview;document.getElementById('comparison-data').src=hole.data_preview||'';document.getElementById('comparison-data').style.display=hole.data_preview?'block':'none';document.getElementById('comparison-meta').innerHTML=hole.data_preview?(hole.meta||[]).map(esc).join('<br>'):'No matching Data image';document.getElementById('comparison-foil-mrc').disabled=!hole.foil_has_mrc;document.getElementById('comparison-data-mrc').disabled=!hole.data_has_mrc}
+function mrcPreviewUrl(kind,name,low=2,high=98){return '/mrc_file?idx='+selectedIdx+'&kind='+kind+'&name='+encodeURIComponent(name||'')+'&low='+encodeURIComponent(low)+'&high='+encodeURIComponent(high)+'&t='+Date.now()}
+function arrangeSelectedWorkspace(){const layout=document.querySelector('.selected-detail-layout'),media=document.querySelector('.selected-media-card'),comparison=document.getElementById('hole-comparison');if(!layout||!media||!comparison)return;media.querySelector('.panel-title').textContent='GridSquare with screened FoilHoles';const ratings=document.getElementById('dashboard-ratings'),ratingTitle=ratings.previousElementSibling,ratingPanel=document.createElement('div');ratingPanel.className='inline-rating-panel';ratingPanel.appendChild(ratingTitle);ratingPanel.appendChild(ratings);media.appendChild(ratingPanel);const visual=document.createElement('div');visual.className='selected-visual-workspace';layout.insertBefore(visual,media);visual.appendChild(media);visual.appendChild(comparison);const foilPanel=document.getElementById('comparison-foil').closest('.comparison-panel'),dataPanel=document.getElementById('comparison-data').closest('.comparison-panel'),grid=comparison.querySelector('.comparison-grid');dataPanel.classList.add('data-panel');grid.appendChild(dataPanel);grid.appendChild(foilPanel);const placeholder=document.createElement('div');placeholder.className='hole-preview-placeholder';placeholder.innerHTML='<div><strong>Hover a screened FoilHole</strong><br><span>Its Data image will appear beside the GridSquare, with the FoilHole image underneath.</span></div>';grid.insertBefore(placeholder,grid.firstChild)}
+function installMrcViewer(imgId,pngButtonId,mrcButtonId,kind,getSource){const img=document.getElementById(imgId),pngButton=document.getElementById(pngButtonId),mrcButton=document.getElementById(mrcButtonId);if(!img||!pngButton||!mrcButton)return;const viewport=document.createElement('div');viewport.className='review-image-viewport';img.parentNode.insertBefore(viewport,img);viewport.appendChild(img);const controls=document.createElement('div');controls.className='mrc-viewer-controls';controls.innerHTML='<div class="mrc-control-row"><label>Low <span class="mrc-low-value">2</span>% <input class="mrc-low" type="range" min="0" max="99" value="2"></label><label>High <span class="mrc-high-value">98</span>% <input class="mrc-high" type="range" min="1" max="100" value="98"></label></div><div class="mrc-control-row"><button type="button" class="button mrc-minus">−</button><span class="mrc-zoom-value">100%</span><button type="button" class="button mrc-plus">+</button><button type="button" class="button mrc-reset">Reset</button><span class="panel-note">Scroll to zoom · drag to pan</span></div>';mrcButton.closest('.media-actions').after(controls);const low=controls.querySelector('.mrc-low'),high=controls.querySelector('.mrc-high'),lowValue=controls.querySelector('.mrc-low-value'),highValue=controls.querySelector('.mrc-high-value'),zoomValue=controls.querySelector('.mrc-zoom-value');let scale=1,x=0,y=0,dragging=false,startX=0,startY=0,renderTimer=null,mrcActive=false;function apply(){img.style.transform='translate('+x.toFixed(1)+'px,'+y.toFixed(1)+'px) scale('+scale.toFixed(3)+')';zoomValue.textContent=Math.round(scale*100)+'%';viewport.classList.toggle('zoomable',mrcActive)}function setScale(value){const next=Math.max(1,Math.min(8,value)),ratio=next/scale;x*=ratio;y*=ratio;scale=next;if(scale===1){x=0;y=0}apply()}function reset(){scale=1;x=0;y=0;apply()}function renderMrc(){const source=getSource();if(!source||!source.name||!source.hasMrc)return;const lowNumber=Number(low.value),highNumber=Number(high.value);lowValue.textContent=low.value;highValue.textContent=high.value;img.style.display='block';img.src=mrcPreviewUrl(kind,source.name,lowNumber,highNumber)}function queueRender(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}lowValue.textContent=low.value;highValue.textContent=high.value;if(renderTimer)clearTimeout(renderTimer);renderTimer=setTimeout(renderMrc,250)}low.oninput=()=>queueRender(low);high.oninput=()=>queueRender(high);mrcButton.onclick=()=>{const source=getSource();if(!source||!source.hasMrc)return;mrcActive=true;controls.classList.add('visible');renderMrc();reset()};pngButton.onclick=()=>{const source=getSource();if(!source||!source.png)return;mrcActive=false;controls.classList.remove('visible');img.style.display='block';img.src=source.png;reset()};controls.querySelector('.mrc-minus').onclick=()=>setScale(scale/1.3);controls.querySelector('.mrc-plus').onclick=()=>setScale(scale*1.3);controls.querySelector('.mrc-reset').onclick=reset;viewport.addEventListener('wheel',event=>{if(!mrcActive)return;event.preventDefault();setScale(scale*Math.exp(-event.deltaY*.0015))},{passive:false});viewport.addEventListener('pointerdown',event=>{if(!mrcActive||scale<=1||event.button!==0)return;dragging=true;startX=event.clientX-x;startY=event.clientY-y;viewport.classList.add('dragging');viewport.setPointerCapture(event.pointerId)});viewport.addEventListener('pointermove',event=>{if(!dragging)return;x=event.clientX-startX;y=event.clientY-startY;apply()});viewport.addEventListener('pointerup',()=>{dragging=false;viewport.classList.remove('dragging')});viewport.addEventListener('pointercancel',()=>{dragging=false;viewport.classList.remove('dragging')});apply()}
+function positionDashboardHolePreview(hole){activeHole=hole;const section=document.getElementById('hole-comparison');section.classList.add('has-selection');document.getElementById('hole-comparison-title').textContent='FoilHole '+hole.foil_id;document.getElementById('comparison-meta').innerHTML=hole.data_preview?(hole.meta||[]).map(esc).join('<br>'):'No matching Data image';document.getElementById('comparison-foil-mrc').disabled=!hole.foil_has_mrc;document.getElementById('comparison-data-mrc').disabled=!hole.data_has_mrc;document.getElementById('comparison-foil-png').click();if(hole.data_preview)document.getElementById('comparison-data-png').click();else document.getElementById('comparison-data').style.display='none'}
 function renderDashboardHoles(holes){const layer=document.getElementById('dashboard-hole-layer');layer.innerHTML='';(holes||[]).forEach(hole=>{const button=document.createElement('button');button.type='button';button.className='dashboard-hole-hit';button.style.left=hole.x+'%';button.style.top=hole.y+'%';button.title='FoilHole '+hole.foil_id;button.setAttribute('aria-label','Preview FoilHole '+hole.foil_id);button.onpointerenter=()=>positionDashboardHolePreview(hole);button.onfocus=()=>positionDashboardHolePreview(hole);button.onclick=()=>positionDashboardHolePreview(hole);layer.appendChild(button)})}
+function syncSelectedGridAnnotation(){if(selectedIdx===null||!selectedGridData)return;const grid=GRIDS.find(entry=>entry.idx===selectedIdx);if(grid){grid.rating=Number(selectedGridData.rating)||0;grid.collect=Boolean(selectedGridData.collect);grid.collection_status=selectedGridData.collection_status||''}renderMarkers();renderGridList(document.getElementById('grid-search').value)}
+function setDashboardRating(value,save=true){document.querySelectorAll('.dashboard-rating').forEach(button=>button.classList.toggle('active',Number(button.dataset.rating)===Number(value)));if(selectedGridData){selectedGridData.rating=Number(value)||0;syncSelectedGridAnnotation()}if(save)queueDashboardSave()}
+function setDashboardCollectionStatus(status,save=true){const normalized=status==='suitable'||status==='unsuitable'?status:'';if(selectedGridData){selectedGridData.collection_status=normalized;selectedGridData.collect=normalized==='suitable';syncSelectedGridAnnotation()}document.getElementById('mark-suitable').classList.toggle('active',normalized==='suitable');document.getElementById('mark-unsuitable').classList.toggle('active',normalized==='unsuitable');if(save)queueDashboardSave()}
+function renderMarkers(){
+  if(!markerLayer)return;markerLayer.innerHTML='';
+  const ratingColors={0:'#2563eb',1:'#dc2626',2:'#f97316',3:'#facc15',4:'#84cc16',5:'#2e7d32'};
+  GRIDS.filter(grid=>grid.position).forEach(grid=>{
+    const noData=grid.data_count===0,button=document.createElement('button'),status=grid.collection_status||'',statusColor=status==='suitable'?'#059669':status==='unsuitable'?'#dc2626':'#64748b';
+    button.type='button';button.className='grid-marker'+(grid.reviewed?' reviewed':'')+(!grid.include?' excluded':'')+(noData?' no-data':'')+(grid.idx===selectedIdx?' active':'');button.dataset.idx=grid.idx;button.dataset.statusLabel=status==='suitable'?'S':status==='unsuitable'?'U':'-';button.style.setProperty('--status-color',statusColor);button.style.left=grid.position.x+'%';button.style.top=grid.position.y+'%';button.style.background=ratingColors[Number(grid.rating)||0];button.style.color=[3,4].includes(Number(grid.rating))?'#172033':'#fff';button.style.borderColor=statusColor;button.style.boxShadow=noData?'0 0 0 4px rgba(251,191,36,.55),0 3px 10px rgba(0,0,0,.4)':'0 0 0 3px '+statusColor+'55,0 3px 10px rgba(0,0,0,.4)';button.textContent=String(grid.idx+1);
+    const decision=status==='suitable'?' · suitable for collection':status==='unsuitable'?' · unsuitable for collection':' · collection status unmarked',availability=noData?' · NO SCREENING DATA':'';button.title='GridSquare '+grid.id+' · rating '+(grid.rating||0)+availability+decision;button.setAttribute('aria-label','Open GridSquare '+grid.id+', rating '+(grid.rating||0)+decision+(noData?', no screening data':''));button.addEventListener('pointerdown',event=>event.stopPropagation());button.onclick=event=>{event.stopPropagation();selectGrid(grid.idx)};markerLayer.appendChild(button);
+  });
+  UNSCREENED.filter(target=>target.selected||targetMode).forEach(target=>{const button=document.createElement('button');button.type='button';button.className='manual-target-marker '+(target.selected?'selected':'candidate');button.style.left=target.position.x+'%';button.style.top=target.position.y+'%';button.title=targetMode?((target.selected?'Remove':'Add')+' unscreened GridSquare '+target.id+' as a collection target'):('Manual collection target · GridSquare '+target.id);button.setAttribute('aria-label',button.title);button.addEventListener('pointerdown',event=>event.stopPropagation());button.onclick=async event=>{event.stopPropagation();if(!targetMode&&target.selected)return;button.disabled=true;try{const response=await fetch('/manual_target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:target.key,selected:!target.selected})});if(!response.ok)throw new Error('HTTP '+response.status);const payload=await response.json();target.selected=Boolean(payload.selected);renderMarkers()}catch(error){alert('Could not save target: '+error.message)}};markerLayer.appendChild(button)});
+  const targetButton=document.getElementById('manual-target-toggle');if(targetButton){const count=UNSCREENED.filter(target=>target.selected).length;targetButton.classList.toggle('active',targetMode);targetButton.textContent=(targetMode?'Finish target selection':'Add unscreened targets')+(count?' · '+count:'')}
+  const atlasHelp=document.getElementById('atlas-help');if(atlasHelp)atlasHelp.textContent=targetMode?'Target mode: click an unscreened square; only selected targets will be marked.':'Scroll to zoom · drag to pan · double-click to reset';
+}
+function arrangeSelectedWorkspace(){
+  const workspace=document.querySelector('.workspace'),atlasPanel=workspace?workspace.querySelector(':scope > .panel'):null,browser=document.querySelector('.browser-panel'),inspector=document.getElementById('selected-detail'),layout=document.querySelector('.selected-detail-layout'),media=document.querySelector('.selected-media-card'),controls=document.querySelector('.review-controls'),comparison=document.getElementById('hole-comparison');
+  if(!workspace||!atlasPanel||!browser||!inspector||!layout||!media||!controls||!comparison)return;
+  atlasPanel.classList.add('primary-viewer-panel');inspector.classList.add('primary-viewer-panel');
+  media.querySelector('.panel-title').textContent='GridSquare with screened FoilHoles';
+  const summary=inspector.querySelector('.selected-summary'),inspectorHead=inspector.querySelector('.panel-head');if(summary&&inspectorHead)inspectorHead.appendChild(summary);
+  const guide=document.createElement('div');guide.className='interaction-guide';guide.id='grid-hover-guide';guide.textContent='Tip: hover a numbered FoilHole or use Previous/Next below the Data image.';
+  const overlayWrap=document.getElementById('selected-overlay-wrap'),mediaActions=media.querySelector('.media-actions'),overlayNote=document.getElementById('overlay-note');media.insertBefore(overlayWrap,mediaActions);
+  const controlDock=document.createElement('div');controlDock.id='grid-control-dock';controlDock.className='grid-control-dock';media.insertBefore(controlDock,overlayNote);controlDock.appendChild(mediaActions);
+  const gridNav=document.createElement('div');gridNav.className='grid-nav';gridNav.innerHTML='<button id="grid-prev" type="button" class="button">← Previous GridSquare</button><div id="grid-nav-status" class="grid-nav-status">Select a GridSquare</div><button id="grid-next" type="button" class="button">Next GridSquare →</button>';controlDock.appendChild(gridNav);media.insertBefore(guide,overlayNote);
+  const foilPanel=document.getElementById('comparison-foil').closest('.comparison-panel');
+  const dataPanel=document.getElementById('comparison-data').closest('.comparison-panel');
+  foilPanel.classList.add('panel','linked-image-panel','no-image');dataPanel.classList.add('panel','linked-image-panel','data-panel','no-image');
+  foilPanel.insertAdjacentHTML('afterbegin','<div class="linked-empty"><div><strong>No FoilHole selected</strong><br>Choose a screened hole in the GridSquare above.</div></div>');
+  dataPanel.insertAdjacentHTML('afterbegin','<div class="linked-empty"><div><strong>No Data image selected</strong><br>The matching Data image will appear here without changing the layout size.</div></div>');
+  const nav=document.createElement('div');nav.className='hole-nav';nav.innerHTML='<button id="hole-prev" type="button" class="button">← Previous hole</button><div id="hole-nav-status" class="hole-nav-status">Select a GridSquare</div><button id="hole-next" type="button" class="button">Next hole →</button>';dataPanel.appendChild(nav);
+  const visual=document.createElement('div');visual.className='visual-dashboard';workspace.insertBefore(browser,workspace.firstChild);workspace.insertBefore(visual,inspector);visual.appendChild(atlasPanel);visual.appendChild(inspector);visual.appendChild(foilPanel);visual.appendChild(dataPanel);comparison.classList.add('comparison-storage');
+  const reviewRail=document.createElement('aside');reviewRail.className='panel review-rail';reviewRail.appendChild(controls);workspace.appendChild(reviewRail);
+  layout.appendChild(media);
+  document.getElementById('hole-prev').onclick=()=>showDashboardHoleByIndex(activeHoleIndex-1);
+  document.getElementById('hole-next').onclick=()=>showDashboardHoleByIndex(activeHoleIndex+1);
+  document.getElementById('grid-prev').onclick=()=>{if(selectedIdx!==null&&selectedIdx>0)selectGrid(selectedIdx-1,false)};
+  document.getElementById('grid-next').onclick=()=>{if(selectedIdx!==null&&selectedIdx<GRIDS.length-1)selectGrid(selectedIdx+1,false)};
+  updateGridNavigation();
+}
+function installMrcViewer(imgId,pngButtonId,mrcButtonId,kind,getSource){
+  const img=document.getElementById(imgId),pngButton=document.getElementById(pngButtonId),mrcButton=document.getElementById(mrcButtonId);if(!img||!pngButton||!mrcButton)return;
+  const parent=img.parentNode,viewport=document.createElement('div');viewport.className='review-image-viewport';parent.insertBefore(viewport,img);
+  const stage=document.createElement('div');stage.className='review-image-stage';viewport.appendChild(stage);stage.appendChild(img);if(kind==='grid'){const layer=document.getElementById('dashboard-hole-layer');if(layer)stage.appendChild(layer)}
+  const controls=document.createElement('div');controls.className='mrc-viewer-controls'+(kind==='grid'?' grid-viewer-controls':'');const controlsTitle=kind==='grid'?'<div class="viewer-controls-title"><span>GridSquare display controls</span><span>Contrast activates with MRC</span></div>':'';controls.innerHTML=controlsTitle+'<div class="mrc-control-row mrc-contrast-row"><label>Low <span class="mrc-low-value">2</span>% <input class="mrc-low" type="range" min="0" max="99" value="2"></label><label>High <span class="mrc-high-value">98</span>% <input class="mrc-high" type="range" min="1" max="100" value="98"></label></div><div class="mrc-control-row"><button type="button" class="button mrc-minus">−</button><span class="mrc-zoom-value">100%</span><button type="button" class="button mrc-plus">+</button><button type="button" class="button mrc-reset">Reset</button><span class="panel-note">Scroll to zoom · drag to pan</span></div>';
+  mrcButton.closest('.media-actions').after(controls);
+  if(kind==='grid'){const gridNav=document.getElementById('grid-nav');if(gridNav)controls.after(gridNav)}
+  const low=controls.querySelector('.mrc-low'),high=controls.querySelector('.mrc-high'),lowValue=controls.querySelector('.mrc-low-value'),highValue=controls.querySelector('.mrc-high-value'),zoomValue=controls.querySelector('.mrc-zoom-value'),contrastRow=controls.querySelector('.mrc-contrast-row');let scale=1,x=0,y=0,dragging=false,startX=0,startY=0,renderTimer=null,mrcActive=false;if(kind==='grid'){low.disabled=true;high.disabled=true;contrastRow.classList.add('disabled')}
+  function syncFit(){const iw=img.naturalWidth||1,ih=img.naturalHeight||1,vw=Math.max(1,viewport.clientWidth),vh=Math.max(1,viewport.clientHeight),ratio=Math.min(vw/iw,vh/ih);stage.style.width=Math.max(1,iw*ratio).toFixed(2)+'px';stage.style.height=Math.max(1,ih*ratio).toFixed(2)+'px'}
+  function apply(){stage.style.transform='translate(-50%,-50%) translate('+x.toFixed(1)+'px,'+y.toFixed(1)+'px) scale('+scale.toFixed(3)+')';zoomValue.textContent=Math.round(scale*100)+'%';viewport.classList.toggle('zoomable',scale>1)}
+  function setScale(value){const next=Math.max(1,Math.min(8,value)),ratio=next/scale;x*=ratio;y*=ratio;scale=next;if(scale===1){x=0;y=0}apply()}
+  function reset(){scale=1;x=0;y=0;apply()}
+  function renderMrc(){const source=getSource();if(!source||!source.hasMrc)return;lowValue.textContent=low.value;highValue.textContent=high.value;img.src=mrcPreviewUrl(kind,source.name||'',Number(low.value),Number(high.value))}
+  function queueRender(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}lowValue.textContent=low.value;highValue.textContent=high.value;if(renderTimer)clearTimeout(renderTimer);renderTimer=setTimeout(renderMrc,250)}
+  low.oninput=()=>queueRender(low);high.oninput=()=>queueRender(high);
+  mrcButton.onclick=()=>{const source=getSource();if(!source||!source.hasMrc)return;mrcActive=true;controls.classList.add('mrc-active');low.disabled=false;high.disabled=false;contrastRow.classList.remove('disabled');pngButton.classList.remove('active');mrcButton.classList.add('active');renderMrc();reset()};
+  pngButton.onclick=()=>{const source=getSource();if(!source||!source.png)return;mrcActive=false;controls.classList.remove('mrc-active');if(kind==='grid'){low.disabled=true;high.disabled=true;contrastRow.classList.add('disabled')}mrcButton.classList.remove('active');pngButton.classList.add('active');img.src=source.png;reset()};
+  controls.querySelector('.mrc-minus').onclick=()=>setScale(scale/1.3);controls.querySelector('.mrc-plus').onclick=()=>setScale(scale*1.3);controls.querySelector('.mrc-reset').onclick=reset;
+  viewport.addEventListener('wheel',event=>{event.preventDefault();setScale(scale*Math.exp(-event.deltaY*.0015))},{passive:false});
+  viewport.addEventListener('pointerdown',event=>{if(scale<=1||event.button!==0||event.target.closest('.dashboard-hole-hit'))return;dragging=true;startX=event.clientX-x;startY=event.clientY-y;viewport.classList.add('dragging');viewport.setPointerCapture(event.pointerId)});
+  viewport.addEventListener('pointermove',event=>{if(!dragging)return;x=event.clientX-startX;y=event.clientY-startY;apply()});viewport.addEventListener('pointerup',()=>{dragging=false;viewport.classList.remove('dragging')});viewport.addEventListener('pointercancel',()=>{dragging=false;viewport.classList.remove('dragging')});
+  img.addEventListener('load',()=>{syncFit();reset()});if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>{syncFit();apply()}).observe(viewport);img._viewerReset=reset;img._viewerShowPng=()=>pngButton.click();syncFit();apply();
+}
+function updateHoleNavigation(){
+  const count=dashboardHoles.length,status=document.getElementById('hole-nav-status'),prev=document.getElementById('hole-prev'),next=document.getElementById('hole-next');if(!status||!prev||!next)return;
+  status.textContent=count?(activeHoleIndex>=0?'Hole '+(activeHoleIndex+1)+' of '+count:count+' screened holes'):'No screened holes available';prev.disabled=activeHoleIndex<=0;next.disabled=activeHoleIndex<0||activeHoleIndex>=count-1;
+}
+function updateGridNavigation(){
+  const status=document.getElementById('grid-nav-status'),prev=document.getElementById('grid-prev'),next=document.getElementById('grid-next');if(!status||!prev||!next)return;
+  status.textContent=selectedIdx===null?'Select a GridSquare':'GridSquare '+(selectedIdx+1)+' of '+GRIDS.length;prev.disabled=selectedIdx===null||selectedIdx<=0;next.disabled=selectedIdx===null||selectedIdx>=GRIDS.length-1;
+}
+function positionDashboardHolePreview(hole){
+  if(!hole)return;activeHole=hole;activeHoleIndex=dashboardHoles.indexOf(hole);document.body.classList.add('has-hole');
+  document.querySelectorAll('.dashboard-hole-hit').forEach((button,index)=>button.classList.toggle('active',index===activeHoleIndex));
+  const foilPanel=document.getElementById('comparison-foil').closest('.linked-image-panel'),dataPanel=document.getElementById('comparison-data').closest('.linked-image-panel');foilPanel.classList.remove('no-image');dataPanel.classList.toggle('no-image',!hole.data_preview);
+  foilPanel.querySelector('.comparison-label').textContent='FoilHole '+hole.foil_id;dataPanel.querySelector('.comparison-label').textContent=hole.data_preview?'Data · FoilHole '+hole.foil_id:'Data · no matching image';
+  document.getElementById('comparison-meta').innerHTML=hole.data_preview?(hole.meta||[]).map(esc).join('<br>'):'No matching Data image for this FoilHole.';
+  document.getElementById('comparison-foil-mrc').disabled=!hole.foil_has_mrc;document.getElementById('comparison-data-mrc').disabled=!hole.data_has_mrc;
+  document.getElementById('comparison-foil-png').click();if(hole.data_preview)document.getElementById('comparison-data-png').click();
+  updateHoleNavigation();
+}
+function showDashboardHoleByIndex(index){if(!dashboardHoles.length)return;const safe=Math.max(0,Math.min(dashboardHoles.length-1,index));positionDashboardHolePreview(dashboardHoles[safe])}
+function renderDashboardHoles(holes){
+  dashboardHoles=Array.isArray(holes)?holes:[];activeHole=null;activeHoleIndex=-1;document.body.classList.remove('has-hole');document.querySelectorAll('.linked-image-panel').forEach(panel=>panel.classList.add('no-image'));document.getElementById('comparison-meta').textContent='';const layer=document.getElementById('dashboard-hole-layer');layer.innerHTML='';
+  dashboardHoles.forEach((hole,index)=>{const button=document.createElement('button');button.type='button';button.className='dashboard-hole-hit';button.style.left=hole.x+'%';button.style.top=hole.y+'%';button.dataset.markerLabel=hole.marker_label||String(index+1);button.title='FoilHole '+hole.foil_id;button.setAttribute('aria-label','Show FoilHole '+hole.foil_id);button.onpointerenter=()=>showDashboardHoleByIndex(index);button.onfocus=()=>showDashboardHoleByIndex(index);button.onclick=()=>showDashboardHoleByIndex(index);layer.appendChild(button)});updateHoleNavigation();
+}
 async function selectGrid(idx,scrollToReview=true){
   if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null;await saveDashboardReview()}
-  selectedIdx=idx;activeHole=null;
+  selectedIdx=idx;activeHole=null;updateGridNavigation();
   document.querySelectorAll('.grid-marker,.grid-card').forEach(el=>el.classList.toggle('active',Number(el.dataset.idx)===idx));
-  const empty=document.getElementById('inspector-empty'),body=document.getElementById('inspector-body');
-  empty.style.display='none';body.classList.add('visible');
+  const inspector=document.getElementById('selected-detail'),empty=document.getElementById('inspector-empty'),body=document.getElementById('inspector-body');
+  inspector.classList.add('has-selection');empty.style.display='none';body.classList.add('visible');
   document.getElementById('dashboard-save-state').textContent='Loading…';
-  document.getElementById('hole-comparison').classList.remove('visible');
+  document.getElementById('hole-comparison')?.classList.remove('has-selection');
+  document.getElementById('comparison-foil').removeAttribute('src');
+  document.getElementById('comparison-data').removeAttribute('src');
   try{
-    const response=await fetch('/grid_details?idx='+idx);
+    const response=await fetch('/grid_details?idx='+idx+'&t='+Date.now(),{cache:'no-store'});
     if(!response.ok)throw new Error('HTTP '+response.status);
     if(idx!==selectedIdx)return;
     const data=await response.json();selectedGridData=data;
@@ -2164,25 +2398,31 @@ async function selectGrid(idx,scrollToReview=true){
     document.getElementById('selected-file').textContent=data.name;
     const decision=data.collection_status==='suitable'?'<span class="badge">Suitable</span>':data.collection_status==='unsuitable'?'<span class="badge">Unsuitable</span>':'';
     document.getElementById('selected-badges').innerHTML='<span class="badge">EPU '+esc(data.category??'N/A')+'</span><span class="badge">'+data.foil_count+' foils</span><span class="badge">'+data.data_count+' data</span>'+decision;
-    document.getElementById('selected-grid-image').src=data.grid_preview;
-    document.getElementById('selected-grid-mrc').disabled=!data.grid_has_mrc;
     const overlayWrap=document.getElementById('selected-overlay-wrap'),overlayImage=document.getElementById('selected-overlay-image');
-    overlayWrap.style.display=data.overlay_preview?'block':'none';
-    if(data.overlay_preview)overlayImage.src=data.overlay_preview;
-    renderDashboardHoles(data.holes);setDashboardRating(data.rating||0,false);setDashboardCollectionStatus(data.collection_status||'',false);
+    overlayWrap.style.display='block';
+    overlayImage.onerror=()=>{if(overlayImage.dataset.fallback!=='1'){overlayImage.dataset.fallback='1';overlayImage.src=data.grid_preview+'&t='+Date.now();document.getElementById('overlay-note').textContent='The FoilHole overlay could not be loaded; showing the current GridSquare PNG.'}};
+    overlayImage.dataset.fallback='0';overlayImage.src=(data.overlay_preview||data.grid_preview)+'&t='+Date.now();
+    document.getElementById('selected-grid-mrc').disabled=!data.grid_has_mrc;
+    document.getElementById('selected-grid-png').click();
+    document.getElementById('overlay-note').textContent=data.overlay_preview?'Hover or click a screened FoilHole, or use Previous/Next below.':'Foil overlay unavailable; showing the GridSquare image without hole targets.';
+    renderDashboardHoles(data.holes);if(data.holes&&data.holes.length)showDashboardHoleByIndex(0);setDashboardRating(data.rating||0,false);setDashboardCollectionStatus(data.collection_status||'',false);
     document.getElementById('dashboard-comment').value=data.comment||'';
     document.getElementById('dashboard-include').checked=data.include!==false;
     document.getElementById('dashboard-save-state').textContent=data.reviewed?'Saved review loaded':'Not yet reviewed';
     renderGridList(document.getElementById('grid-search').value);
     if(scrollToReview)document.getElementById('selected-detail').scrollIntoView({behavior:'smooth',block:'start'});
-  }catch(error){document.getElementById('dashboard-save-state').textContent='GridSquare images could not be loaded'}
+  }catch(error){selectedGridData=null;renderDashboardHoles([]);document.getElementById('dashboard-save-state').textContent='GridSquare could not be loaded: '+error.message}
 }
 function openLightbox(src,label){const box=document.getElementById('lightbox');document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=label;box.classList.add('open')}
 function closeLightbox(){document.getElementById('lightbox').classList.remove('open');document.getElementById('lightbox-image').src=''}
 function applyAtlas(){atlasContent.style.transform='translate('+atlasX.toFixed(1)+'px,'+atlasY.toFixed(1)+'px) scale('+atlasScale.toFixed(3)+')';document.getElementById('atlas-zoom').textContent=Math.round(atlasScale*100)+'%'}
 function setAtlasScale(value,clientX=null,clientY=null){const next=Math.max(1,Math.min(8,value)),ratio=next/atlasScale;if(clientX!==null){const r=atlasViewport.getBoundingClientRect(),px=clientX-r.left-r.width/2,py=clientY-r.top-r.height/2;atlasX=px-(px-atlasX)*ratio;atlasY=py-(py-atlasY)*ratio}else{atlasX*=ratio;atlasY*=ratio}atlasScale=next;if(next===1){atlasX=0;atlasY=0}applyAtlas()}
 function resetAtlas(){atlasScale=1;atlasX=0;atlasY=0;applyAtlas()}
-if(HAS_ATLAS){renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.atlas-tools'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;const mode=b.dataset.mode;img.src=(mode==='categories'?'/atlas_overview_categories':mode==='mrc'?'/atlas_overview_mrc':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=mode==='screened'?'block':'none';resetAtlas()})}
+function loadAtlasMrc(){const img=document.getElementById('atlas-image');if(!img||atlasMode!=='mrc')return;img.src='/atlas_overview_mrc?low='+encodeURIComponent(atlasLow)+'&high='+encodeURIComponent(atlasHigh)+'&session='+encodeURIComponent(CACHE_KEY)+'&t='+Date.now()}
+function installAtlasMrcControls(){if(!atlasViewport)return;const panel=document.createElement('div');panel.className='atlas-mrc-contrast';panel.innerHTML='<label>Low <span class="atlas-low-value">1</span>% <input class="atlas-low" type="range" min="0" max="99" value="1"></label><label>High <span class="atlas-high-value">99</span>% <input class="atlas-high" type="range" min="1" max="100" value="99"></label>';atlasViewport.appendChild(panel);const low=panel.querySelector('.atlas-low'),high=panel.querySelector('.atlas-high'),lowValue=panel.querySelector('.atlas-low-value'),highValue=panel.querySelector('.atlas-high-value');function queue(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}atlasLow=Number(low.value);atlasHigh=Number(high.value);lowValue.textContent=low.value;highValue.textContent=high.value;if(atlasMrcTimer)clearTimeout(atlasMrcTimer);atlasMrcTimer=setTimeout(loadAtlasMrc,300)}low.oninput=()=>queue(low);high.oninput=()=>queue(high);return panel}
+if(HAS_ATLAS){const atlasContrast=installAtlasMrcControls();renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.manual-target-marker,.atlas-tools,.atlas-mrc-contrast'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker,.manual-target-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;atlasMode=b.dataset.mode;atlasContrast.classList.toggle('visible',atlasMode==='mrc');if(atlasMode==='mrc')loadAtlasMrc();else img.src=(atlasMode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=atlasMode==='screened'?'block':'none';resetAtlas()})}
+const manualTargetToggle=document.getElementById('manual-target-toggle');if(manualTargetToggle)manualTargetToggle.onclick=()=>{targetMode=!targetMode;if(targetMode&&atlasMode!=='screened')document.querySelector('.atlas-mode[data-mode="screened"]').click();renderMarkers()};
+arrangeSelectedWorkspace();
 renderGridList();
 document.getElementById('grid-search').addEventListener('input',event=>renderGridList(event.target.value));
 document.querySelectorAll('.dashboard-rating').forEach(button=>button.onclick=()=>setDashboardRating(button.dataset.rating));
@@ -2199,15 +2439,26 @@ document.getElementById('comparison-foil-png').onclick=()=>{if(activeHole)docume
 document.getElementById('comparison-data-png').onclick=()=>{if(activeHole&&activeHole.data_preview)document.getElementById('comparison-data').src=activeHole.data_preview};
 document.getElementById('comparison-foil-mrc').onclick=()=>{if(activeHole&&activeHole.foil_has_mrc)document.getElementById('comparison-foil').src=mrcPreviewUrl('foil',activeHole.foil_name)};
 document.getElementById('comparison-data-mrc').onclick=()=>{if(activeHole&&activeHole.data_has_mrc)document.getElementById('comparison-data').src=mrcPreviewUrl('data',activeHole.data_name)};
+installMrcViewer('comparison-foil','comparison-foil-png','comparison-foil-mrc','foil',()=>activeHole?{name:activeHole.foil_name,png:activeHole.foil_preview,hasMrc:activeHole.foil_has_mrc}:null);
+installMrcViewer('comparison-data','comparison-data-png','comparison-data-mrc','data',()=>activeHole?{name:activeHole.data_name,png:activeHole.data_preview,hasMrc:activeHole.data_has_mrc}:null);
+installMrcViewer('selected-overlay-image','selected-grid-png','selected-grid-mrc','grid',()=>selectedGridData?{name:'',png:selectedGridData.overlay_preview||selectedGridData.grid_preview,hasMrc:selectedGridData.grid_has_mrc}:null);
 document.getElementById('lightbox-close').onclick=closeLightbox;
 document.getElementById('lightbox').onclick=event=>{if(event.target.id==='lightbox')closeLightbox()};
-document.addEventListener('keydown',event=>{if(event.key==='Escape')closeLightbox()});
+const portableDialog=document.getElementById('portable-dialog'),portableDestination=document.getElementById('portable-destination'),portableStart=document.getElementById('portable-start'),portableStatus=document.getElementById('portable-status'),portableStatusText=document.getElementById('portable-status-text'),portableProgressBar=document.getElementById('portable-progress-bar');let portablePollTimer=null;
+portableDestination.value=PORTABLE_DEFAULT;
+function closePortableDialog(){if(portableDialog.open)portableDialog.close()}
+function updatePortableStatus(job){const progress=Math.max(0,Math.min(100,Number(job.progress)||0));portableStatus.classList.add('visible');portableStatus.classList.toggle('error',job.status==='error');portableStatusText.textContent=(job.message||job.status||'Working…')+(job.path?'\\n'+job.path:'');portableProgressBar.style.width=progress+'%';if(job.status==='done'||job.status==='error'){portableStart.disabled=false;portableStart.textContent='Start export';if(portablePollTimer){clearTimeout(portablePollTimer);portablePollTimer=null}}}
+async function pollPortableExport(jobId){try{const response=await fetch('/portable_export/'+encodeURIComponent(jobId)+'?t='+Date.now(),{cache:'no-store'});const job=await response.json();if(!response.ok)throw new Error(job.error||('HTTP '+response.status));updatePortableStatus(job);if(job.status!=='done'&&job.status!=='error')portablePollTimer=setTimeout(()=>pollPortableExport(jobId),900)}catch(error){updatePortableStatus({status:'error',progress:100,message:'Could not read export progress: '+error.message})}}
+document.getElementById('portable-export-dashboard').onclick=()=>{portableStatus.classList.remove('visible','error');portableProgressBar.style.width='0%';if(typeof portableDialog.showModal==='function')portableDialog.showModal();else portableDialog.setAttribute('open','')};
+document.getElementById('portable-dialog-close').onclick=closePortableDialog;document.getElementById('portable-cancel').onclick=closePortableDialog;
+portableStart.onclick=async()=>{const destination=portableDestination.value.trim();if(!destination){updatePortableStatus({status:'error',progress:100,message:'Choose a destination folder.'});return}portableStart.disabled=true;portableStart.textContent='Exporting…';updatePortableStatus({status:'queued',progress:0,message:'Saving current review and preparing export…'});try{if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null;await saveDashboardReview()}const response=await fetch('/portable_export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({destination})});const payload=await response.json();if(!response.ok)throw new Error(payload.error||('HTTP '+response.status));updatePortableStatus(payload.job||{status:'queued',progress:0,message:'Queued…'});pollPortableExport(payload.job_id)}catch(error){updatePortableStatus({status:'error',progress:100,message:'Could not start portable export: '+error.message})}};
+document.addEventListener('keydown',async event=>{if(event.key==='Escape'){closeLightbox();return}if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)&&selectedIdx!==null){event.preventDefault();if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null}await saveDashboardReview();if(selectedIdx<GRIDS.length-1)await selectGrid(selectedIdx+1,true)}});
 let serverWasDisconnected=false;
-function showServerDisconnected(message='The local EPU Mapper server is not responding. Return to the launcher and click Start review.'){serverWasDisconnected=true;const health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');health.className='health-light err';text.textContent='Server disconnected';box.className='preflight-pop show err';box.innerHTML='<strong>Dashboard disconnected:</strong> '+esc(message)}
+function showServerDisconnected(message='The local EPU Mapper server is not responding. Return to the launcher and click Start review.'){serverWasDisconnected=true;const health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');if(health)health.className='health-light err';if(text)text.textContent='Server disconnected';box.className='preflight-pop show err';box.innerHTML='<strong>Dashboard disconnected:</strong> '+esc(message)}
 const dashboardAtlasImage=document.getElementById('atlas-image');if(dashboardAtlasImage)dashboardAtlasImage.addEventListener('error',()=>showServerDisconnected('The requested atlas image could not be loaded. If this tab was already open, restart the server in the launcher.'));
 async function monitorServer(){try{const response=await fetch('/status?t='+Date.now(),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);if(serverWasDisconnected)location.reload()}catch(_error){showServerDisconnected()}}
 monitorServer();setInterval(monitorServer,5000);
-fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data.level||'ok',health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');health.className='health-light '+(level==='ok'?'ok':level==='error'?'err':'');text.textContent=level==='ok'?'Session ready':level==='error'?'Session issue':'Ready with warnings';const rows=(data.errors||[]).concat(data.warnings||[]);if(rows.length){box.className='preflight-pop show'+(level==='error'?' err':'');box.innerHTML='<strong>'+(level==='error'?'Session issue':'Preflight note')+':</strong> '+rows.slice(0,3).map(esc).join(' · ')}}).catch(()=>{document.getElementById('health-text').textContent='Status unavailable'});
+fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data.level||'ok',health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');if(health)health.className='health-light '+(level==='ok'?'ok':level==='error'?'err':'');if(text)text.textContent=level==='ok'?'Session ready':level==='error'?'Session issue':'Ready with warnings';const rows=(data.errors||[]).concat(data.warnings||[]);if(rows.length){box.className='preflight-pop show'+(level==='error'?' err':'');box.innerHTML='<strong>'+(level==='error'?'Session issue':'Preflight note')+':</strong> '+rows.slice(0,3).map(esc).join(' · ')}}).catch(()=>{const text=document.getElementById('health-text');if(text)text.textContent='Status unavailable'});
 </script></body></html>"""
         if atlas_preview_path:
             atlas_content = (
@@ -2215,13 +2466,21 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 f"src=\"/atlas_overview_raw?session={urllib.parse.quote(session_cache_key)}\" alt=\"Grid atlas\"><div id=\"marker-layer\" class=\"marker-layer\"></div></div>"
             )
             atlas_modes = (
-                "<div class=\"segmented\"><button type=\"button\" class=\"atlas-mode active\" data-mode=\"screened\">Screened</button>"
+                "<div class=\"atlas-header-tools\"><div class=\"segmented\"><button type=\"button\" class=\"atlas-mode active\" data-mode=\"screened\">Screened</button>"
                 "<button type=\"button\" class=\"atlas-mode\" data-mode=\"categories\">EPU categories</button>"
                 "<button type=\"button\" class=\"atlas-mode\" data-mode=\"raw\">PNG atlas</button>"
                 "<button type=\"button\" class=\"atlas-mode\" data-mode=\"mrc\">Load MRC</button></div>"
+                "<button type=\"button\" id=\"manual-target-toggle\" class=\"button manual-target-button\">Add unscreened targets</button>"
+                "<div class=\"atlas-status-legend\" aria-label=\"Atlas marker legend\">"
+                "<span class=\"legend-item\">Rating:</span><span class=\"legend-swatch rating-1\">1</span><span class=\"legend-swatch rating-2\">2</span><span class=\"legend-swatch rating-3\">3</span><span class=\"legend-swatch rating-4\">4</span><span class=\"legend-swatch rating-5\">5</span>"
+                "<span class=\"legend-item\"><span class=\"legend-swatch suitable\">S</span>Suitable</span>"
+                "<span class=\"legend-item\"><span class=\"legend-swatch unsuitable\">U</span>Not suitable</span>"
+                "<span class=\"legend-item\"><span class=\"legend-swatch unmarked\">-</span>Unmarked</span>"
+                "<span class=\"legend-item\"><span class=\"legend-swatch no-data\">!</span>No screening data</span>"
+                "<span class=\"legend-item\"><span class=\"legend-swatch target\"></span>Unscreened target</span></div></div>"
             )
             atlas_aux = (
-                "<div class=\"atlas-help\">Scroll to zoom · drag to pan · double-click to reset</div>"
+                "<div id=\"atlas-help\" class=\"atlas-help\">Scroll to zoom · drag to pan · double-click to reset</div>"
                 "<div class=\"atlas-tools\"><button type=\"button\" id=\"atlas-minus\" aria-label=\"Zoom out\">−</button>"
                 "<span id=\"atlas-zoom\" class=\"atlas-zoom\">100%</span>"
                 "<button type=\"button\" id=\"atlas-plus\" aria-label=\"Zoom in\">+</button>"
@@ -2232,10 +2491,16 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             atlas_modes = ""
             atlas_aux = ""
         safe_grids_json = json.dumps(grid_summaries, separators=(",", ":")).replace("</", "<\\/")
+        safe_unscreened_json = json.dumps(unscreened_summaries, separators=(",", ":")).replace("</", "<\\/")
         root_html = root_html.replace("__GRIDS_JSON__", safe_grids_json)
+        root_html = root_html.replace("__UNSCREENED_JSON__", safe_unscreened_json)
         root_html = root_html.replace("__HAS_ATLAS__", "true" if atlas_preview_path else "false")
         root_html = root_html.replace("__SESSION_KEY__", json.dumps(session_storage_key))
         root_html = root_html.replace("__CACHE_KEY__", json.dumps(session_cache_key))
+        portable_default = Path.home() / "Downloads"
+        if not portable_default.is_dir():
+            portable_default = Path.home()
+        root_html = root_html.replace("__PORTABLE_DEFAULT__", json.dumps(str(portable_default)))
         root_html = root_html.replace("__SESSION_PATH__", str(base_dir).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         root_html = root_html.replace("__TOTAL__", str(len(grid_summaries)))
         root_html = root_html.replace("__REVIEWED__", str(reviewed_count))
@@ -2356,6 +2621,40 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             }
         )
 
+    @app.get("/manual_targets")
+    def get_manual_targets():
+        return JSONResponse(
+            {
+                "targets": list(manual_targets.values()),
+                "unscreened": _unscreened_atlas_summaries(),
+            }
+        )
+
+    @app.post("/manual_target")
+    async def set_manual_target(request: Request):
+        try:
+            payload = await request.json()
+            key = str(payload.get("key", "")).strip()
+            selected = bool(payload.get("selected", True))
+        except Exception:
+            return JSONResponse({"error": "invalid request"}, status_code=400)
+        available = {entry["key"]: entry for entry in _unscreened_atlas_summaries()}
+        target = available.get(key)
+        if target is None:
+            return JSONResponse({"error": "Atlas GridSquare is not an unscreened target"}, status_code=404)
+        if selected:
+            manual_targets[key] = {
+                "key": key,
+                "gridsquare_id": target["id"],
+                "category": target.get("category"),
+                "position": target["position"],
+                "selected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+        else:
+            manual_targets.pop(key, None)
+        _save_json_dict(manual_targets_file, manual_targets)
+        return JSONResponse({"ok": True, "key": key, "selected": selected, "count": len(manual_targets)})
+
     @app.get("/grid")
     def grid(idx: int):
         if idx < 0 or idx >= len(items):
@@ -2410,16 +2709,23 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         raise HTTPException(status_code=404)
 
     @app.get("/atlas_overview_mrc")
-    def atlas_overview_mrc():
-        nonlocal atlas_mrc_preview
-        if atlas_mrc_preview is None and atlas_preview_path and atlas_preview_path.is_file():
-            atlas_rgb = _open_atlas_rgb(atlas_preview_path, prefer_mrc=True)
+    def atlas_overview_mrc(low: float = 1.0, high: float = 99.0):
+        safe_low = max(0.0, min(99.0, float(low)))
+        safe_high = max(safe_low + 0.1, min(100.0, float(high)))
+        cache_key = (round(safe_low, 1), round(safe_high, 1))
+        payload = atlas_mrc_previews.get(cache_key)
+        if payload is None and atlas_preview_path and atlas_preview_path.is_file():
+            atlas_mrc_path = _find_atlas_mrc(atlas_preview_path)
+            atlas_rgb = _mrc_to_image(atlas_mrc_path, safe_low, safe_high) if atlas_mrc_path else None
             if atlas_rgb is not None:
                 buf = io.BytesIO()
-                atlas_rgb.save(buf, format="PNG", compress_level=3)
-                atlas_mrc_preview = buf.getvalue()
-        if atlas_mrc_preview:
-            return Response(content=atlas_mrc_preview, media_type="image/png", headers={"Cache-Control": "no-store"})
+                atlas_rgb.convert("RGB").save(buf, format="PNG", compress_level=3)
+                payload = buf.getvalue()
+                if len(atlas_mrc_previews) >= 12:
+                    atlas_mrc_previews.pop(next(iter(atlas_mrc_previews)))
+                atlas_mrc_previews[cache_key] = payload
+        if payload:
+            return Response(content=payload, media_type="image/png", headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
 
     @app.get("/overlay")
@@ -2739,6 +3045,35 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             },
         )
 
+    @app.get("/report.html")
+    def embedded_html_report():
+        filename = f"{label_prefix}Screening_report.html" if label_prefix else "Screening_report.html"
+        target = base_dir / filename
+        try:
+            write_embedded_html_report(
+                base_dir,
+                target,
+                atlas_name,
+                responses,
+                overlay=overlay_enabled,
+                atlas_overlay=atlas_overlay,
+                global_summary=summary_state["text"],
+                skip_foil_processing=skip_foil_processing,
+            )
+        except (PermissionError, OSError):
+            target = _temp_report_path(filename)
+            write_embedded_html_report(
+                base_dir,
+                target,
+                atlas_name,
+                responses,
+                overlay=overlay_enabled,
+                atlas_overlay=atlas_overlay,
+                global_summary=summary_state["text"],
+                skip_foil_processing=skip_foil_processing,
+            )
+        return FileResponse(target, media_type="text/html", filename=filename, headers={"Cache-Control": "no-store"})
+
     @app.post("/report_jobs")
     async def create_report_job(request: Request):
         try:
@@ -2791,6 +3126,41 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             raise HTTPException(status_code=404)
         return FileResponse(path, media_type="application/pdf", filename=filename, headers={"Cache-Control": "no-store"})
 
+    @app.post("/portable_export")
+    async def create_portable_export(request: Request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+        destination_value = str(payload.get("destination", "") or "").strip()
+        if not destination_value:
+            return JSONResponse({"error": "Choose a destination folder."}, status_code=400)
+        destination = Path(destination_value).expanduser().resolve()
+        if not destination.is_dir():
+            return JSONResponse({"error": f"Destination folder not found: {destination}"}, status_code=400)
+        job_id = secrets.token_urlsafe(8)
+        now = time.time()
+        with portable_jobs_lock:
+            portable_jobs[job_id] = {
+                "id": job_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "Queued…",
+                "created_at": now,
+                "updated_at": now,
+            }
+        threading.Thread(target=_run_portable_job, args=(job_id, destination), daemon=True).start()
+        return JSONResponse({"job_id": job_id, "job": _portable_job_state(job_id)})
+
+    @app.get("/portable_export/{job_id}")
+    def portable_export_status(job_id: str):
+        state = _portable_job_state(job_id)
+        if state is None:
+            raise HTTPException(status_code=404)
+        return JSONResponse(state)
+
     @app.get("/done")
     def done():
         summary_json = json.dumps(summary_state["text"])
@@ -2813,12 +3183,15 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 </style>
 </head><body><div class="page"><div class="card">
 <div class="title">All GridSquares reviewed</div>
-<div class="note">Before generating PDFs, optionally add one session-level summary sentence.</div>
+<div class="note">Before generating reports, optionally add one session-level summary sentence.</div>
 <label class="summary-label" for="global-summary">Session summary (one sentence, optional)</label>
 <textarea id="global-summary" rows="2" maxlength="__SUMMARY_MAX_LEN__"></textarea>
 <div><button type="button" class="btn" id="save-summary">Save summary</button></div>
-<div class="note">Then generate the full PDF report (overview first, followed by detailed included GridSquares).</div>
+<div class="note">You can now add unscreened Atlas GridSquares as manual collection targets.</div>
+<a class="btn secondary" href="/?targeting=1">Select unscreened Atlas targets</a>
+<div class="note">The full PDF and HTML reports contain the Atlas overview plus screening data for one highest-rated suitable GridSquare.</div>
 <a class="btn" id="report-link" href="#">Generate full PDF report</a>
+<a class="btn secondary" id="html-report-link" href="/report.html">Download self-contained HTML report</a>
 <div class="note">Export structured review data:</div>
 <a class="btn secondary" id="export-csv" href="/export.csv">Download CSV</a>
 <a class="btn secondary" id="export-json" href="/export.json">Download JSON</a>
