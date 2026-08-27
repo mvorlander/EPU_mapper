@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Simple Tkinter launcher for the EPU Mapper review app on Windows."""
+"""Lightweight Tkinter launcher for the EPU Mapper review app."""
 from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
@@ -40,9 +44,111 @@ TRANSFORM_OPTIONS = [
     ("Mirror diag", "mirror_diag"),
     ("Mirror diag inv", "mirror_diag_inv"),
 ]
+
+
+def _browser_host(host: str) -> str:
+    return "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+
+
+def _startup_page_html(target_url: str) -> str:
+    target_json = json.dumps(target_url).replace("</", "<\\/")
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper is preparing</title>
+<style>:root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{width:min(520px,calc(100vw - 36px));background:#fff;border:1px solid #dfe5ee;border-radius:16px;padding:28px;box-shadow:0 18px 50px rgba(26,39,67,.12)}}.mark{{width:42px;height:42px;border-radius:12px;background:linear-gradient(145deg,#5eead4,#3b82f6);display:grid;place-items:center;font-weight:850;color:#10213b;margin-bottom:18px}}h1{{font-size:21px;margin:0 0 8px}}p{{font-size:13px;line-height:1.55;color:#657289;margin:0}}.progress{{height:5px;background:#e8edf5;border-radius:9px;overflow:hidden;margin:22px 0 14px}}.progress span{{display:block;width:35%;height:100%;background:#2563eb;border-radius:9px;animation:move 1.4s ease-in-out infinite}}#status{{font-size:11px;color:#7a8799}}@keyframes move{{0%{{transform:translateX(-110%)}}100%{{transform:translateX(330%)}}}}</style></head>
+<body><main><div class="mark">E</div><h1>Preparing the screening dashboard</h1><p>EPU Mapper is reading the session and atlas. Sessions on OffloadData can take a few minutes; this page will open the dashboard automatically.</p><div class="progress"><span></span></div><div id="status">Waiting for the local server…</div></main>
+<script>const target={target_json};async function poll(){{try{{const response=await fetch('/ready?t='+Date.now(),{{cache:'no-store'}});const state=await response.json();if(state.ready){{location.replace(state.url);return}}if(state.error){{document.getElementById('status').textContent=state.error;return}}}}catch(_error){{}}setTimeout(poll,1000)}}poll();</script></body></html>"""
+
+
+def _start_browser_wait_page(proc: subprocess.Popen[str], host: str, port: str) -> tuple[ThreadingHTTPServer, str]:
+    connect_host = _browser_host(host)
+    target_url = f"http://{connect_host}:{port}"
+    page = _startup_page_html(target_url).encode("utf-8")
+
+    class StartupHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            if self.path.startswith("/ready"):
+                error = None
+                ready = False
+                exit_code = proc.poll()
+                if exit_code is not None:
+                    error = f"EPU Mapper stopped before the server was ready (exit code {exit_code}). Check the launcher log."
+                else:
+                    try:
+                        with socket.create_connection((connect_host, int(port)), timeout=0.25):
+                            ready = True
+                    except OSError:
+                        pass
+                payload = json.dumps({"ready": ready, "url": target_url, "error": error}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, _format: str, *_args) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StartupHandler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    wait_url = f"http://127.0.0.1:{server.server_address[1]}"
+    return server, wait_url
+
+
+def _open_url(url: str) -> None:
+    if sys.platform == "darwin":
+        subprocess.Popen(
+            ["/usr/bin/open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        webbrowser.open(url)
+
+
 def _history_file() -> Path:
-    base = Path(os.environ.get("APPDATA", str(Path.home())))
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("APPDATA", str(Path.home())))
     return base / "EPUMapperReview" / "launcher_history.json"
+
+
+def _server_log_file() -> Path:
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Logs"
+    else:
+        base = Path(os.environ.get("LOCALAPPDATA", os.environ.get("APPDATA", str(Path.home()))))
+    return base / "EPUMapper" / "server.log"
+
+
+def _suggest_atlas_root(session_path: str) -> Path | None:
+    """Find the Atlas directory belonging to the selected EPU session."""
+    if not session_path:
+        return None
+    try:
+        current = Path(session_path).expanduser().resolve()
+    except Exception:
+        return None
+    search_roots = [current, *list(current.parents)[:5]]
+    seen: set[Path] = set()
+    for root in search_roots:
+        candidates = [root] if root.name.lower() == "atlas" else [root / "Atlas", root / "atlas"]
+        for candidate in candidates:
+            if candidate in seen or not candidate.is_dir():
+                continue
+            seen.add(candidate)
+            patterns = ("Atlas_*.jpg", "Atlas_*.jpeg", "Atlas_*.png", "atlas_*.jpg", "atlas_*.png")
+            if any(next(candidate.glob(pattern), None) is not None for pattern in patterns):
+                return candidate
+    return None
 
 
 def _default_python() -> str:
@@ -137,11 +243,14 @@ class ReviewLauncher:
                 "Use the packaged Windows installer/exe, or install Tk support."
             )
         self.proc: subprocess.Popen[str] | None = None
+        self.startup_server: ThreadingHTTPServer | None = None
         self.preferences = self._load_preferences()
         self.session_history = list(self.preferences.get("sessions", []))
+        saved_atlas_by_session = self.preferences.get("atlas_by_session", {})
+        self.atlas_by_session = dict(saved_atlas_by_session) if isinstance(saved_atlas_by_session, dict) else {}
         self._details_running = False
         self.root = tk.Tk()
-        self.root.title("EPU Mapper Review Launcher")
+        self.root.title("EPU Mapper")
         self._build_form()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -155,6 +264,7 @@ class ReviewLauncher:
         self.session_var = tk.StringVar(value=self.preferences.get("last_session", ""))
         session_entry = ttk.Entry(frm, textvariable=self.session_var, width=70)
         session_entry.grid(row=1, column=0, sticky="we")
+        session_entry.bind("<FocusOut>", lambda _event: self._apply_session_atlas(self.session_var.get().strip()))
         ttk.Button(frm, text="Browse", command=self.browse_session).grid(row=1, column=1, padx=(6, 0))
 
         ttk.Label(frm, text="Recent sessions:").grid(row=2, column=0, sticky="w", pady=(6, 0))
@@ -191,9 +301,13 @@ class ReviewLauncher:
         self.atlas_browse_btn = ttk.Button(frm, text="Browse", command=self.browse_atlas)
         self.atlas_browse_btn.grid(row=7, column=1, padx=(6, 0))
         self._on_atlas_mode_change(remember_current=False)
+        self._apply_session_atlas(self.session_var.get().strip())
 
         ttk.Label(frm, text="Session/Grid label (optional):").grid(row=8, column=0, sticky="w", pady=(10, 0))
-        self.label_var = tk.StringVar(value=self.preferences.get("session_label", DEFAULT_LABEL))
+        saved_label = str(self.preferences.get("session_label", DEFAULT_LABEL) or "")
+        if "\n" in saved_label or "\r" in saved_label or len(saved_label) > 80:
+            saved_label = ""
+        self.label_var = tk.StringVar(value=saved_label)
         ttk.Entry(frm, textvariable=self.label_var, width=40).grid(row=9, column=0, sticky="we")
 
         options_row = ttk.Frame(frm)
@@ -258,6 +372,22 @@ class ReviewLauncher:
         path = filedialog.askdirectory(title="Select EPU session output folder")
         if path:
             self.session_var.set(path)
+            self._apply_session_atlas(path)
+
+    def _apply_session_atlas(self, session_path: str) -> None:
+        if self._atlas_mode() != ATLAS_MODE_EPU or not session_path:
+            return
+        normalized = str(Path(session_path).expanduser())
+        remembered = self.atlas_by_session.get(normalized, "")
+        if remembered and Path(remembered).is_dir():
+            atlas_root = Path(remembered)
+        else:
+            atlas_root = _suggest_atlas_root(normalized)
+        value = str(atlas_root) if atlas_root is not None else ""
+        self.atlas_root_var.set(value)
+        self.atlas_var.set(value)
+        if value:
+            self.atlas_by_session[normalized] = value
 
     def _atlas_mode(self) -> str:
         mode = self.atlas_mode_var.get()
@@ -307,6 +437,8 @@ class ReviewLauncher:
         if path:
             self.atlas_var.set(path)
             self._store_atlas_input()
+            if self._atlas_mode() == ATLAS_MODE_EPU and self.session_var.get().strip():
+                self.atlas_by_session[str(Path(self.session_var.get().strip()).expanduser())] = path
 
     def start_server(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -336,7 +468,11 @@ class ReviewLauncher:
         transform_value = self.transform_var.get()
         transform = self._transform_value(transform_value)
 
-        label = self.label_var.get().strip()
+        try:
+            label = self._validated_session_label()
+        except ValueError as exc:
+            messagebox.showerror("Invalid session label", str(exc))
+            return
         cmd = _review_command(
             session_path,
             host,
@@ -347,6 +483,7 @@ class ReviewLauncher:
             self.skip_foil_processing_var.get(),
             transform,
             session_label=label or None,
+            open_browser=False,
         )
 
         env = self._build_env()
@@ -367,7 +504,14 @@ class ReviewLauncher:
         self._persist_preferences(transform)
         self.launch_btn.configure(state="disabled")
         threading.Thread(target=self._stream_output, daemon=True).start()
-        self._log(f"Started server on {host}:{port}. Close the browser tab when finished.\n")
+        self._log(f"Persistent server log: {_server_log_file()}\n")
+        try:
+            self._stop_startup_server()
+            self.startup_server, wait_url = _start_browser_wait_page(self.proc, host, port)
+            _open_url(wait_url)
+            self._log(f"Preparing the session for {host}:{port}; opened a browser waiting page.\n")
+        except Exception as exc:
+            self._log(f"Could not open the browser waiting page: {exc}\n")
 
     def export_details(self) -> None:
         if self._details_running:
@@ -396,7 +540,11 @@ class ReviewLauncher:
         transform = self._transform_value(transform_value)
         host = self.host_var.get().strip() or DEFAULT_HOST
         port = self.port_var.get().strip() or DEFAULT_PORT
-        label = self.label_var.get().strip()
+        try:
+            label = self._validated_session_label()
+        except ValueError as exc:
+            messagebox.showerror("Invalid session label", str(exc))
+            return
         cmd = _review_command(
             session_path,
             host,
@@ -422,7 +570,22 @@ class ReviewLauncher:
             self.proc.terminate()
             self._log("Stopping server...\n")
         self.proc = None
+        self._stop_startup_server()
         self.launch_btn.configure(state="normal")
+
+    def _validated_session_label(self) -> str:
+        label = self.label_var.get().strip()
+        if "\n" in label or "\r" in label:
+            raise ValueError("The optional session label must be a single line.")
+        if len(label) > 80:
+            raise ValueError("The optional session label must be 80 characters or fewer.")
+        return label
+
+    def _stop_startup_server(self) -> None:
+        server = self.startup_server
+        self.startup_server = None
+        if server is not None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     def _transform_value(self, label: str) -> str:
         for text, value in TRANSFORM_OPTIONS:
@@ -440,6 +603,7 @@ class ReviewLauncher:
         val = self.recent_var.get()
         if val:
             self.session_var.set(val)
+            self._apply_session_atlas(val)
 
     def _prefs_path(self) -> Path:
         return _history_file()
@@ -473,6 +637,7 @@ class ReviewLauncher:
             "last_atlas_root": self.atlas_root_var.get().strip(),
             "last_atlas_file": self.atlas_file_var.get().strip(),
             "last_atlas": self._current_atlas_path(),
+            "atlas_by_session": self.atlas_by_session,
             "session_label": self.label_var.get().strip(),
             "show_advanced": bool(self.advanced_var.get()),
         }
@@ -492,11 +657,31 @@ class ReviewLauncher:
         return env
 
     def _stream_output(self) -> None:
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
+        proc = self.proc
+        assert proc and proc.stdout
+        log_path = _server_log_file()
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = log_path.open("a", encoding="utf-8")
+        except OSError:
+            log_handle = None
+        header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting EPU Mapper server (PID {proc.pid})\n"
+        if log_handle:
+            log_handle.write(header)
+            log_handle.flush()
+        for line in proc.stdout:
             self._log(line)
-        self._log("Server exited.\n")
-        self.proc = None
+            if log_handle:
+                log_handle.write(line)
+                log_handle.flush()
+        exit_code = proc.wait()
+        exit_line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Server exited with code {exit_code}.\n"
+        self._log(exit_line)
+        if log_handle:
+            log_handle.write(exit_line)
+            log_handle.close()
+        if self.proc is proc:
+            self.proc = None
         self.root.after(0, lambda: self.launch_btn.configure(state="normal"))
 
     def _run_details_job(self, cmd: list[str], session_path: str, transform: str) -> None:
@@ -557,6 +742,7 @@ class ReviewLauncher:
                 self.stop_server()
             else:
                 return
+        self._stop_startup_server()
         self.root.destroy()
 
     def run(self) -> None:

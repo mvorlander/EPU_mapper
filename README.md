@@ -6,12 +6,16 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 - Inspect GridSquare, FoilHole, and Data images in one page.
 - Use the atlas-first dashboard to jump directly to any screened GridSquare and
   browse all of its associated images without leaving the overview.
+- Hover screened atlas squares for a large GridSquare preview. Click a square
+  to open its large GridSquare view, then hover a screened FoilHole to compare
+  the FoilHole and matched Data images side by side.
 - Map the acquired FoilHoles onto the GridSquare and the current GridSquare
   position on the atlas to pick the best areas.
-- Switch between JPEG and MRC, adjust contrast, and zoom or pan continuously in
-  the main viewer (scroll to zoom, then drag—no separate pan tool).
-- Rate each GridSquare, add reviewer comments, and choose whether it stays in
-  the final report.
+- Load fast PNG previews by default, request an MRC only for the particular
+  atlas, GridSquare, FoilHole, or Data image that needs closer inspection, and
+  zoom or pan continuously (scroll to zoom, then drag—no separate pan tool).
+- Rate each GridSquare, add reviewer comments, mark it suitable or unsuitable
+  for collection, and choose whether it stays in the final report.
 
 
 ![Annotated web app](images/webapp_annotated.png)
@@ -33,6 +37,25 @@ setting up your high-res data collection:
   metadata.
 
 ## Installation
+
+### Lightweight macOS launcher
+
+After creating the Conda environment below, build a small native launcher and
+install it into your user Applications folder:
+
+```bash
+./scripts/build_macos_launcher.sh --install
+```
+
+Open **EPU Mapper** from Finder or Spotlight. The launcher remembers recent
+sessions and atlas locations, starts the local dashboard, and provides a Stop
+button plus access to details-only PDF export. A browser preparation page opens
+immediately and redirects to the dashboard when session scanning is complete.
+Keep the launcher open while using the dashboard; its **Stop server** button or
+quitting the launcher stops the local site. Server output is also retained at
+`~/Library/Logs/EPUMapper/server.log` for troubleshooting.
+The app reuses the local Conda environment rather than bundling a second Python runtime. See
+[`macos/README.md`](macos/README.md) for selecting a specific Python environment.
 
 ### Windows installer
 
@@ -105,11 +128,14 @@ Images-Disc1/
 ![EPU Mapper first page](images/EPU_mapper_1st_page.png)
 
 The start page is an interactive screening dashboard. It runs preflight checks,
-confirms that the session folders were found, and uses the full-resolution atlas
-MRC when available. Click a numbered screened-square marker to open its
-GridSquare, foil overlay, FoilHole, and data images in the inspector. You can
-also search the acquisition-order list, switch to the EPU-category or raw atlas,
-and enter the systematic review at any selected square.
+confirms that the session folders were found, and loads PNG previews by default.
+Hover a numbered screened-square marker to preview its GridSquare, then click it
+to open a large GridSquare and screened-hole overlay directly below the atlas.
+Hover a screened hole for a large side-by-side FoilHole/Data comparison. Rating,
+comment, report inclusion, and suitable/unsuitable collection controls are in
+the same workspace. Use **Load MRC** only when a specific full-resolution source
+is needed. Suitable marks are amber, unsuitable marks are red, and both save
+immediately.
 
 ### 4. Review GridSquares in the web app
 
@@ -176,8 +202,9 @@ Most users outside VBC can ignore this section.
   detailed pages for included GridSquares.
 - `Screening_details.pdf` – optional details-only export (e.g. via
   `--details-only` / `--export-all-details`), including foil/data thumbnails plus metadata.
-- `review_responses.json` – the persisted ratings, comments, and inclusion
-  flags, written next to the disc so you can resume later.
+- `review_responses.json` – the persisted ratings, comments, inclusion flags,
+  and suitable/unsuitable collection decisions, written next to the disc so
+  you can resume later.
 - `review_summary.txt` – optional one-line session summary entered on the final
   page before downloading reports.
 

@@ -965,10 +965,15 @@ def _draw_grid_summary_page(
         rows_height = 0
 
     rating = '—' if not resp else str(resp.get('rating', '—'))
+    collection_status = str(resp.get('collection_status', '') if resp else '').strip().lower()
+    if collection_status not in ('suitable', 'unsuitable'):
+        collection_status = 'suitable' if resp and bool(resp.get('collect', False)) else 'Unmarked'
+    else:
+        collection_status = collection_status.title()
     category_text = _format_category_score(category_score)
     comment_raw = '' if not resp else str(resp.get('comment', '')).strip()
     comment_lines = textwrap.wrap(comment_raw, width=110) if comment_raw else []
-    info_card_height = max(320, card_inner_pad * 2 + 180 + len(comment_lines) * 34)
+    info_card_height = max(360, card_inner_pad * 2 + 214 + len(comment_lines) * 34)
     hero_card_height = hero_panel_h + card_inner_pad * 2 + 80
     total_height = (
         base_margin
@@ -1004,7 +1009,8 @@ def _draw_grid_summary_page(
     c.drawString(base_margin + card_inner_pad, y - card_inner_pad - 46, f"Rating: {rating}")
     c.setFont(_PDF_FONT_REGULAR, 42)
     c.drawString(base_margin + card_inner_pad, y - card_inner_pad - 102, f"EPU category score: {category_text}")
-    text_y = y - card_inner_pad - 180
+    c.drawString(base_margin + card_inner_pad, y - card_inner_pad - 154, f"Collection suitability: {collection_status}")
+    text_y = y - card_inner_pad - 214
     c.setFillColor(muted_color)
     c.setFont(_PDF_FONT_REGULAR, 34)
     if comment_lines:
@@ -2281,12 +2287,20 @@ def _build_overview_page_image(
     color_note = "Note: category colors are arbitrary and currently do not match the EPU GUI color code."
     draw.text((margin, stats_y), color_note, fill=(80, 88, 108), font=fonts["small"])
     stats_y += line_h
-    reviewed_count = sum(1 for resp in responses.values() if resp)
+    reviewed_count = sum(1 for resp in responses.values() if resp and bool(resp.get("reviewed", True)))
     selected_count = sum(1 for resp in responses.values() if resp and bool(resp.get("include", True)))
+    suitable_count = sum(
+        1
+        for resp in responses.values()
+        if resp and (resp.get("collection_status") == "suitable" or (not resp.get("collection_status") and bool(resp.get("collect", False))))
+    )
+    unsuitable_count = sum(1 for resp in responses.values() if resp and resp.get("collection_status") == "unsuitable")
     stats_lines = [
         f"Total GridSquares: {len(grids)}",
         f"Reviewed GridSquares: {reviewed_count}",
         f"Included GridSquares: {selected_count}",
+        f"Suitable for collection: {suitable_count}",
+        f"Unsuitable for collection: {unsuitable_count}",
     ]
     for text in stats_lines:
         draw.text((margin, stats_y), text, fill=0, font=fonts["body"])
@@ -2299,6 +2313,11 @@ def _build_overview_page_image(
         rating = resp.get("rating", "—") if resp else "—"
         comment = (resp.get("comment", "") if resp else "").strip()
         include_flag = "Yes" if resp and resp.get("include", True) else "No"
+        collection_status = str(resp.get("collection_status", "") if resp else "").strip().lower()
+        if collection_status not in ("suitable", "unsuitable"):
+            collection_status = "Suitable" if resp and resp.get("collect", False) else "—"
+        else:
+            collection_status = collection_status.title()
         category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
         rows.append(
             (
@@ -2306,6 +2325,7 @@ def _build_overview_page_image(
                 _format_category_score(category_score),
                 str(rating),
                 include_flag,
+                collection_status,
                 comment or "—",
             )
         )
@@ -2330,7 +2350,7 @@ def _build_overview_page_image(
 
     legend = (
         "Each row lists the GridSquare order, EPU category score, rating (0 means skipped), "
-        "reviewer notes, and whether it remained included in the detailed report."
+        "collection mark, reviewer notes, and whether it remained included in the detailed report."
     )
     for chunk in textwrap.wrap(legend, width=120):
         draw.text((margin, y_offset), chunk, fill=0, font=fonts["body"])
@@ -2341,21 +2361,24 @@ def _build_overview_page_image(
     category_col = grid_col + 260
     rating_col = category_col + 340
     include_col = rating_col + 180
-    comment_col = include_col + 220
+    collect_col = include_col + 220
+    comment_col = collect_col + 220
     header_y = y_offset
     draw.text((grid_col, header_y), "GridSquare", fill=0, font=fonts["table"])
     draw.text((category_col, header_y), "EPU color / category", fill=0, font=fonts["table"])
     draw.text((rating_col, header_y), "Rating", fill=0, font=fonts["table"])
     draw.text((include_col, header_y), "Included?", fill=0, font=fonts["table"])
+    draw.text((collect_col, header_y), "Collection", fill=0, font=fonts["table"])
     draw.text((comment_col, header_y), "Reviewer comments", fill=0, font=fonts["table"])
     y_offset = header_y + (fonts["table"].size if hasattr(fonts["table"], "size") else 24) + 6
     row_height = (fonts["table"].size if hasattr(fonts["table"], "size") else 24) + 6
-    for grid_label, category_text, rating_text, include_text, comment_text in rows:
+    for grid_label, category_text, rating_text, include_text, collect_text, comment_text in rows:
         draw.text((grid_col, y_offset), grid_label, fill=0, font=fonts["table"])
         draw.text((category_col, y_offset), category_text, fill=0, font=fonts["table"])
         draw.text((rating_col, y_offset), rating_text, fill=0, font=fonts["table"])
         draw.text((include_col, y_offset), include_text, fill=0, font=fonts["table"])
-        comment_lines = textwrap.wrap(comment_text, width=72) or ["—"]
+        draw.text((collect_col, y_offset), collect_text, fill=0, font=fonts["table"])
+        comment_lines = textwrap.wrap(comment_text, width=58) or ["—"]
         comment_y = y_offset
         for c_line in comment_lines:
             draw.text((comment_col, comment_y), c_line, fill=0, font=fonts["table"])

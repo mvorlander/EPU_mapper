@@ -273,7 +273,10 @@ def _render_atlas_overlay(
 ) -> bytes | None:
     if active_key not in centers:
         return None
-    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=True)
+    # Keep the marked-location view on the same JPEG/PNG source as the default
+    # overview. The MRC is an explicit opt-in so the two views cannot silently
+    # show different atlas acquisitions.
+    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=False)
     if atlas_rgb is None:
         return None
 
@@ -344,11 +347,11 @@ def _open_atlas_rgb(atlas_path: Path, prefer_mrc: bool = True) -> Image.Image | 
 
 
 def _render_atlas_raw(atlas_path: Path) -> bytes | None:
-    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=True)
+    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=False)
     if atlas_rgb is None:
         return None
     buf = io.BytesIO()
-    atlas_rgb.save(buf, format="PNG", optimize=True)
+    atlas_rgb.save(buf, format="PNG", compress_level=3)
     return buf.getvalue()
 
 
@@ -692,43 +695,53 @@ def _overlay_tools():
     return _OVERLAY_TOOLS
 
 
-def _generate_overlay_image(gdir: Path) -> Path | None:
+def _generate_overlay_image(gdir: Path) -> tuple[Path | None, list[dict]]:
     """Generate foil_overlay.png inside `gdir` using the standalone helper."""
     tools = _overlay_tools()
     if not tools:
-        return None
+        return None, []
     compute_markers, plot_overlay = tools
     _record_status(f"[overlay] Generating overlay for {gdir.name}...")
     try:
         grid_img, markers = compute_markers(gdir)
     except Exception as exc:
         _record_status(f"[overlay] skipping {gdir.name}: {exc}")
-        return None
+        return None, []
     if not markers:
         _record_status(f"[overlay] no FoilHole markers for {gdir.name}")
-        return None
+        return None, []
+    marker_payload = [
+        {
+            "x": max(0.0, min(100.0, float(px) / max(1, grid_img.width) * 100.0)),
+            "y": max(0.0, min(100.0, float(py) / max(1, grid_img.height) * 100.0)),
+            "in_bounds": bool(in_bounds),
+            "label": int(label),
+            "foil_name": path.name,
+        }
+        for px, py, in_bounds, label, path in markers
+    ]
     out_path = gdir / "foil_overlay.png"
     try:
         plot_overlay(grid_img, markers, title=gdir.name, output=out_path, dpi=180)
     except Exception as exc:
         _record_status(f"[overlay] failed to render overlay for {gdir.name}: {exc}")
-        return None
+        return None, marker_payload
     if out_path.is_file():
         _record_status(f"[overlay] Finished {gdir.name}")
-        return out_path
+        return out_path, marker_payload
     _record_status(f"[overlay] Overlay file missing for {gdir.name}")
-    return None
+    return None, marker_payload
 
 
-def _ensure_overlay_image(gdir: Path, base_dir: Path) -> tuple[Path | None, str | None]:
+def _ensure_overlay_image(gdir: Path, base_dir: Path) -> tuple[Path | None, str | None, list[dict]]:
     """Return a fresh overlay PNG path if generation succeeds, else fall back to cached copy."""
-    generated = _generate_overlay_image(gdir)
+    generated, markers = _generate_overlay_image(gdir)
     if generated:
-        return generated, None
+        return generated, None, markers
     cached = _find_overlay_image(gdir, base_dir)
     if cached:
-        return cached, "Using cached overlay image (new generation failed)."
-    return None, "Overlay unavailable for this GridSquare (missing metadata or generation failed)."
+        return cached, "Using cached overlay image (new generation failed).", markers
+    return None, "Overlay unavailable for this GridSquare (missing metadata or generation failed).", markers
 
 
 def _has_grid_dirs(path: Path) -> bool:
@@ -898,8 +911,9 @@ def create_app(
                         )
         overlay_path = None
         overlay_message = None
+        foil_markers: list[dict] = []
         if overlay_enabled:
-            overlay_path, overlay_message = _ensure_overlay_image(gdir, base_dir)
+            overlay_path, overlay_message, foil_markers = _ensure_overlay_image(gdir, base_dir)
         items.append(
             {
                 "id": _gid,
@@ -917,6 +931,7 @@ def create_app(
                 "epu_category_score": epu_category_score,
                 "overlay": overlay_path,
                 "overlay_message": overlay_message,
+                "foil_markers": foil_markers,
                 "foil_processing_note": foil_processing_note,
                 "foils": foil_list,
                 "data": data_list,
@@ -927,6 +942,7 @@ def create_app(
     atlas_screened_preview: bytes | None = None
     atlas_category_preview: bytes | None = None
     atlas_raw_preview: bytes | None = None
+    atlas_mrc_preview: bytes | None = None
     atlas_preview_message: str | None = None
     atlas_preview_path: Path | None = None
     atlas_sample_item = next(
@@ -969,6 +985,7 @@ def create_app(
     drafts_file = _drafts_file_path(base_dir)
     summary_state = {"text": _load_review_summary(base_dir)}
     session_storage_key = hashlib.sha1(str(base_dir).encode("utf-8")).hexdigest()[:16]
+    session_cache_key = secrets.token_urlsafe(8)
     thumb_cache_dir = Path(tempfile.gettempdir()) / "EPUMapperThumbCache" / session_storage_key
     thumb_cache_dir.mkdir(parents=True, exist_ok=True)
     drafts_lock = threading.Lock()
@@ -1012,6 +1029,11 @@ def create_app(
         if len(comment) > _DRAFT_MAX_LEN:
             comment = comment[:_DRAFT_MAX_LEN]
         include = bool(payload.get("include", default_include))
+        collection_status = str(payload.get("collection_status", "") or "").strip().lower()
+        if collection_status not in ("suitable", "unsuitable"):
+            collection_status = "suitable" if bool(payload.get("collect", False)) else ""
+        collect = collection_status == "suitable"
+        reviewed = bool(payload.get("reviewed", True))
         updated_at_raw = payload.get("updated_at", time.time())
         try:
             updated_at = float(updated_at_raw)
@@ -1021,6 +1043,9 @@ def create_app(
             "rating": rating,
             "comment": comment,
             "include": include,
+            "collect": collect,
+            "collection_status": collection_status,
+            "reviewed": reviewed,
             "updated_at": updated_at,
         }
 
@@ -1074,6 +1099,33 @@ def create_app(
             except Exception:
                 return None
 
+    def _build_png_preview(src: Path, size: int) -> Path | None:
+        """Build a fast display PNG without touching an MRC source."""
+        if not src or not src.is_file():
+            return None
+        size = max(256, min(2048, int(size)))
+        try:
+            stat = src.stat()
+        except Exception:
+            return None
+        key_payload = f"png|{src.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{size}".encode("utf-8")
+        cache_path = thumb_cache_dir / f"{hashlib.sha1(key_payload).hexdigest()}_{size}.png"
+        if cache_path.is_file():
+            return cache_path
+        with thumb_cache_lock:
+            if cache_path.is_file():
+                return cache_path
+            try:
+                with Image.open(src) as image:
+                    preview = image.convert("RGB")
+                    preview.thumbnail((size, size), Image.LANCZOS)
+                temp_path = cache_path.with_suffix(".tmp.png")
+                preview.save(temp_path, format="PNG", compress_level=3)
+                temp_path.replace(cache_path)
+                return cache_path
+            except Exception:
+                return None
+
     def _thumbnail_sources() -> list[Path]:
         sources: list[Path] = []
         for item in items:
@@ -1118,6 +1170,8 @@ def create_app(
                     "gridsquare_dir": name,
                     "gridsquare_image": item["name"],
                     "include": bool(response.get("include", True)),
+                    "collect": bool(response.get("collect", False)),
+                    "collection_status": response.get("collection_status", ""),
                     "rating": int(response.get("rating", 0)),
                     "comment": str(response.get("comment", "")),
                     "foil_count": len(item["foils"]),
@@ -1160,12 +1214,49 @@ def create_app(
                     "category": item.get("epu_category_score"),
                     "foil_count": len(item["foils"]),
                     "data_count": len(item["data"]),
-                    "reviewed": item["dir"].name in responses,
-                    "rating": response["rating"] if item["dir"].name in responses else 0,
+                    "reviewed": item["dir"].name in responses and response["reviewed"],
+                    "rating": response["rating"] if item["dir"].name in responses and response["reviewed"] else 0,
                     "include": response["include"],
+                    "collect": response["collect"],
+                    "collection_status": response["collection_status"],
                 }
             )
         return summaries
+
+    def _hole_preview_records(idx: int, item: dict) -> list[dict]:
+        foil_by_name = {entry["path"].name: entry for entry in item["foils"]}
+        data_by_id: dict[str, list[dict]] = {}
+        for entry in item["data"]:
+            data_by_id.setdefault(entry["id"], []).append(entry)
+        records: list[dict] = []
+        for marker in item.get("foil_markers", []):
+            foil = foil_by_name.get(marker.get("foil_name", ""))
+            if foil is None:
+                continue
+            matched = data_by_id.get(foil["id"], [])
+            data_entry = matched[-1] if matched else None
+            foil_name = foil["path"].name
+            data_name = data_entry["path"].name if data_entry else ""
+            records.append(
+                {
+                    "x": marker.get("x", 0),
+                    "y": marker.get("y", 0),
+                    "marker_label": marker.get("label"),
+                    "foil_id": str(foil["id"]),
+                    "foil_name": foil_name,
+                    "foil_preview": f"/preview.png?idx={idx}&kind=foil&name={urllib.parse.quote(foil_name)}&size=1400&session={session_cache_key}",
+                    "foil_has_mrc": bool(foil.get("mrc")),
+                    "data_name": data_name,
+                    "data_preview": (
+                        f"/preview.png?idx={idx}&kind=data&name={urllib.parse.quote(data_name)}&size=1400&session={session_cache_key}"
+                        if data_entry
+                        else ""
+                    ),
+                    "data_has_mrc": bool(data_entry and data_entry.get("mrc")),
+                    "meta": data_entry.get("meta", []) if data_entry else [],
+                }
+            )
+        return records
 
     def _job_state(job_id: str) -> dict | None:
         with report_jobs_lock:
@@ -1248,7 +1339,7 @@ def create_app(
         ts = int(time.time() * 1000)
         default_kind = "atlas" if item["atlas"] else "grid"
         default_label = "Atlas" if default_kind == "atlas" else "GridSquare"
-        default_src = f"/atlas?idx={idx}&t={ts}" if default_kind == "atlas" else f"/grid?idx={idx}&t={ts}"
+        default_src = f"/preview.png?idx={idx}&kind={default_kind}&size=1600&session={session_cache_key}&t={ts}"
         default_has_mrc_json = atlas_mrc_json if default_kind == "atlas" else grid_mrc_json
         category_text = _format_category_score_text(item.get("epu_category_score"))
         category_subtitle_html = f"<div class=\"subtitle\">EPU category score: {category_text}</div>"
@@ -1269,27 +1360,61 @@ def create_app(
             f"<div class=\"image-frame\"><div id=\"viewer-caption\" class=\"image-caption\">Viewer: {default_label} (last clicked image)</div>"
             f"<div id=\"viewer-viewport\" class=\"viewer-viewport\"><img id=\"gridimg\" class=\"frame-image\" src=\"{default_src}\"/></div></div>"
         )
+        data_by_id = {}
+        for d in item["data"]:
+            data_by_id.setdefault(d["id"], []).append(d)
+        foil_id_by_name = {f["path"].name: f["id"] for f in item["foils"]}
+        foil_hover_markers = []
+        for marker in item.get("foil_markers", []):
+            foil_id = foil_id_by_name.get(marker.get("foil_name", ""))
+            matched_data = data_by_id.get(foil_id, []) if foil_id is not None else []
+            preview_data = matched_data[-1] if matched_data else None
+            foil_hover_markers.append(
+                {
+                    "x": marker.get("x", 0),
+                    "y": marker.get("y", 0),
+                    "label": marker.get("label"),
+                    "foil_id": str(foil_id or marker.get("foil_name", "FoilHole")),
+                    "data_name": preview_data["path"].name if preview_data else "",
+                    "data_has_mrc": bool(preview_data and preview_data.get("mrc")),
+                    "preview": (
+                        f"/thumb?idx={idx}&kind=data&name={urllib.parse.quote(preview_data['path'].name)}&size=420"
+                        if preview_data
+                        else ""
+                    ),
+                }
+            )
+        foil_hover_markers_json = json.dumps(foil_hover_markers, separators=(",", ":")).replace("</", "<\\/")
         overlay_html = ""
         overlay_inline_notice = ""
         if item.get("overlay"):
             overlay_html = (
                 f"<div class=\"image-frame\"><div class=\"image-caption\">Foil overlay</div>"
-                f"<img id=\"overlayimg\" class=\"frame-image\" src=\"/overlay?idx={idx}&t={ts}\"/></div>"
+                f"<div class=\"foil-overlay-wrap\"><img id=\"overlayimg\" class=\"frame-image\" src=\"/overlay?idx={idx}&t={ts}\"/>"
+                f"<div id=\"foil-hover-layer\" class=\"foil-hover-layer\"></div></div>"
+                f"<div class=\"note\">Hover a numbered FoilHole to preview its latest Data image.</div></div>"
             )
         elif item.get("overlay_message"):
             overlay_inline_notice = f"<div class=\"note warn\">{item['overlay_message']}</div>"
         grid_section_html = f"<div class=\"grid-panel\">{grid_frame_html}{overlay_html}</div>{overlay_inline_notice}"
-        data_by_id = {}
-        for d in item["data"]:
-            data_by_id.setdefault(d["id"], []).append(d)
         thumb_card_html = ""
         if item["foils"]:
             groups = []
             for f in item["foils"]:
+                matched_for_foil = data_by_id.get(f["id"], [])
+                hover_data = matched_for_foil[-1] if matched_for_foil else None
+                hover_attrs = ""
+                if hover_data:
+                    hover_attrs = (
+                        f" data-hover-preview=\"/thumb?idx={idx}&kind=data&name={urllib.parse.quote(hover_data['path'].name)}&size=420\""
+                        f" data-hover-label=\"FoilHole {f['id']} · Data preview\""
+                        f" data-hover-data-name=\"{hover_data['path'].name}\""
+                        f" data-hover-data-mrc=\"{1 if hover_data['mrc'] else 0}\""
+                    )
                 foil_thumb = (
-                    f"<img class=\"thumb\" loading=\"lazy\" data-kind=\"foil\" data-name=\"{f['path'].name}\" "
+                    f"<img class=\"thumb foil-thumb\" loading=\"lazy\" data-kind=\"foil\" data-name=\"{f['path'].name}\" "
                     f"data-has-mrc=\"{1 if f['mrc'] else 0}\" "
-                    f"src=\"/thumb?idx={idx}&kind=foil&name={urllib.parse.quote(f['path'].name)}&size={_THUMB_DEFAULT_SIZE}\"/>"
+                    f"src=\"/thumb?idx={idx}&kind=foil&name={urllib.parse.quote(f['path'].name)}&size={_THUMB_DEFAULT_SIZE}\"{hover_attrs}/>"
                 )
                 data_imgs = []
                 for p in data_by_id.get(f["id"], []):
@@ -1361,6 +1486,8 @@ body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Robot
 .rate-buttons{{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;}}
 .rate{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;min-width:38px;}}
 .rate.active{{background:#1b6ef3;color:#fff;border-color:#1b6ef3;}}
+.collection-choice.suitable.active{{background:#dcfce7;color:#08765a;border-color:#34d399;}}
+.collection-choice.unsuitable.active{{background:#ffe4e6;color:#9f1239;border-color:#fb7185;}}
 .note{{color:#555;font-size:13px;margin:6px 0;}}
 .note.warn{{color:#b00020;}}
 .note.ok{{color:#13653f;}}
@@ -1381,6 +1508,15 @@ body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Robot
 .foil-group{{border-top:1px solid #eef0f3;padding-top:10px;margin-top:10px;}}
 .foil-row{{display:flex;align-items:flex-start;gap:12px;}}
 .data-block{{flex:1;}}
+.foil-overlay-wrap{{position:relative;width:100%;max-width:var(--img-size);line-height:0;}}
+.foil-overlay-wrap #overlayimg{{width:100%;max-width:none;height:auto;}}
+.foil-hover-layer{{position:absolute;inset:0;pointer-events:none;}}
+.foil-hit{{position:absolute;width:30px;height:30px;transform:translate(-50%,-50%);border:2px solid rgba(255,255,255,.2);border-radius:50%;background:rgba(37,99,235,.03);pointer-events:auto;cursor:crosshair;padding:0;}}
+.foil-hit:hover,.foil-hit:focus-visible{{border-color:#5eead4;background:rgba(94,234,212,.22);box-shadow:0 0 0 4px rgba(15,23,42,.42);outline:none;}}
+.image-hover-preview{{position:fixed;display:none;z-index:100;width:250px;padding:8px;background:#fff;border:1px solid #cfd8e6;border-radius:12px;box-shadow:0 18px 45px rgba(10,20,38,.3);pointer-events:none;line-height:1.25;}}
+.image-hover-preview.visible{{display:block;}}
+.image-hover-preview img{{display:block;width:232px;height:232px;object-fit:contain;background:#101827;border-radius:8px;}}
+.image-hover-label{{padding:7px 3px 2px;font-size:11px;font-weight:700;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;padding:8px;font-size:14px;}}
 .submit-row{{margin-top:10px;}}
 .atlas-placeholder{{border:1px dashed #cfd6e4;border-radius:10px;padding:10px;background:#fdfdfd;color:#445;}}
@@ -1399,6 +1535,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 </head>
 <body>
 <div id=\"loading-overlay\"><div class=\"spinner\"></div><div>Loading images…</div></div>
+<div id=\"hole-hover-preview\" class=\"image-hover-preview\" role=\"tooltip\"><img id=\"hole-hover-image\" alt=\"Data image preview\"><div id=\"hole-hover-label\" class=\"image-hover-label\"></div></div>
 <div class=\"page\">
 <div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div>{category_subtitle_html}</div><div class=\"header-actions\"><a class=\"btn nav-btn\" href=\"/\">Atlas overview</a>{prev_nav_html}<div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div>{next_nav_html}</div></div>
 {overlay_banner}
@@ -1433,7 +1570,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div class=\"section-title\">Selected image</div>
 <div id=\"selected-image\" class=\"note\">{default_label}</div>
 <div class=\"actions\">
-<button type=\"button\" id=\"show-jpeg\" class=\"btn\">Show JPEG</button>
+<button type=\"button\" id=\"show-jpeg\" class=\"btn\">Show PNG preview</button>
 <button type=\"button\" id=\"show-mrc\" class=\"btn\">Show MRC for selected image</button>
 <button type=\"button\" id=\"zoom-out\" class=\"btn\">Zoom -</button>
 <button type=\"button\" id=\"zoom-in\" class=\"btn\">Zoom +</button>
@@ -1453,6 +1590,9 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <li>1-5: set rating</li>
 <li>Ctrl/Cmd+Enter: submit current GridSquare</li>
 </ul>
+<div class=\"section-title\">Collection</div>
+<div class=\"actions\"><button type=\"button\" id=\"review-suitable\" class=\"btn collection-choice suitable\">Mark suitable for collection</button><button type=\"button\" id=\"review-unsuitable\" class=\"btn collection-choice unsuitable\">Mark unsuitable for collection</button><button type=\"button\" id=\"review-clear-collection\" class=\"btn\">Clear</button></div>
+<div class=\"note\">The collection decision is saved immediately and included in structured exports and PDF summaries.</div>
 <div class=\"section-title\">Report</div>
 <label class=\"note\"><input type=\"checkbox\" id=\"include-report\" checked> Include this GridSquare in the final report</label>
 <div class=\"note\">Clear this to leave the GridSquare out of the PDF.</div>
@@ -1478,9 +1618,11 @@ const SESSION_STORAGE_KEY = {json.dumps(session_storage_key)};
 const STORAGE_KEY = 'review_state_' + SESSION_STORAGE_KEY + '_' + IDX;
 const LAST_IDX_KEY = 'last_idx_' + SESSION_STORAGE_KEY;
 const HOTKEYS_KEY = 'hotkeys_enabled_' + SESSION_STORAGE_KEY;
+const FOIL_HOVER_MARKERS = {foil_hover_markers_json};
 localStorage.setItem(LAST_IDX_KEY, IDX);
 const commentEl = document.getElementById('comment');
 const includeEl = document.getElementById('include-report');
+let collectionStatus = '';
 const hotkeysEl = document.getElementById('hotkeys-enabled');
 const autosaveEl = document.getElementById('autosave-state');
 let rating = 3;
@@ -1521,7 +1663,7 @@ async function submitReview(){{
     persistTimer = null;
   }}
   try {{
-    const payload = {{idx: IDX, rating: rating, comment: document.getElementById('comment').value, include: document.getElementById('include-report').checked}};
+    const payload = {{idx: IDX, rating: rating, comment: document.getElementById('comment').value, include: document.getElementById('include-report').checked, collection_status: collectionStatus, collect: collectionStatus === 'suitable'}};
     const res = await fetch('/submit', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(payload)}});
     const text = await res.text();
     if (!res.ok) {{
@@ -1550,10 +1692,7 @@ Array.from(document.querySelectorAll('.rate')).forEach(b=>{{ b.onclick = () => s
 document.getElementById('skip').onclick = () => {{ rating = 0; submitReview(); }};
 setRating(3);
 function jpgUrl(kind,name){{
-  if (kind === 'grid') return '/grid?idx=' + IDX + '&t=' + Date.now();
-  if (kind === 'atlas') return '/atlas?idx=' + IDX + '&t=' + Date.now();
-  if (kind === 'foil') return '/foil?idx=' + IDX + '&name=' + encodeURIComponent(name) + '&t=' + Date.now();
-  return '/data?idx=' + IDX + '&name=' + encodeURIComponent(name) + '&t=' + Date.now();
+  return '/preview.png?idx=' + IDX + '&kind=' + kind + (name ? '&name=' + encodeURIComponent(name) : '') + '&size=1600&t=' + Date.now();
 }}
 function mrcUrl(){{
   const low = document.getElementById('low').value;
@@ -1645,6 +1784,52 @@ function selectImage(kind,name,hasMrc){{
 }}
 Array.from(document.querySelectorAll('.thumb')).forEach(t=>{{
   t.onclick = () => selectImage(t.dataset.kind, t.dataset.name, t.dataset.hasMrc === '1');
+}});
+const holeHoverPreview = document.getElementById('hole-hover-preview');
+const holeHoverImage = document.getElementById('hole-hover-image');
+const holeHoverLabel = document.getElementById('hole-hover-label');
+function positionHolePreview(event){{
+  if (!holeHoverPreview) return;
+  const gap = 16;
+  const width = 250;
+  const height = 282;
+  let left = event.clientX + gap;
+  let top = event.clientY + gap;
+  if (left + width > window.innerWidth - 8) left = event.clientX - width - gap;
+  if (top + height > window.innerHeight - 8) top = window.innerHeight - height - 8;
+  holeHoverPreview.style.left = Math.max(8, left) + 'px';
+  holeHoverPreview.style.top = Math.max(8, top) + 'px';
+}}
+function showHolePreview(src,label,event){{
+  if (!src || !holeHoverPreview) return;
+  holeHoverImage.src = src;
+  holeHoverLabel.textContent = label || 'Data image preview';
+  holeHoverPreview.classList.add('visible');
+  positionHolePreview(event);
+}}
+function hideHolePreview(){{if (holeHoverPreview) holeHoverPreview.classList.remove('visible');}}
+function bindHoleHover(element,src,label){{
+  if (!element || !src) return;
+  element.addEventListener('pointerenter',event=>showHolePreview(src,label,event));
+  element.addEventListener('pointermove',positionHolePreview);
+  element.addEventListener('pointerleave',hideHolePreview);
+}}
+const foilHoverLayer = document.getElementById('foil-hover-layer');
+if (foilHoverLayer){{
+  FOIL_HOVER_MARKERS.filter(marker=>marker.preview).forEach(marker=>{{
+    const hotspot = document.createElement('button');
+    hotspot.type = 'button';
+    hotspot.className = 'foil-hit';
+    hotspot.style.left = marker.x + '%';
+    hotspot.style.top = marker.y + '%';
+    hotspot.setAttribute('aria-label','Preview Data image for FoilHole ' + marker.foil_id);
+    bindHoleHover(hotspot,marker.preview,'FoilHole ' + marker.foil_id + ' · Data preview');
+    hotspot.onclick = ()=>selectImage('data',marker.data_name,Boolean(marker.data_has_mrc));
+    foilHoverLayer.appendChild(hotspot);
+  }});
+}}
+document.querySelectorAll('.foil-thumb[data-hover-preview]').forEach(thumb=>{{
+  bindHoleHover(thumb,thumb.dataset.hoverPreview,thumb.dataset.hoverLabel);
 }});
 const viewerImg = document.getElementById('gridimg');
 viewerImg.onclick = (e) => {{
@@ -1742,6 +1927,8 @@ function persistState(){{
     rating,
     comment: commentEl.value,
     include: includeEl.checked,
+    collection_status: collectionStatus,
+    collect: collectionStatus === 'suitable',
     updated_at: nowTs
   }};
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
@@ -1766,6 +1953,8 @@ async function saveDraftToServer(){{
       rating,
       comment: commentEl.value,
       include: includeEl.checked,
+      collection_status: collectionStatus,
+      collect: collectionStatus === 'suitable',
       updated_at: Date.now() / 1000.0
     }};
     const res = await fetch('/draft', {{
@@ -1803,6 +1992,8 @@ function applyState(data){{
   if (!data || typeof data !== 'object') return;
   if (typeof data.comment === 'string') commentEl.value = data.comment;
   if (typeof data.include === 'boolean') includeEl.checked = data.include;
+  if (typeof data.collection_status === 'string') setReviewCollectionStatus(data.collection_status, false);
+  else if (data.collect === true) setReviewCollectionStatus('suitable', false);
   if (typeof data.rating === 'number' && data.rating >= 1 && data.rating <= 5) setRating(data.rating);
 }}
 function restoreLocalState(){{
@@ -1852,6 +2043,15 @@ initHotkeysSetting();
 }})();
 commentEl.addEventListener('input', persistState);
 includeEl.addEventListener('change', persistState);
+function setReviewCollectionStatus(status, save=true){{
+  collectionStatus = status === 'suitable' || status === 'unsuitable' ? status : '';
+  document.getElementById('review-suitable').classList.toggle('active', collectionStatus === 'suitable');
+  document.getElementById('review-unsuitable').classList.toggle('active', collectionStatus === 'unsuitable');
+  if (save) persistState();
+}}
+document.getElementById('review-suitable').onclick = () => setReviewCollectionStatus('suitable');
+document.getElementById('review-unsuitable').onclick = () => setReviewCollectionStatus('unsuitable');
+document.getElementById('review-clear-collection').onclick = () => setReviewCollectionStatus('');
 document.getElementById('low').oninput = updateContrast;
 document.getElementById('high').oninput = updateContrast;
 updateButtons();
@@ -1898,6 +2098,7 @@ setInterval(refreshStatus, 5000);
         reviewed_count = sum(1 for entry in grid_summaries if entry["reviewed"])
         mapped_count = sum(1 for entry in grid_summaries if entry["position"])
         image_count = sum(1 + entry["foil_count"] + entry["data_count"] for entry in grid_summaries)
+        atlas_source_text = atlas_preview_path.name if atlas_preview_path else "No atlas selected"
         root_html = """<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper dashboard</title>
 <style>
 :root{color-scheme:light;--ink:#172033;--muted:#68758b;--line:#dfe5ee;--soft:#f4f7fb;--panel:#fff;--nav:#101a2f;--nav-muted:#aeb9cc;--brand:#5eead4;--accent:#2563eb;--accent-dark:#1d4ed8;--good:#0f9f74;--warn:#b45309;--shadow:0 10px 30px rgba(26,39,67,.08);}
@@ -1905,44 +2106,119 @@ setInterval(refreshStatus, 5000);
 .sidebar{position:sticky;top:0;height:100vh;background:var(--nav);color:#fff;padding:24px 18px;display:flex;flex-direction:column;z-index:5}.brand{display:flex;align-items:center;gap:11px;font-size:17px;font-weight:750;letter-spacing:-.02em;margin:0 8px 28px}.brand-mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(145deg,#5eead4,#3b82f6);display:grid;place-items:center;color:#10213b;font-weight:900}.nav-label{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#71809a;margin:15px 10px 7px}.nav-item{display:flex;align-items:center;gap:10px;color:var(--nav-muted);text-decoration:none;padding:10px;border-radius:9px;font-size:13px;margin:2px 0}.nav-item.active{background:#1c2943;color:#fff}.nav-dot{width:7px;height:7px;border-radius:50%;background:#53617a}.nav-item.active .nav-dot{background:var(--brand);box-shadow:0 0 0 4px rgba(94,234,212,.12)}.session-health{margin-top:auto;border-top:1px solid #27344d;padding:16px 8px 0}.health-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--nav-muted)}.health-light{width:8px;height:8px;border-radius:50%;background:#f59e0b}.health-light.ok{background:#34d399}.health-light.err{background:#fb7185}.session-name{font-size:11px;color:#76859e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:8px}
 .main{min-width:0}.topbar{height:70px;background:rgba(255,255,255,.94);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 30px;position:sticky;top:0;z-index:4;backdrop-filter:blur(10px)}.top-title{font-size:17px;font-weight:700;letter-spacing:-.015em}.top-subtitle{font-size:12px;color:var(--muted);margin-top:3px}.top-actions{display:flex;gap:9px}.button{border:1px solid #cfd7e4;background:#fff;color:#314059;border-radius:9px;padding:9px 13px;font-size:12px;font-weight:650;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px}.button:hover{border-color:#aeb9ca;background:#f9fbfd}.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.button.primary:hover{background:var(--accent-dark)}
 .content{padding:24px 30px 40px;max-width:1800px;margin:0 auto}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 16px;display:flex;align-items:baseline;justify-content:space-between}.stat-value{font-size:22px;font-weight:750;letter-spacing:-.04em}.stat-label{font-size:11px;color:var(--muted);font-weight:650}.workspace{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(350px,.75fr);gap:16px;align-items:start}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 1px 2px rgba(24,36,60,.03);overflow:hidden}.panel-head{min-height:57px;padding:13px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.panel-title{font-size:13px;font-weight:750}.panel-note{font-size:11px;color:var(--muted);margin-top:3px}.segmented{display:flex;padding:3px;background:#eef2f7;border-radius:9px}.segmented button{border:0;background:transparent;color:#66748a;border-radius:7px;padding:7px 9px;font-size:11px;font-weight:650;cursor:pointer}.segmented button.active{background:#fff;color:#1c2940;box-shadow:0 1px 3px rgba(18,31,53,.12)}
-.atlas-viewport{height:clamp(500px,62vh,760px);background:#111827;overflow:hidden;position:relative;touch-action:none;cursor:grab}.atlas-viewport.dragging{cursor:grabbing}.atlas-content{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}.atlas-image-wrap{position:relative;display:inline-block;line-height:0;max-width:100%;max-height:100%}.atlas-image{display:block;max-width:100%;max-height:clamp(500px,62vh,760px);width:auto;height:auto;user-select:none;-webkit-user-drag:none}.marker-layer{position:absolute;inset:0;pointer-events:none}.grid-marker{position:absolute;width:28px;height:28px;transform:translate(-50%,-50%);border-radius:50%;border:2px solid rgba(255,255,255,.9);background:#2563eb;color:#fff;font-size:10px;font-weight:800;line-height:1;cursor:pointer;pointer-events:auto;box-shadow:0 3px 10px rgba(0,0,0,.4);transition:transform .12s,background .12s}.grid-marker:hover,.grid-marker.active{transform:translate(-50%,-50%) scale(1.18);background:#0f9f74;z-index:2}.grid-marker.reviewed{background:#0f9f74}.grid-marker.excluded{background:#64748b}.atlas-empty{height:100%;display:grid;place-items:center;color:#cbd5e1;text-align:center;padding:30px}.atlas-tools{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:5px;background:rgba(13,22,38,.86);padding:5px;border-radius:9px;color:#d8e0ec}.atlas-tools button{width:31px;height:31px;border:0;border-radius:7px;background:transparent;color:#fff;font-size:16px;cursor:pointer}.atlas-tools button:hover{background:rgba(255,255,255,.12)}.atlas-zoom{font-size:10px;min-width:40px;text-align:center}.atlas-help{position:absolute;left:12px;bottom:12px;background:rgba(13,22,38,.78);color:#d8e0ec;font-size:10px;padding:7px 9px;border-radius:7px;pointer-events:none}
+.atlas-viewport{height:clamp(500px,62vh,760px);background:#111827;overflow:hidden;position:relative;touch-action:none;cursor:grab}.atlas-viewport.dragging{cursor:grabbing}.atlas-content{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}.atlas-image-wrap{position:relative;display:inline-block;line-height:0;max-width:100%;max-height:100%}.atlas-image{display:block;max-width:100%;max-height:clamp(500px,62vh,760px);width:auto;height:auto;user-select:none;-webkit-user-drag:none}.marker-layer{position:absolute;inset:0;pointer-events:none}.grid-marker{position:absolute;width:28px;height:28px;transform:translate(-50%,-50%);border-radius:50%;border:2px solid rgba(255,255,255,.9);background:#2563eb;color:#fff;font-size:10px;font-weight:800;line-height:1;cursor:pointer;pointer-events:auto;box-shadow:0 3px 10px rgba(0,0,0,.4);transition:transform .12s,background .12s}.grid-marker:hover,.grid-marker.active{transform:translate(-50%,-50%) scale(1.18);background:#0f9f74;z-index:2}.grid-marker.reviewed{background:#0f9f74}.grid-marker.excluded{background:#64748b}.grid-marker.collection{background:#d97706;box-shadow:0 0 0 4px rgba(245,158,11,.3),0 3px 10px rgba(0,0,0,.4)}.atlas-empty{height:100%;display:grid;place-items:center;color:#cbd5e1;text-align:center;padding:30px}.atlas-tools{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:5px;background:rgba(13,22,38,.86);padding:5px;border-radius:9px;color:#d8e0ec}.atlas-tools button{width:31px;height:31px;border:0;border-radius:7px;background:transparent;color:#fff;font-size:16px;cursor:pointer}.atlas-tools button:hover{background:rgba(255,255,255,.12)}.atlas-zoom{font-size:10px;min-width:40px;text-align:center}.atlas-help{position:absolute;left:12px;bottom:12px;background:rgba(13,22,38,.78);color:#d8e0ec;font-size:10px;padding:7px 9px;border-radius:7px;pointer-events:none}
 .inspector{min-height:620px}.inspector-empty{min-height:520px;display:grid;place-items:center;text-align:center;color:var(--muted);padding:42px}.empty-target{width:48px;height:48px;border-radius:50%;border:1px dashed #9cabc0;margin:0 auto 12px;display:grid;place-items:center;color:#789}.inspector-body{display:none}.inspector-body.visible{display:block}.selected-summary{padding:15px 16px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.selected-title{font-size:17px;font-weight:760;letter-spacing:-.025em}.selected-file{font-size:10px;color:var(--muted);margin-top:4px;max-width:270px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}.badge{font-size:10px;font-weight:650;color:#4f5f76;background:#edf2f7;padding:4px 7px;border-radius:999px}.inspector-gallery{padding:12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;max-height:540px;overflow:auto}.gallery-item{border:1px solid var(--line);background:#fff;border-radius:10px;overflow:hidden;padding:0;cursor:pointer;text-align:left;color:var(--ink)}.gallery-item:hover{border-color:#94a3b8}.gallery-item img{width:100%;aspect-ratio:1/1;object-fit:contain;background:#101827;display:block}.gallery-caption{padding:8px;font-size:10px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gallery-meta{padding:0 8px 8px;color:var(--muted);font-size:9px;line-height:1.35}.inspector-actions{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px}.inspector-actions .button{flex:1}
-.browser-panel{margin-top:16px}.browser-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.search{width:230px;border:1px solid #d3dbe7;border-radius:8px;padding:8px 10px;font-size:11px;outline:none}.search:focus{border-color:#5b8def;box-shadow:0 0 0 3px rgba(37,99,235,.08)}.grid-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:9px;padding:12px;max-height:300px;overflow:auto}.grid-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px;display:flex;align-items:center;gap:9px;cursor:pointer;text-align:left;color:var(--ink)}.grid-card:hover,.grid-card.active{border-color:#6b93e7;background:#f7faff}.grid-card-index{width:29px;height:29px;flex:0 0 auto;border-radius:8px;background:#eaf0fb;color:#2856ad;display:grid;place-items:center;font-size:10px;font-weight:800}.grid-card.reviewed .grid-card-index{background:#daf5ec;color:#08765a}.grid-card-title{font-size:11px;font-weight:700}.grid-card-meta{font-size:9px;color:var(--muted);margin-top:3px}.preflight-pop{display:none;margin:0 30px 16px;padding:10px 13px;border:1px solid #f1d19b;background:#fff9ed;color:#85530d;border-radius:10px;font-size:11px}.preflight-pop.show{display:block}.preflight-pop.err{border-color:#f3b8c1;background:#fff4f5;color:#9f1239}
+.workspace{display:flex;flex-direction:column;gap:16px}.inspector{min-height:0}.inspector-empty{min-height:260px}.selected-detail-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(320px,.65fr);gap:16px;padding:16px}.selected-media-card,.review-controls,.comparison-panel{border:1px solid var(--line);border-radius:12px;background:#fbfcfe;padding:12px}.selected-grid-image{display:block;width:100%;max-height:760px;object-fit:contain;background:#101827;border-radius:10px}.media-actions{display:flex;gap:8px;margin-top:10px}.selected-overlay-wrap{position:relative;margin:14px auto 0;width:min(100%,760px);line-height:0}.selected-overlay-image{display:block;width:100%;height:auto;background:#101827;border-radius:10px}.dashboard-hole-layer{position:absolute;inset:0;pointer-events:none}.dashboard-hole-hit{position:absolute;width:34px;height:34px;transform:translate(-50%,-50%);border:2px solid rgba(255,255,255,.28);border-radius:50%;background:rgba(37,99,235,.04);pointer-events:auto;cursor:crosshair}.dashboard-hole-hit:hover,.dashboard-hole-hit.active{border-color:#5eead4;background:rgba(94,234,212,.25);box-shadow:0 0 0 4px rgba(15,23,42,.42)}.review-controls{align-self:start;position:sticky;top:88px}.control-title{font-size:12px;font-weight:750;margin:14px 0 7px}.dashboard-ratings,.collection-decisions{display:flex;gap:7px;flex-wrap:wrap}.dashboard-rating{width:39px;height:36px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;cursor:pointer}.dashboard-rating.active{background:#2563eb;color:#fff;border-color:#2563eb}.collection-decision.suitable.active{background:#dcfce7;color:#08765a;border-color:#34d399}.collection-decision.unsuitable.active{background:#ffe4e6;color:#9f1239;border-color:#fb7185}.dashboard-comment{width:100%;min-height:120px;border:1px solid #cbd5e1;border-radius:9px;padding:9px;resize:vertical}.save-state{font-size:11px;color:var(--muted);min-height:18px;margin-top:8px}.hole-comparison{display:none;padding:0 16px 16px}.hole-comparison.visible{display:block}.comparison-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.comparison-panel img{display:block;width:100%;height:clamp(360px,44vw,680px);object-fit:contain;background:#101827;border-radius:9px}.comparison-label{font-size:12px;font-weight:750;margin-bottom:8px}.comparison-meta{font-size:10px;color:var(--muted);margin-top:7px}.grid-marker.unsuitable{background:#dc2626}.grid-card.unsuitable .grid-card-index{background:#ffe4e6;color:#9f1239}
+.browser-panel{margin-top:16px}.browser-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.search{width:230px;border:1px solid #d3dbe7;border-radius:8px;padding:8px 10px;font-size:11px;outline:none}.search:focus{border-color:#5b8def;box-shadow:0 0 0 3px rgba(37,99,235,.08)}.grid-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:9px;padding:12px;max-height:300px;overflow:auto}.grid-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px;display:flex;align-items:center;gap:9px;cursor:pointer;text-align:left;color:var(--ink)}.grid-card:hover,.grid-card.active{border-color:#6b93e7;background:#f7faff}.grid-card-index{width:29px;height:29px;flex:0 0 auto;border-radius:8px;background:#eaf0fb;color:#2856ad;display:grid;place-items:center;font-size:10px;font-weight:800}.grid-card.reviewed .grid-card-index{background:#daf5ec;color:#08765a}.grid-card.collection .grid-card-index{background:#fff0d5;color:#a84f05}.grid-card-title{font-size:11px;font-weight:700}.grid-card-meta{font-size:9px;color:var(--muted);margin-top:3px}.button.collection.active{border-color:#d97706;background:#fff7e8;color:#9a4b08}.preflight-pop{display:none;margin:0 30px 16px;padding:10px 13px;border:1px solid #f1d19b;background:#fff9ed;color:#85530d;border-radius:10px;font-size:11px}.preflight-pop.show{display:block}.preflight-pop.err{border-color:#f3b8c1;background:#fff4f5;color:#9f1239}
 .lightbox{position:fixed;inset:0;background:rgba(5,10,20,.88);z-index:20;display:none;align-items:center;justify-content:center;padding:30px}.lightbox.open{display:flex}.lightbox img{max-width:92vw;max-height:88vh;object-fit:contain}.lightbox-close{position:absolute;right:22px;top:18px;border:0;background:rgba(255,255,255,.12);color:#fff;border-radius:8px;width:38px;height:38px;font-size:20px;cursor:pointer}
-@media(max-width:1100px){.shell{grid-template-columns:76px minmax(0,1fr)}.sidebar{padding:22px 12px}.brand{margin:0 auto 28px}.brand span:last-child,.nav-item span:last-child,.nav-label,.session-health{display:none}.nav-item{justify-content:center}.workspace{grid-template-columns:1fr}.inspector{min-height:0}.inspector-empty{min-height:220px}.inspector-gallery{max-height:none;grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:720px){.shell{display:block}.sidebar{display:none}.topbar{padding:0 15px}.content{padding:15px}.stats{grid-template-columns:1fr}.top-subtitle{display:none}.workspace{display:block}.inspector{margin-top:12px}.atlas-viewport{height:56vh}.atlas-image{max-height:56vh}.inspector-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.browser-head{align-items:stretch;flex-direction:column}.search{width:100%}}
+.grid-hover-preview{position:fixed;display:none;z-index:15;width:min(560px,calc(100vw - 24px));padding:9px;background:#fff;border:1px solid #cfd8e6;border-radius:14px;box-shadow:0 18px 45px rgba(7,15,30,.34);pointer-events:none}.grid-hover-preview.visible{display:block}.grid-hover-preview img{display:block;width:542px;max-width:100%;height:min(542px,calc(100vh - 100px));object-fit:contain;background:#101827;border-radius:9px}.grid-hover-caption{padding:8px 3px 2px;font-size:12px;font-weight:750;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:1100px){.shell{grid-template-columns:76px minmax(0,1fr)}.sidebar{padding:22px 12px}.brand{margin:0 auto 28px}.brand span:last-child,.nav-item span:last-child,.nav-label,.session-health{display:none}.nav-item{justify-content:center}.selected-detail-layout{grid-template-columns:1fr}.review-controls{position:static}.inspector{min-height:0}.inspector-empty{min-height:220px}.inspector-gallery{max-height:none;grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.shell{display:block}.sidebar{display:none}.topbar{padding:0 15px}.content{padding:15px}.stats{grid-template-columns:1fr}.top-subtitle{display:none}.workspace{display:block}.inspector{margin-top:12px}.atlas-viewport{height:56vh}.atlas-image{max-height:56vh}.selected-detail-layout{padding:10px}.comparison-grid{grid-template-columns:1fr}.comparison-panel img{height:70vw}.inspector-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.browser-head{align-items:stretch;flex-direction:column}.search{width:100%}}
 </style></head><body>
 <div class="shell"><aside class="sidebar"><div class="brand"><span class="brand-mark">E</span><span>EPU Mapper</span></div><div class="nav-label">Workspace</div><a class="nav-item active" href="/"><span class="nav-dot"></span><span>Atlas overview</span></a><a class="nav-item" href="/review/0"><span class="nav-dot"></span><span>Systematic review</span></a><a class="nav-item" href="/done"><span class="nav-dot"></span><span>Reports & export</span></a><div class="session-health"><div class="health-row"><span id="health-light" class="health-light"></span><span id="health-text">Checking session</span></div><div class="session-name">__SESSION_PATH__</div></div></aside>
-<main class="main"><header class="topbar"><div><div class="top-title">Screening dashboard</div><div class="top-subtitle">Select a screened square on the atlas to inspect every associated image</div></div><div class="top-actions"><a class="button" id="resume-btn" style="display:none" href="#">Resume</a><a class="button primary" href="/review/0">Start systematic review</a></div></header><div id="preflight" class="preflight-pop"></div>
+<main class="main"><header class="topbar"><div><div class="top-title">Screening dashboard</div><div class="top-subtitle">Hover to preview; click a square to review it in the workspace below</div></div><div class="top-actions"><a class="button" href="/done">Reports & export</a></div></header><div id="preflight" class="preflight-pop"></div>
 <div class="content"><section class="stats"><div class="stat"><span><span class="stat-value">__TOTAL__</span></span><span class="stat-label">Screened GridSquares</span></div><div class="stat"><span class="stat-value">__REVIEWED__</span><span class="stat-label">Reviewed</span></div><div class="stat"><span class="stat-value">__IMAGES__</span><span class="stat-label">Associated images</span></div></section>
-<section class="workspace"><div class="panel"><div class="panel-head"><div><div class="panel-title">Interactive grid atlas</div><div class="panel-note">__MAPPED__ mapped squares · high-resolution source when Atlas.mrc is available</div></div>__ATLAS_MODES__</div><div id="atlas-viewport" class="atlas-viewport"><div id="atlas-content" class="atlas-content">__ATLAS_CONTENT__</div>__ATLAS_AUX__</div></div>
-<aside class="panel inspector"><div class="panel-head"><div><div class="panel-title">GridSquare images</div><div class="panel-note">GridSquare, overlay, FoilHole and data images</div></div></div><div id="inspector-empty" class="inspector-empty"><div><div class="empty-target">＋</div><div>Select a numbered atlas marker<br>or a GridSquare below</div></div></div><div id="inspector-body" class="inspector-body"><div class="selected-summary"><div><div id="selected-title" class="selected-title"></div><div id="selected-file" class="selected-file"></div><div id="selected-badges" class="badges"></div></div></div><div id="inspector-gallery" class="inspector-gallery"></div><div class="inspector-actions"><a id="review-selected" class="button primary" href="#">Review this square</a></div></div></aside></section>
+<section class="workspace"><div class="panel"><div class="panel-head"><div><div class="panel-title">Interactive grid atlas</div><div class="panel-note">__MAPPED__ mapped squares · source: __ATLAS_SOURCE__ · fast PNG by default · load MRC only on request</div></div>__ATLAS_MODES__</div><div id="atlas-viewport" class="atlas-viewport"><div id="atlas-content" class="atlas-content">__ATLAS_CONTENT__</div>__ATLAS_AUX__</div></div>
+<aside id="selected-detail" class="panel inspector"><div class="panel-head"><div><div class="panel-title">Selected GridSquare review</div><div class="panel-note">PNG previews load by default; MRC is loaded only when requested</div></div></div><div id="inspector-empty" class="inspector-empty"><div><div class="empty-target">＋</div><div>Select a numbered atlas marker<br>or a GridSquare below</div></div></div><div id="inspector-body" class="inspector-body"><div class="selected-summary"><div><div id="selected-title" class="selected-title"></div><div id="selected-file" class="selected-file"></div><div id="selected-badges" class="badges"></div></div></div><div class="selected-detail-layout"><div class="selected-media-card"><div class="panel-title">GridSquare</div><img id="selected-grid-image" class="selected-grid-image" alt="Selected GridSquare"><div class="media-actions"><button id="selected-grid-png" type="button" class="button active">PNG preview</button><button id="selected-grid-mrc" type="button" class="button">Load GridSquare MRC</button></div><div id="selected-overlay-wrap" class="selected-overlay-wrap"><img id="selected-overlay-image" class="selected-overlay-image" alt="Screened FoilHole overlay"><div id="dashboard-hole-layer" class="dashboard-hole-layer"></div></div><div id="overlay-note" class="panel-note">Hover a screened FoilHole to compare its FoilHole and Data images.</div></div><aside class="review-controls"><div class="panel-title">Review decision</div><div class="control-title">Rating</div><div id="dashboard-ratings" class="dashboard-ratings"><button type="button" class="dashboard-rating" data-rating="1">1</button><button type="button" class="dashboard-rating" data-rating="2">2</button><button type="button" class="dashboard-rating" data-rating="3">3</button><button type="button" class="dashboard-rating" data-rating="4">4</button><button type="button" class="dashboard-rating" data-rating="5">5</button></div><div class="control-title">Collection suitability</div><div class="collection-decisions"><button id="mark-suitable" type="button" class="button collection-decision suitable">Suitable for collection</button><button id="mark-unsuitable" type="button" class="button collection-decision unsuitable">Unsuitable for collection</button><button id="clear-collection" type="button" class="button collection-decision">Clear</button></div><div class="control-title">Comment</div><textarea id="dashboard-comment" class="dashboard-comment" placeholder="Add notes for this GridSquare…"></textarea><label class="panel-note"><input id="dashboard-include" type="checkbox" checked> Include in final report</label><div id="dashboard-save-state" class="save-state"></div></aside></div><section id="hole-comparison" class="hole-comparison"><div class="panel-head"><div><div id="hole-comparison-title" class="panel-title">FoilHole comparison</div><div class="panel-note">Large PNG previews; request MRC only when needed</div></div></div><div class="comparison-grid"><div class="comparison-panel"><div class="comparison-label">FoilHole image</div><img id="comparison-foil" alt="FoilHole preview"><div class="media-actions"><button id="comparison-foil-png" type="button" class="button">PNG</button><button id="comparison-foil-mrc" type="button" class="button">Load MRC</button></div></div><div class="comparison-panel"><div class="comparison-label">Data image</div><img id="comparison-data" alt="Data preview"><div id="comparison-meta" class="comparison-meta"></div><div class="media-actions"><button id="comparison-data-png" type="button" class="button">PNG</button><button id="comparison-data-mrc" type="button" class="button">Load MRC</button></div></div></div></section></div></aside></section>
 <section class="panel browser-panel"><div class="panel-head browser-head"><div><div class="panel-title">All screened GridSquares</div><div class="panel-note">Acquisition order</div></div><input id="grid-search" class="search" type="search" placeholder="Find GridSquare ID…" aria-label="Find GridSquare"></div><div id="grid-list" class="grid-list"></div></section></div></main></div>
 <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Image preview"><button type="button" id="lightbox-close" class="lightbox-close" aria-label="Close">×</button><img id="lightbox-image" alt="Selected microscopy image"></div>
+<div id="grid-hover-preview" class="grid-hover-preview" role="tooltip"><img id="grid-hover-image" alt="GridSquare preview"><div id="grid-hover-caption" class="grid-hover-caption"></div></div>
 <script>
-const GRIDS=__GRIDS_JSON__;const HAS_ATLAS=__HAS_ATLAS__;const SESSION_STORAGE_KEY=__SESSION_KEY__;const LAST_IDX_KEY='last_idx_'+SESSION_STORAGE_KEY;const atlasViewport=document.getElementById('atlas-viewport');const atlasContent=document.getElementById('atlas-content');const markerLayer=document.getElementById('marker-layer');let selectedIdx=null;let atlasScale=1,atlasX=0,atlasY=0,atlasDragging=false,atlasStartX=0,atlasStartY=0;
+const GRIDS=__GRIDS_JSON__;const HAS_ATLAS=__HAS_ATLAS__;const SESSION_STORAGE_KEY=__SESSION_KEY__;const CACHE_KEY=__CACHE_KEY__;const LAST_IDX_KEY='last_idx_'+SESSION_STORAGE_KEY;const atlasViewport=document.getElementById('atlas-viewport');const atlasContent=document.getElementById('atlas-content');const markerLayer=document.getElementById('marker-layer');let selectedIdx=null;let atlasScale=1,atlasX=0,atlasY=0,atlasDragging=false,atlasStartX=0,atlasStartY=0;
 function esc(value){return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
-function renderMarkers(){if(!markerLayer)return;markerLayer.innerHTML='';GRIDS.filter(g=>g.position).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-marker'+(g.reviewed?' reviewed':'')+(!g.include?' excluded':'');b.dataset.idx=g.idx;b.style.left=g.position.x+'%';b.style.top=g.position.y+'%';b.textContent=String(g.idx+1);b.title='GridSquare '+g.id;b.setAttribute('aria-label','Open GridSquare '+g.id);b.addEventListener('pointerdown',e=>e.stopPropagation());b.onclick=e=>{e.stopPropagation();selectGrid(g.idx)};markerLayer.appendChild(b)})}
-function renderGridList(filter=''){const list=document.getElementById('grid-list');const needle=filter.trim().toLowerCase();list.innerHTML='';GRIDS.filter(g=>!needle||g.id.toLowerCase().includes(needle)||g.name.toLowerCase().includes(needle)).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-card'+(g.reviewed?' reviewed':'')+(g.idx===selectedIdx?' active':'');b.dataset.idx=g.idx;b.innerHTML='<span class="grid-card-index">'+(g.idx+1)+'</span><span><span class="grid-card-title">GridSquare '+esc(g.id)+'</span><span class="grid-card-meta">'+g.foil_count+' foils · '+g.data_count+' data'+(g.reviewed?' · reviewed':'')+'</span></span>';b.onclick=()=>selectGrid(g.idx);list.appendChild(b)})}
-async function selectGrid(idx){selectedIdx=idx;document.querySelectorAll('.grid-marker,.grid-card').forEach(el=>el.classList.toggle('active',Number(el.dataset.idx)===idx));const empty=document.getElementById('inspector-empty'),body=document.getElementById('inspector-body'),gallery=document.getElementById('inspector-gallery');empty.style.display='none';body.classList.add('visible');gallery.innerHTML='<div class="panel-note">Loading images…</div>';try{const res=await fetch('/grid_details?idx='+idx);if(!res.ok)throw new Error('HTTP '+res.status);const data=await res.json();document.getElementById('selected-title').textContent='GridSquare '+data.id;document.getElementById('selected-file').textContent=data.name;document.getElementById('selected-badges').innerHTML='<span class="badge">EPU '+esc(data.category??'N/A')+'</span><span class="badge">'+data.foil_count+' foils</span><span class="badge">'+data.data_count+' data</span>';document.getElementById('review-selected').href=data.review_url;gallery.innerHTML='';data.images.forEach(img=>{const b=document.createElement('button');b.type='button';b.className='gallery-item';const meta=(img.meta||[]).slice(0,2).map(esc).join('<br>');b.innerHTML='<img loading="lazy" src="'+esc(img.thumb)+'" alt="'+esc(img.label)+'"><div class="gallery-caption">'+esc(img.label)+'</div>'+(meta?'<div class="gallery-meta">'+meta+'</div>':'');b.onclick=()=>openLightbox(img.src,img.label);gallery.appendChild(b)});renderGridList(document.getElementById('grid-search').value)}catch(err){gallery.innerHTML='<div class="panel-note">Images could not be loaded.</div>'}}
+const gridHoverPreview=document.getElementById('grid-hover-preview'),gridHoverImage=document.getElementById('grid-hover-image'),gridHoverCaption=document.getElementById('grid-hover-caption');let hoveredGridIdx=null;
+function positionGridHover(event){const gap=18,width=Math.min(560,window.innerWidth-24),height=Math.min(590,window.innerHeight-24);let left=event.clientX+gap,top=event.clientY+gap;if(left+width>window.innerWidth-8)left=event.clientX-width-gap;if(top+height>window.innerHeight-8)top=window.innerHeight-height-8;gridHoverPreview.style.left=Math.max(8,left)+'px';gridHoverPreview.style.top=Math.max(8,top)+'px'}
+function showGridHover(target,event){const idx=Number(target.dataset.idx),grid=GRIDS.find(entry=>entry.idx===idx);if(!grid)return;if(hoveredGridIdx!==idx){hoveredGridIdx=idx;gridHoverImage.src='/preview.png?idx='+idx+'&kind=grid&size=1100&session='+encodeURIComponent(CACHE_KEY);const decision=grid.collection_status==='suitable'?' · suitable':grid.collection_status==='unsuitable'?' · unsuitable':'';gridHoverCaption.textContent='GridSquare '+grid.id+decision}gridHoverPreview.classList.add('visible');positionGridHover(event)}
+function hideGridHover(){hoveredGridIdx=null;gridHoverPreview.classList.remove('visible')}
+document.addEventListener('pointerover',event=>{const target=event.target.closest('.grid-marker,.grid-card');if(!target||target.contains(event.relatedTarget))return;showGridHover(target,event)});
+document.addEventListener('pointermove',event=>{if(gridHoverPreview.classList.contains('visible'))positionGridHover(event)});
+document.addEventListener('pointerout',event=>{const target=event.target.closest('.grid-marker,.grid-card');if(target&&!target.contains(event.relatedTarget))hideGridHover()});
+document.addEventListener('pointerdown',hideGridHover);
+function renderMarkers(){if(!markerLayer)return;markerLayer.innerHTML='';GRIDS.filter(g=>g.position).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-marker'+(g.reviewed?' reviewed':'')+(!g.include?' excluded':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'');b.dataset.idx=g.idx;b.style.left=g.position.x+'%';b.style.top=g.position.y+'%';b.textContent=String(g.idx+1);const decision=g.collection_status==='suitable'?' · suitable for collection':g.collection_status==='unsuitable'?' · unsuitable for collection':'';b.title='GridSquare '+g.id+decision;b.setAttribute('aria-label','Open GridSquare '+g.id);b.addEventListener('pointerdown',e=>e.stopPropagation());b.onclick=e=>{e.stopPropagation();selectGrid(g.idx)};markerLayer.appendChild(b)})}
+function renderGridList(filter=''){const list=document.getElementById('grid-list');const needle=filter.trim().toLowerCase();list.innerHTML='';GRIDS.filter(g=>!needle||g.id.toLowerCase().includes(needle)||g.name.toLowerCase().includes(needle)).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-card'+(g.reviewed?' reviewed':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'')+(g.idx===selectedIdx?' active':'');b.dataset.idx=g.idx;const decision=g.collection_status==='suitable'?' · suitable':g.collection_status==='unsuitable'?' · unsuitable':'';b.innerHTML='<span class="grid-card-index">'+(g.idx+1)+'</span><span><span class="grid-card-title">GridSquare '+esc(g.id)+'</span><span class="grid-card-meta">'+g.foil_count+' foils · '+g.data_count+' data'+(g.reviewed?' · reviewed':'')+decision+'</span></span>';b.onclick=()=>selectGrid(g.idx);list.appendChild(b)})}
+let selectedGridData=null,dashboardSaveTimer=null,activeHole=null;
+function setDashboardRating(value,save=true){document.querySelectorAll('.dashboard-rating').forEach(button=>button.classList.toggle('active',Number(button.dataset.rating)===Number(value)));if(selectedGridData)selectedGridData.rating=Number(value)||0;if(save)queueDashboardSave()}
+function setDashboardCollectionStatus(status,save=true){if(selectedGridData){selectedGridData.collection_status=status;selectedGridData.collect=status==='suitable'}document.getElementById('mark-suitable').classList.toggle('active',status==='suitable');document.getElementById('mark-unsuitable').classList.toggle('active',status==='unsuitable');if(save)queueDashboardSave()}
+function queueDashboardSave(){if(selectedIdx===null||!selectedGridData)return;const state=document.getElementById('dashboard-save-state');state.textContent='Saving…';if(dashboardSaveTimer)clearTimeout(dashboardSaveTimer);dashboardSaveTimer=setTimeout(saveDashboardReview,450)}
+async function saveDashboardReview(){if(selectedIdx===null||!selectedGridData)return;const payload={idx:selectedIdx,rating:selectedGridData.rating||0,comment:document.getElementById('dashboard-comment').value,include:document.getElementById('dashboard-include').checked,collection_status:selectedGridData.collection_status||'',collect:selectedGridData.collection_status==='suitable'};const state=document.getElementById('dashboard-save-state');try{const response=await fetch('/review_state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!response.ok)throw new Error('HTTP '+response.status);const result=await response.json(),grid=GRIDS.find(entry=>entry.idx===selectedIdx);if(grid){grid.reviewed=true;grid.rating=payload.rating;grid.include=payload.include;grid.collect=payload.collect;grid.collection_status=payload.collection_status}state.textContent='Saved';renderMarkers();renderGridList(document.getElementById('grid-search').value)}catch(error){state.textContent='Save failed — retry after reconnecting'}}
+function pngUrl(kind,name,size=1400){return '/preview.png?idx='+selectedIdx+'&kind='+kind+(name?'&name='+encodeURIComponent(name):'')+'&size='+size+'&session='+encodeURIComponent(CACHE_KEY)}
+function mrcPreviewUrl(kind,name){return '/mrc_file?idx='+selectedIdx+'&kind='+kind+'&name='+encodeURIComponent(name||'')+'&low=2&high=98&t='+Date.now()}
+function positionDashboardHolePreview(hole){activeHole=hole;const section=document.getElementById('hole-comparison');section.classList.add('visible');document.getElementById('hole-comparison-title').textContent='FoilHole '+hole.foil_id+' comparison';document.getElementById('comparison-foil').src=hole.foil_preview;document.getElementById('comparison-data').src=hole.data_preview||'';document.getElementById('comparison-data').style.display=hole.data_preview?'block':'none';document.getElementById('comparison-meta').innerHTML=hole.data_preview?(hole.meta||[]).map(esc).join('<br>'):'No matching Data image';document.getElementById('comparison-foil-mrc').disabled=!hole.foil_has_mrc;document.getElementById('comparison-data-mrc').disabled=!hole.data_has_mrc}
+function renderDashboardHoles(holes){const layer=document.getElementById('dashboard-hole-layer');layer.innerHTML='';(holes||[]).forEach(hole=>{const button=document.createElement('button');button.type='button';button.className='dashboard-hole-hit';button.style.left=hole.x+'%';button.style.top=hole.y+'%';button.title='FoilHole '+hole.foil_id;button.setAttribute('aria-label','Preview FoilHole '+hole.foil_id);button.onpointerenter=()=>positionDashboardHolePreview(hole);button.onfocus=()=>positionDashboardHolePreview(hole);button.onclick=()=>positionDashboardHolePreview(hole);layer.appendChild(button)})}
+async function selectGrid(idx,scrollToReview=true){
+  if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null;await saveDashboardReview()}
+  selectedIdx=idx;activeHole=null;
+  document.querySelectorAll('.grid-marker,.grid-card').forEach(el=>el.classList.toggle('active',Number(el.dataset.idx)===idx));
+  const empty=document.getElementById('inspector-empty'),body=document.getElementById('inspector-body');
+  empty.style.display='none';body.classList.add('visible');
+  document.getElementById('dashboard-save-state').textContent='Loading…';
+  document.getElementById('hole-comparison').classList.remove('visible');
+  try{
+    const response=await fetch('/grid_details?idx='+idx);
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    if(idx!==selectedIdx)return;
+    const data=await response.json();selectedGridData=data;
+    const grid=GRIDS.find(entry=>entry.idx===idx);
+    if(grid){grid.collect=Boolean(data.collect);grid.collection_status=data.collection_status||''}
+    document.getElementById('selected-title').textContent='GridSquare '+data.id;
+    document.getElementById('selected-file').textContent=data.name;
+    const decision=data.collection_status==='suitable'?'<span class="badge">Suitable</span>':data.collection_status==='unsuitable'?'<span class="badge">Unsuitable</span>':'';
+    document.getElementById('selected-badges').innerHTML='<span class="badge">EPU '+esc(data.category??'N/A')+'</span><span class="badge">'+data.foil_count+' foils</span><span class="badge">'+data.data_count+' data</span>'+decision;
+    document.getElementById('selected-grid-image').src=data.grid_preview;
+    document.getElementById('selected-grid-mrc').disabled=!data.grid_has_mrc;
+    const overlayWrap=document.getElementById('selected-overlay-wrap'),overlayImage=document.getElementById('selected-overlay-image');
+    overlayWrap.style.display=data.overlay_preview?'block':'none';
+    if(data.overlay_preview)overlayImage.src=data.overlay_preview;
+    renderDashboardHoles(data.holes);setDashboardRating(data.rating||0,false);setDashboardCollectionStatus(data.collection_status||'',false);
+    document.getElementById('dashboard-comment').value=data.comment||'';
+    document.getElementById('dashboard-include').checked=data.include!==false;
+    document.getElementById('dashboard-save-state').textContent=data.reviewed?'Saved review loaded':'Not yet reviewed';
+    renderGridList(document.getElementById('grid-search').value);
+    if(scrollToReview)document.getElementById('selected-detail').scrollIntoView({behavior:'smooth',block:'start'});
+  }catch(error){document.getElementById('dashboard-save-state').textContent='GridSquare images could not be loaded'}
+}
 function openLightbox(src,label){const box=document.getElementById('lightbox');document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=label;box.classList.add('open')}
 function closeLightbox(){document.getElementById('lightbox').classList.remove('open');document.getElementById('lightbox-image').src=''}
 function applyAtlas(){atlasContent.style.transform='translate('+atlasX.toFixed(1)+'px,'+atlasY.toFixed(1)+'px) scale('+atlasScale.toFixed(3)+')';document.getElementById('atlas-zoom').textContent=Math.round(atlasScale*100)+'%'}
 function setAtlasScale(value,clientX=null,clientY=null){const next=Math.max(1,Math.min(8,value)),ratio=next/atlasScale;if(clientX!==null){const r=atlasViewport.getBoundingClientRect(),px=clientX-r.left-r.width/2,py=clientY-r.top-r.height/2;atlasX=px-(px-atlasX)*ratio;atlasY=py-(py-atlasY)*ratio}else{atlasX*=ratio;atlasY*=ratio}atlasScale=next;if(next===1){atlasX=0;atlasY=0}applyAtlas()}
 function resetAtlas(){atlasScale=1;atlasX=0;atlasY=0;applyAtlas()}
-if(HAS_ATLAS){renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.atlas-tools'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;img.src=b.dataset.mode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw';if(markerLayer)markerLayer.style.display=b.dataset.mode==='screened'?'block':'none';resetAtlas()})}
-renderGridList();document.getElementById('grid-search').addEventListener('input',e=>renderGridList(e.target.value));document.getElementById('lightbox-close').onclick=closeLightbox;document.getElementById('lightbox').onclick=e=>{if(e.target.id==='lightbox')closeLightbox()};document.addEventListener('keydown',e=>{if(e.key==='Escape')closeLightbox()});const lastIdx=localStorage.getItem(LAST_IDX_KEY);if(lastIdx!==null&&Number(lastIdx)>=0&&Number(lastIdx)<GRIDS.length){const resume=document.getElementById('resume-btn');resume.style.display='inline-flex';resume.href='/review/'+lastIdx}if(GRIDS.length)selectGrid(0);
+if(HAS_ATLAS){renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.atlas-tools'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;const mode=b.dataset.mode;img.src=(mode==='categories'?'/atlas_overview_categories':mode==='mrc'?'/atlas_overview_mrc':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=mode==='screened'?'block':'none';resetAtlas()})}
+renderGridList();
+document.getElementById('grid-search').addEventListener('input',event=>renderGridList(event.target.value));
+document.querySelectorAll('.dashboard-rating').forEach(button=>button.onclick=()=>setDashboardRating(button.dataset.rating));
+document.getElementById('mark-suitable').onclick=()=>setDashboardCollectionStatus('suitable');
+document.getElementById('mark-unsuitable').onclick=()=>setDashboardCollectionStatus('unsuitable');
+document.getElementById('mark-suitable').textContent='Mark suitable for collection';
+document.getElementById('mark-unsuitable').textContent='Mark unsuitable for collection';
+document.getElementById('clear-collection').onclick=()=>setDashboardCollectionStatus('');
+document.getElementById('dashboard-comment').addEventListener('input',queueDashboardSave);
+document.getElementById('dashboard-include').addEventListener('change',queueDashboardSave);
+document.getElementById('selected-grid-png').onclick=()=>{if(selectedGridData)document.getElementById('selected-grid-image').src=selectedGridData.grid_preview};
+document.getElementById('selected-grid-mrc').onclick=()=>{if(selectedGridData&&selectedGridData.grid_has_mrc)document.getElementById('selected-grid-image').src=mrcPreviewUrl('grid','')};
+document.getElementById('comparison-foil-png').onclick=()=>{if(activeHole)document.getElementById('comparison-foil').src=activeHole.foil_preview};
+document.getElementById('comparison-data-png').onclick=()=>{if(activeHole&&activeHole.data_preview)document.getElementById('comparison-data').src=activeHole.data_preview};
+document.getElementById('comparison-foil-mrc').onclick=()=>{if(activeHole&&activeHole.foil_has_mrc)document.getElementById('comparison-foil').src=mrcPreviewUrl('foil',activeHole.foil_name)};
+document.getElementById('comparison-data-mrc').onclick=()=>{if(activeHole&&activeHole.data_has_mrc)document.getElementById('comparison-data').src=mrcPreviewUrl('data',activeHole.data_name)};
+document.getElementById('lightbox-close').onclick=closeLightbox;
+document.getElementById('lightbox').onclick=event=>{if(event.target.id==='lightbox')closeLightbox()};
+document.addEventListener('keydown',event=>{if(event.key==='Escape')closeLightbox()});
+let serverWasDisconnected=false;
+function showServerDisconnected(message='The local EPU Mapper server is not responding. Return to the launcher and click Start review.'){serverWasDisconnected=true;const health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');health.className='health-light err';text.textContent='Server disconnected';box.className='preflight-pop show err';box.innerHTML='<strong>Dashboard disconnected:</strong> '+esc(message)}
+const dashboardAtlasImage=document.getElementById('atlas-image');if(dashboardAtlasImage)dashboardAtlasImage.addEventListener('error',()=>showServerDisconnected('The requested atlas image could not be loaded. If this tab was already open, restart the server in the launcher.'));
+async function monitorServer(){try{const response=await fetch('/status?t='+Date.now(),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);if(serverWasDisconnected)location.reload()}catch(_error){showServerDisconnected()}}
+monitorServer();setInterval(monitorServer,5000);
 fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data.level||'ok',health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');health.className='health-light '+(level==='ok'?'ok':level==='error'?'err':'');text.textContent=level==='ok'?'Session ready':level==='error'?'Session issue':'Ready with warnings';const rows=(data.errors||[]).concat(data.warnings||[]);if(rows.length){box.className='preflight-pop show'+(level==='error'?' err':'');box.innerHTML='<strong>'+(level==='error'?'Session issue':'Preflight note')+':</strong> '+rows.slice(0,3).map(esc).join(' · ')}}).catch(()=>{document.getElementById('health-text').textContent='Status unavailable'});
 </script></body></html>"""
         if atlas_preview_path:
             atlas_content = (
                 "<div class=\"atlas-image-wrap\"><img id=\"atlas-image\" class=\"atlas-image\" "
-                "src=\"/atlas_overview_raw\" alt=\"High-resolution grid atlas\"><div id=\"marker-layer\" class=\"marker-layer\"></div></div>"
+                f"src=\"/atlas_overview_raw?session={urllib.parse.quote(session_cache_key)}\" alt=\"Grid atlas\"><div id=\"marker-layer\" class=\"marker-layer\"></div></div>"
             )
             atlas_modes = (
                 "<div class=\"segmented\"><button type=\"button\" class=\"atlas-mode active\" data-mode=\"screened\">Screened</button>"
                 "<button type=\"button\" class=\"atlas-mode\" data-mode=\"categories\">EPU categories</button>"
-                "<button type=\"button\" class=\"atlas-mode\" data-mode=\"raw\">Raw</button></div>"
+                "<button type=\"button\" class=\"atlas-mode\" data-mode=\"raw\">PNG atlas</button>"
+                "<button type=\"button\" class=\"atlas-mode\" data-mode=\"mrc\">Load MRC</button></div>"
             )
             atlas_aux = (
                 "<div class=\"atlas-help\">Scroll to zoom · drag to pan · double-click to reset</div>"
@@ -1959,11 +2235,13 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         root_html = root_html.replace("__GRIDS_JSON__", safe_grids_json)
         root_html = root_html.replace("__HAS_ATLAS__", "true" if atlas_preview_path else "false")
         root_html = root_html.replace("__SESSION_KEY__", json.dumps(session_storage_key))
+        root_html = root_html.replace("__CACHE_KEY__", json.dumps(session_cache_key))
         root_html = root_html.replace("__SESSION_PATH__", str(base_dir).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         root_html = root_html.replace("__TOTAL__", str(len(grid_summaries)))
         root_html = root_html.replace("__REVIEWED__", str(reviewed_count))
         root_html = root_html.replace("__IMAGES__", str(image_count))
         root_html = root_html.replace("__MAPPED__", str(mapped_count))
+        root_html = root_html.replace("__ATLAS_SOURCE__", atlas_source_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         root_html = root_html.replace("__ATLAS_CONTENT__", atlas_content)
         root_html = root_html.replace("__ATLAS_MODES__", atlas_modes)
         root_html = root_html.replace("__ATLAS_AUX__", atlas_aux)
@@ -1980,6 +2258,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         if idx < 0 or idx >= len(items):
             raise HTTPException(status_code=404)
         item = items[idx]
+        response = _normalize_review_entry(responses.get(item["dir"].name, {}), default_include=True)
         images = [
             {
                 "kind": "grid",
@@ -2050,6 +2329,16 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 "category": item.get("epu_category_score"),
                 "foil_count": len(item["foils"]),
                 "data_count": len(item["data"]),
+                "collect": response["collect"],
+                "collection_status": response["collection_status"],
+                "rating": response["rating"],
+                "comment": response["comment"],
+                "include": response["include"],
+                "reviewed": response["reviewed"] if item["dir"].name in responses else False,
+                "grid_preview": f"/preview.png?idx={idx}&kind=grid&size=1800&session={session_cache_key}",
+                "grid_has_mrc": bool(item.get("mrc")),
+                "overlay_preview": f"/preview.png?idx={idx}&kind=overlay&size=1800&session={session_cache_key}" if item.get("overlay") else "",
+                "holes": _hole_preview_records(idx, item),
                 "review_url": f"/review/{idx}",
                 "images": images,
             }
@@ -2071,7 +2360,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
     def grid(idx: int):
         if idx < 0 or idx >= len(items):
             raise HTTPException(status_code=404)
-        return FileResponse(items[idx]["grid_img"], media_type="image/jpeg")
+        return FileResponse(items[idx]["grid_img"], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @app.get("/atlas")
     def atlas(idx: int):
@@ -2093,31 +2382,44 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 f"GridSquare {item['id']}",
             )
             if payload:
-                return Response(content=payload, media_type="image/png")
-        return FileResponse(atlas_path)
+                return Response(content=payload, media_type="image/png", headers={"Cache-Control": "no-store"})
+        return FileResponse(atlas_path, headers={"Cache-Control": "no-store"})
 
     @app.get("/atlas_overview_screened")
     def atlas_overview_screened():
         if atlas_screened_preview:
-            return Response(content=atlas_screened_preview, media_type="image/png")
+            return Response(content=atlas_screened_preview, media_type="image/png", headers={"Cache-Control": "no-store"})
         if atlas_preview_path and atlas_preview_path.is_file():
-            return FileResponse(atlas_preview_path)
+            return FileResponse(atlas_preview_path, headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
 
     @app.get("/atlas_overview_categories")
     def atlas_overview_categories():
         if atlas_category_preview:
-            return Response(content=atlas_category_preview, media_type="image/png")
+            return Response(content=atlas_category_preview, media_type="image/png", headers={"Cache-Control": "no-store"})
         if atlas_preview_path and atlas_preview_path.is_file():
-            return FileResponse(atlas_preview_path)
+            return FileResponse(atlas_preview_path, headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
 
     @app.get("/atlas_overview_raw")
     def atlas_overview_raw():
         if atlas_raw_preview:
-            return Response(content=atlas_raw_preview, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
+            return Response(content=atlas_raw_preview, media_type="image/png", headers={"Cache-Control": "no-store"})
         if atlas_preview_path and atlas_preview_path.is_file():
-            return FileResponse(atlas_preview_path)
+            return FileResponse(atlas_preview_path, headers={"Cache-Control": "no-store"})
+        raise HTTPException(status_code=404)
+
+    @app.get("/atlas_overview_mrc")
+    def atlas_overview_mrc():
+        nonlocal atlas_mrc_preview
+        if atlas_mrc_preview is None and atlas_preview_path and atlas_preview_path.is_file():
+            atlas_rgb = _open_atlas_rgb(atlas_preview_path, prefer_mrc=True)
+            if atlas_rgb is not None:
+                buf = io.BytesIO()
+                atlas_rgb.save(buf, format="PNG", compress_level=3)
+                atlas_mrc_preview = buf.getvalue()
+        if atlas_mrc_preview:
+            return Response(content=atlas_mrc_preview, media_type="image/png", headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
 
     @app.get("/overlay")
@@ -2127,7 +2429,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         overlay_path = items[idx].get("overlay")
         if not overlay_path or not overlay_path.is_file():
             raise HTTPException(status_code=404)
-        return FileResponse(overlay_path, media_type="image/png")
+        return FileResponse(overlay_path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @app.get("/thumb")
     def thumb(idx: int, kind: str, name: str = "", size: int = _THUMB_DEFAULT_SIZE):
@@ -2142,13 +2444,25 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             return FileResponse(cached, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
         return FileResponse(source, headers={"Cache-Control": "no-store"})
 
+    @app.get("/preview.png")
+    def png_preview(idx: int, kind: str, name: str = "", size: int = 1600):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        source = _resolve_media_path(items[idx], kind, name)
+        if source is None or not source.is_file():
+            raise HTTPException(status_code=404)
+        cached = _build_png_preview(source, size)
+        if cached and cached.is_file():
+            return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "no-store"})
+        raise HTTPException(status_code=404)
+
     @app.get("/data")
     def data(idx: int, name: str):
         if idx < 0 or idx >= len(items):
             raise HTTPException(status_code=404)
         for p in items[idx]["data"]:
             if p["path"].name == name and p["path"].is_file():
-                return FileResponse(p["path"])
+                return FileResponse(p["path"], headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
 
     @app.get("/foil")
@@ -2157,7 +2471,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             raise HTTPException(status_code=404)
         for p in items[idx]["foils"]:
             if p["path"].name == name and p["path"].is_file():
-                return FileResponse(p["path"])
+                return FileResponse(p["path"], headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
 
     @app.get("/mrc_file")
@@ -2220,8 +2534,47 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         with drafts_lock:
             entry = drafts.get(item_name)
             if not isinstance(entry, dict):
-                entry = None
+                entry = responses.get(item_name)
+        if isinstance(entry, dict):
+            entry = _normalize_review_entry(entry, default_include=True)
         return JSONResponse({"draft": entry})
+
+    @app.post("/collection")
+    async def set_collection(request: Request):
+        try:
+            payload = await request.json()
+            idx = int(payload.get("idx", -1))
+        except Exception:
+            return JSONResponse({"error": "invalid request"}, status_code=400)
+        if idx < 0 or idx >= len(items):
+            return JSONResponse({"error": "invalid idx"}, status_code=400)
+        name = _item_key(idx)
+        existing = responses.get(name)
+        if isinstance(existing, dict):
+            entry = _normalize_review_entry(existing, default_include=True)
+        else:
+            entry = _normalize_review_entry({}, default_include=True)
+            entry["reviewed"] = False
+        requested_status = str(payload.get("collection_status", "") or "").strip().lower()
+        if requested_status not in ("suitable", "unsuitable"):
+            requested_status = "suitable" if bool(payload.get("collect", False)) else ""
+        entry["collection_status"] = requested_status
+        entry["collect"] = requested_status == "suitable"
+        entry["updated_at"] = time.time()
+        responses[name] = entry
+        _save_responses(responses)
+        with drafts_lock:
+            draft_entry = drafts.get(name)
+            if isinstance(draft_entry, dict):
+                draft_entry = _normalize_review_entry(draft_entry, default_include=True)
+                draft_entry["collect"] = entry["collect"]
+                draft_entry["collection_status"] = entry["collection_status"]
+                draft_entry["updated_at"] = entry["updated_at"]
+                drafts[name] = draft_entry
+                _save_drafts(drafts)
+        return JSONResponse(
+            {"ok": True, "collect": entry["collect"], "collection_status": entry["collection_status"]}
+        )
 
     @app.post("/draft")
     async def save_draft(request: Request):
@@ -2259,8 +2612,18 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             rating = normalized["rating"]
             comment = normalized["comment"]
             include = normalized["include"]
+            collect = normalized["collect"]
+            collection_status = normalized["collection_status"]
             name = items[idx]["dir"].name
-            responses[name] = {"rating": rating, "comment": comment, "include": include}
+            responses[name] = {
+                "rating": rating,
+                "comment": comment,
+                "include": include,
+                "collect": collect,
+                "collection_status": collection_status,
+                "reviewed": True,
+                "updated_at": time.time(),
+            }
             _save_responses(responses)
             responses.update(_load_responses())
             with drafts_lock:
@@ -2273,6 +2636,26 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             return JSONResponse({"next": next_idx})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/review_state")
+    async def save_review_state(request: Request):
+        try:
+            payload = await request.json()
+            idx = int(payload.get("idx", -1))
+        except Exception:
+            return JSONResponse({"error": "invalid request"}, status_code=400)
+        if idx < 0 or idx >= len(items):
+            return JSONResponse({"error": "invalid idx"}, status_code=400)
+        normalized = _normalize_review_entry(payload, default_include=True)
+        normalized["reviewed"] = True
+        normalized["updated_at"] = time.time()
+        name = _item_key(idx)
+        responses[name] = normalized
+        _save_responses(responses)
+        with drafts_lock:
+            drafts.pop(name, None)
+            _save_drafts(drafts)
+        return JSONResponse({"ok": True, "review": normalized})
 
     @app.get("/summary")
     def summary():
@@ -2332,6 +2715,8 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             "gridsquare_dir",
             "gridsquare_image",
             "include",
+            "collect",
+            "collection_status",
             "rating",
             "comment",
             "foil_count",
@@ -2634,7 +3019,10 @@ def generate_details_report(
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
-    responses = {gdir.name: {"include": True, "rating": 0, "comment": ""} for _gid, gdir in grids}
+    responses = {
+        gdir.name: {"include": True, "collect": False, "collection_status": "", "rating": 0, "comment": ""}
+        for _gid, gdir in grids
+    }
     if details_output:
         target_path = details_output
     else:
