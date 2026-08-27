@@ -2351,6 +2351,7 @@ def _build_overview_page_image(
     responses: dict,
     atlas_overlay: bool = True,
     global_summary: str | None = None,
+    all_screened_images: bool = False,
 ) -> Image.Image:
     grids = _collect_grids(base_dir)
     if not grids:
@@ -2466,11 +2467,14 @@ def _build_overview_page_image(
     suitable_count = sum(1 for resp in responses.values() if _normalized_collection_status(resp) == "suitable")
     unsuitable_count = sum(1 for resp in responses.values() if _normalized_collection_status(resp) == "unsuitable")
     representative = _representative_suitable_grid(grids, responses)
-    representative_text = (
-        f"GridSquare {representative[1]} (rating {_normalized_rating(representative[3].get('rating')) or 0})"
-        if representative is not None
-        else "None - no included GridSquare is marked suitable"
-    )
+    if all_screened_images:
+        detail_scope_text = f"All {len(grids)} screened GridSquares"
+    else:
+        detail_scope_text = (
+            f"GridSquare {representative[1]} (rating {_normalized_rating(representative[3].get('rating')) or 0})"
+            if representative is not None
+            else "None - no included GridSquare is marked suitable"
+        )
     stats_lines = [
         f"Total GridSquares: {len(grids)}",
         f"Reviewed GridSquares: {reviewed_count}",
@@ -2478,7 +2482,7 @@ def _build_overview_page_image(
         f"Suitable for collection: {suitable_count}",
         f"Unsuitable for collection: {unsuitable_count}",
         f"Manual unscreened collection targets: {len(manual_targets)}",
-        f"Detailed screening page: {representative_text}",
+        f"Detailed screening scope: {detail_scope_text}",
     ]
     for text in stats_lines:
         draw.text((margin, stats_y), text, fill=0, font=fonts["body"])
@@ -2604,12 +2608,17 @@ def _append_selected_report_pages(
     include_summary_page: bool = True,
     skip_foil_processing: bool = False,
     representative_suitable_only: bool = False,
+    all_screened_images: bool = False,
 ) -> None:
     grids = _collect_grids(base_dir)
     if not grids:
         raise RuntimeError(f"no GridSquare directories found in {base_dir}")
     include_list = []
-    if representative_suitable_only:
+    if all_screened_images:
+        for idx, (gid, gdir) in enumerate(grids, start=1):
+            response = responses.get(gdir.name)
+            include_list.append((idx, gid, gdir, response if isinstance(response, dict) else {}))
+    elif representative_suitable_only:
         representative = _representative_suitable_grid(grids, responses)
         if representative is not None:
             include_list.append(representative)
@@ -2731,8 +2740,9 @@ def write_selected_report(
     atlas_overlay: bool = True,
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
+    all_screened_images: bool = False,
 ):
-    """Generate a detailed PDF with only the included GridSquares."""
+    """Generate a detailed PDF with included or, when requested, all screened GridSquares."""
     _ensure_pdf_fonts()
     pdf = pdf_canvas.Canvas(str(report_file))
     _append_selected_report_pages(
@@ -2745,6 +2755,7 @@ def write_selected_report(
         global_summary=global_summary,
         include_summary_page=True,
         skip_foil_processing=skip_foil_processing,
+        all_screened_images=all_screened_images,
     )
     pdf.save()
 
@@ -2758,8 +2769,9 @@ def write_combined_report(
     atlas_overlay: bool = True,
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
+    all_screened_images: bool = False,
 ):
-    """Generate one merged PDF: overview first, then included GridSquare details."""
+    """Generate a merged PDF with either one representative or every screened GridSquare."""
     _ensure_pdf_fonts()
     pdf = pdf_canvas.Canvas(str(report_file))
     overview_page = _build_overview_page_image(
@@ -2768,6 +2780,7 @@ def write_combined_report(
         responses,
         atlas_overlay=atlas_overlay,
         global_summary=global_summary,
+        all_screened_images=all_screened_images,
     )
     _append_pil_page(pdf, overview_page)
     _append_selected_report_pages(
@@ -2780,7 +2793,8 @@ def write_combined_report(
         global_summary=global_summary,
         include_summary_page=False,
         skip_foil_processing=skip_foil_processing,
-        representative_suitable_only=True,
+        representative_suitable_only=not all_screened_images,
+        all_screened_images=all_screened_images,
     )
     pdf.save()
 
@@ -2809,6 +2823,7 @@ def build_embedded_html_report(
     atlas_overlay: bool = True,
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
+    all_screened_images: bool = False,
 ) -> str:
     """Build a self-contained HTML report with all displayed images embedded."""
     grids = _collect_grids(base_dir)
@@ -2870,9 +2885,25 @@ def build_embedded_html_report(
         )
 
     representative = _representative_suitable_grid(grids, responses)
-    detail_html = '<section class="section"><h2>Screening data</h2><div class="empty">No included GridSquare is marked suitable for collection.</div></section>'
-    if representative is not None:
-        idx, grid_id, grid_dir, response = representative
+    if all_screened_images:
+        detail_candidates = [
+            (
+                idx,
+                grid_id,
+                grid_dir,
+                responses.get(grid_dir.name) if isinstance(responses.get(grid_dir.name), dict) else {},
+            )
+            for idx, (grid_id, grid_dir) in enumerate(grids, start=1)
+        ]
+        detail_heading = "Screening data - all screened GridSquares"
+        empty_detail_message = "No screened GridSquares were found."
+    else:
+        detail_candidates = [representative] if representative is not None else []
+        detail_heading = "Screening data - one suitable GridSquare"
+        empty_detail_message = "No included GridSquare is marked suitable for collection."
+
+    detail_sections = []
+    for idx, grid_id, grid_dir, response in detail_candidates:
         try:
             grid_path = find_grid_image(grid_dir)
         except FileNotFoundError:
@@ -2899,15 +2930,25 @@ def build_embedded_html_report(
                     + (f'<img src="{data_uri}" alt="Data image for FoilHole {html.escape(str(foil_id))}">' if data_uri else '<div class="empty">No matching Data image</div>')
                     + '</article></div>'
                 )
-        detail_html = (
-            '<section class="section"><h2>Screening data - one suitable GridSquare</h2>'
+        collection_status = _normalized_collection_status(response)
+        collection_label = {
+            "suitable": "Suitable for collection",
+            "unsuitable": "Not suitable for collection",
+        }.get(collection_status, "Collection suitability unmarked")
+        detail_sections.append(
+            '<section class="section">'
             f'<div class="review-summary"><strong>GridSquare {html.escape(str(grid_id))}</strong>'
-            f'<span>Rating {html.escape(str(response.get("rating", 0) or 0))}</span><span>Suitable for collection</span>'
+            f'<span>Rating {html.escape(str(response.get("rating", 0) or 0))}</span><span>{html.escape(collection_label)}</span>'
             f'<p>{html.escape(str(response.get("comment", "") or ""))}</p></div>'
             + (f'<article class="image-card primary"><h3>GridSquare with foil overlay</h3><img src="{primary_uri}" alt="GridSquare {html.escape(str(grid_id))}"></article>' if primary_uri else '<div class="empty">GridSquare image unavailable</div>')
             + ''.join(pairs)
             + '</section>'
         )
+    detail_html = (
+        f'<div class="screening-details"><h2>{html.escape(detail_heading)}</h2>{"".join(detail_sections)}</div>'
+        if detail_sections
+        else f'<section class="section"><h2>{html.escape(detail_heading)}</h2><div class="empty">{html.escape(empty_detail_message)}</div></section>'
+    )
 
     summary = html.escape((global_summary or "").strip())
     target_rows = "".join(
@@ -2939,6 +2980,7 @@ def write_embedded_html_report(
     atlas_overlay: bool = True,
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
+    all_screened_images: bool = False,
 ) -> None:
     report_file.write_text(
         build_embedded_html_report(
@@ -2949,6 +2991,7 @@ def write_embedded_html_report(
             atlas_overlay=atlas_overlay,
             global_summary=global_summary,
             skip_foil_processing=skip_foil_processing,
+            all_screened_images=all_screened_images,
         ),
         encoding="utf-8",
     )

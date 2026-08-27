@@ -1307,9 +1307,10 @@ def create_app(
             job.update(updates)
             job["updated_at"] = time.time()
 
-    def _run_report_job(job_id: str, kind: str) -> None:
+    def _run_report_job(job_id: str, kind: str, scope: str = "representative") -> None:
         _update_job(job_id, status="running", progress=10, message="Preparing report...")
-        report_path, details_path = _report_paths()
+        all_screened_images = scope == "all_screened"
+        report_path, details_path = _report_paths(all_screened_images=all_screened_images)
         job_kind = "full" if kind == "overview" else kind
         target_path = report_path if job_kind == "full" else details_path
 
@@ -1324,6 +1325,7 @@ def create_app(
                     atlas_overlay=atlas_overlay,
                     global_summary=summary_state["text"],
                     skip_foil_processing=skip_foil_processing,
+                    all_screened_images=all_screened_images,
                 )
             elif job_kind == "details":
                 write_selected_report(
@@ -1335,6 +1337,7 @@ def create_app(
                     atlas_overlay=atlas_overlay,
                     global_summary=summary_state["text"],
                     skip_foil_processing=skip_foil_processing,
+                    all_screened_images=all_screened_images,
                 )
             else:
                 raise ValueError(f"unknown report kind: {job_kind}")
@@ -2980,7 +2983,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         summary_state["text"] = normalized
         return JSONResponse({"summary": normalized})
 
-    def _report_paths() -> tuple[Path, Path]:
+    def _report_paths(all_screened_images: bool = False) -> tuple[Path, Path]:
         if report_file:
             report = report_file
             details = report_file.with_name(f"{report_file.stem}_details.pdf")
@@ -2990,6 +2993,9 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             details_name = f"{prefix}Screening_details.pdf"
             report = base_dir / report_name
             details = base_dir / details_name
+        if all_screened_images:
+            report = report.with_name(f"{report.stem}_all_screened{report.suffix}")
+            details = details.with_name(f"{details.stem}_all_screened{details.suffix}")
         return report, details
 
     def _temp_report_path(filename: str) -> Path:
@@ -3046,8 +3052,12 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         )
 
     @app.get("/report.html")
-    def embedded_html_report():
-        filename = f"{label_prefix}Screening_report.html" if label_prefix else "Screening_report.html"
+    def embedded_html_report(scope: str = "representative"):
+        if scope not in {"representative", "all_screened"}:
+            return JSONResponse({"error": "scope must be 'representative' or 'all_screened'"}, status_code=400)
+        all_screened_images = scope == "all_screened"
+        suffix = "Screening_report_all_screened.html" if all_screened_images else "Screening_report.html"
+        filename = f"{label_prefix}{suffix}" if label_prefix else suffix
         target = base_dir / filename
         try:
             write_embedded_html_report(
@@ -3059,6 +3069,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
+                all_screened_images=all_screened_images,
             )
         except (PermissionError, OSError):
             target = _temp_report_path(filename)
@@ -3071,6 +3082,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
+                all_screened_images=all_screened_images,
             )
         return FileResponse(target, media_type="text/html", filename=filename, headers={"Cache-Control": "no-store"})
 
@@ -3083,23 +3095,27 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         except Exception:
             payload = {}
         kind = str(payload.get("kind", "full")).strip().lower()
+        scope = str(payload.get("scope", "representative")).strip().lower()
         if kind == "overview":
             kind = "full"
         if kind not in {"full", "details"}:
             return JSONResponse({"error": "kind must be 'full' or 'details'"}, status_code=400)
+        if scope not in {"representative", "all_screened"}:
+            return JSONResponse({"error": "scope must be 'representative' or 'all_screened'"}, status_code=400)
         job_id = secrets.token_urlsafe(8)
         now = time.time()
         with report_jobs_lock:
             report_jobs[job_id] = {
                 "id": job_id,
                 "kind": kind,
+                "scope": scope,
                 "status": "queued",
                 "progress": 0,
                 "message": "Queued...",
                 "created_at": now,
                 "updated_at": now,
             }
-        threading.Thread(target=_run_report_job, args=(job_id, kind), daemon=True).start()
+        threading.Thread(target=_run_report_job, args=(job_id, kind, scope), daemon=True).start()
         return JSONResponse({"job_id": job_id, "job": _job_state(job_id)})
 
     @app.get("/report_jobs/{job_id}")
@@ -3180,6 +3196,11 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 .progress-label{font-size:13px;color:#445;margin-bottom:8px;}
 .progress-track{height:8px;border-radius:999px;background:#dfe5f1;overflow:hidden;}
 .progress-bar{height:100%;width:0%;background:#1b6ef3;transition:width 0.2s linear;}
+.scope-card{margin:14px 0;padding:12px;border:1px solid #d7deea;border-radius:10px;background:#f8faff;}
+.scope-title{font-size:14px;font-weight:700;margin-bottom:8px;}
+.scope-option{display:block;padding:7px 4px;font-size:14px;cursor:pointer;}
+.scope-option input{margin-right:7px;}
+.scope-help{display:block;margin:3px 0 0 25px;color:#667085;font-size:12px;}
 </style>
 </head><body><div class="page"><div class="card">
 <div class="title">All GridSquares reviewed</div>
@@ -3189,9 +3210,13 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 <div><button type="button" class="btn" id="save-summary">Save summary</button></div>
 <div class="note">You can now add unscreened Atlas GridSquares as manual collection targets.</div>
 <a class="btn secondary" href="/?targeting=1">Select unscreened Atlas targets</a>
-<div class="note">The full PDF and HTML reports contain the Atlas overview plus screening data for one highest-rated suitable GridSquare.</div>
+<div class="scope-card">
+  <div class="scope-title">Screening images to include</div>
+  <label class="scope-option"><input type="radio" name="report-scope" value="representative" checked>One highest-rated suitable GridSquare<span class="scope-help">Recommended compact report.</span></label>
+  <label class="scope-option"><input type="radio" name="report-scope" value="all_screened">All screened GridSquares and images<span class="scope-help">Explicit full-session export; may produce a very large PDF or HTML file.</span></label>
+</div>
 <a class="btn" id="report-link" href="#">Generate full PDF report</a>
-<a class="btn secondary" id="html-report-link" href="/report.html">Download self-contained HTML report</a>
+<a class="btn secondary" id="html-report-link" href="#">Download self-contained HTML report</a>
 <div class="note">Export structured review data:</div>
 <a class="btn secondary" id="export-csv" href="/export.csv">Download CSV</a>
 <a class="btn secondary" id="export-json" href="/export.json">Download JSON</a>
@@ -3267,7 +3292,12 @@ async function pollReportJob(jobId){
   }
 }
 
-async function startReport(kind, msg){
+function selectedReportScope(){
+  const selected = document.querySelector('input[name="report-scope"]:checked');
+  return selected ? selected.value : 'representative';
+}
+
+async function startReport(kind, msg, scope){
   doneStatus.textContent = msg;
   setProgress(true, 'Submitting report job…', 5);
   try{
@@ -3281,7 +3311,7 @@ async function startReport(kind, msg){
     const res = await fetch('/report_jobs', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({kind})
+      body: JSON.stringify({kind, scope})
     });
     const payload = await res.json();
     if (!res.ok || !payload.job_id){
@@ -3296,7 +3326,19 @@ async function startReport(kind, msg){
 
 document.getElementById('report-link').addEventListener('click', (ev) => {
   ev.preventDefault();
-  startReport('full', 'Generating full PDF report…');
+  const scope = selectedReportScope();
+  const message = scope === 'all_screened' ? 'Generating all-screened PDF report…' : 'Generating compact PDF report…';
+  startReport('full', message, scope);
+});
+document.getElementById('html-report-link').addEventListener('click', async (ev) => {
+  ev.preventDefault();
+  doneStatus.textContent = 'Preparing HTML report…';
+  try{
+    await saveSummary(false);
+    window.location = '/report.html?scope=' + encodeURIComponent(selectedReportScope());
+  }catch(err){
+    doneStatus.textContent = String(err);
+  }
 });
 	const SESSION_STORAGE_KEY = __SESSION_STORAGE_KEY_JSON__;
 	localStorage.removeItem('last_idx_' + SESSION_STORAGE_KEY);
@@ -3308,8 +3350,11 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
         return HTMLResponse(done_html)
 
     @app.get("/report")
-    def report():
-        report_path, _details_path = _report_paths()
+    def report(scope: str = "representative"):
+        if scope not in {"representative", "all_screened"}:
+            return JSONResponse({"error": "scope must be 'representative' or 'all_screened'"}, status_code=400)
+        all_screened_images = scope == "all_screened"
+        report_path, _details_path = _report_paths(all_screened_images=all_screened_images)
         target_path = report_path
         try:
             write_combined_report(
@@ -3321,6 +3366,7 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
+                all_screened_images=all_screened_images,
             )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
@@ -3334,6 +3380,7 @@ document.getElementById('report-link').addEventListener('click', (ev) => {
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
+                all_screened_images=all_screened_images,
             )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate full report: {exc}"}, status_code=500)

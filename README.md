@@ -22,23 +22,14 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
   for collection, and choose whether it stays in the final report.
 
 
-![Annotated web app](images/webapp_annotated.png)
+![Current EPU Mapper screening dashboard with linked Atlas, GridSquare, FoilHole, and Data viewers](images/EPU_mapper_dashboard.png)
 
-### Export summaries to guide your data collection set-up
+### Export reports to guide data collection
 
-The app generates a PDF with a high-level summary and detailed per-grid-square
-images. The overview is useful to quickly decide on the best squares when
-setting up your high-res data collection:
-
-![PDF overview](images/EPU_mapper_PDF_overview.png)
-
-- The combined PDF starts with atlas overviews, EPU category overview, session
-  summary, and the review table with ratings and comments. Screened GridSquares
-  on the atlas are color-coded by user rating (1–5), with skipped or unrated
-  squares shown in blue.
-- Detailed pages then show each selected GridSquare in context, including atlas
-  location, foil overlay, matched FoilHole/Data images, and acquisition
-  metadata.
+EPU Mapper generates PDF or self-contained HTML reports with Atlas overviews,
+ratings, collection-suitability annotations, comments, and the requested
+GridSquare/FoilHole/Data imagery. These reports provide a portable record for
+choosing targets and setting up high-resolution data collection.
 
 ## Installation
 
@@ -137,11 +128,9 @@ Images-Disc1/
   session and Atlas relative to its new folder, so the bundle can be moved to
   another disk or computer.
 
-### 3. The start page
+### 3. Use the screening dashboard
 
-![EPU Mapper first page](images/EPU_mapper_1st_page.png)
-
-The start page is an interactive screening dashboard. It runs preflight checks,
+The dashboard shown above runs preflight checks,
 confirms that the session folders were found, and loads PNG previews by default.
 Hover a numbered screened-square marker to preview its GridSquare, then click it
 to open the linked workspace. The screened GridSquare list remains in a compact
@@ -178,11 +167,9 @@ Use the annotated screenshot in the `Why use it` section as the reference for th
 
 ### 5. Export the detailed pages
 
-![PDF details](images/EPU_mapper_PDF_details.png)
-
-Each detailed page shows the current GridSquare in context: atlas location and
-GridSquare image, plus foil overlay / matched FoilHole-data imagery when you
-run the full review mode. In `Atlas/GridSquare only` mode those FoilHole
+Export a PDF or self-contained HTML report after review. Reports show the
+selected GridSquare in context with its Atlas location, GridSquare image, and
+matched FoilHole/Data imagery. In `Atlas/GridSquare only` mode, FoilHole
 sections are omitted entirely.
 
 ## Additional info
@@ -240,10 +227,15 @@ Most users outside VBC can ignore this section.
   collection status as a green suitable, red unsuitable, or gray unmarked
   outline/badge. The report then shows screening data for exactly one included
   GridSquare marked suitable for collection, choosing the highest rating and
-  then acquisition order when ratings tie.
+  then acquisition order when ratings tie. On **Reports & export**, explicitly
+  choose **All screened GridSquares and images** to instead create
+  `Screening_report_all_screened.pdf` with every screened GridSquare and all of
+  its available FoilHole/Data pairs. This can be a very large file.
 - `Screening_report.html` – self-contained HTML version of the combined report.
   All displayed images are embedded in the file, so it can be copied and opened
-  without the EPU Mapper server or its source data paths.
+  without the EPU Mapper server or its source data paths. The same report-scope
+  choice creates `Screening_report_all_screened.html` when all screened imagery
+  is requested.
 - `Screening_details.pdf` – optional details-only export (e.g. via
   `--details-only` / `--export-all-details`), including all included
   GridSquares with foil/data thumbnails plus metadata.
