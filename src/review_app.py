@@ -48,6 +48,26 @@ def _find_mrc_for_jpg(path: Path) -> Path | None:
     return None
 
 
+def _find_atlas_mrc(atlas_path: Path) -> Path | None:
+    """Locate the full-resolution atlas MRC across common EPU naming schemes."""
+    direct = _find_mrc_for_jpg(atlas_path)
+    if direct:
+        return direct
+    for name in ("Atlas.mrc", "atlas.mrc", "Atlas.mrcs", "atlas.mrcs"):
+        candidate = atlas_path.parent / name
+        if candidate.is_file():
+            return candidate
+    candidates = [
+        path
+        for pattern in ("Atlas_*.mrc", "atlas_*.mrc", "*.mrc", "*.mrcs")
+        for path in atlas_path.parent.glob(pattern)
+        if path.is_file()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+
+
 def _format_meta(meta: dict) -> list[str]:
     lines = []
     for key in ("pixel_size", "exposure", "dose", "defocus"):
@@ -184,8 +204,8 @@ def _parse_atlas_dm_centers_and_categories(dm_path: Path) -> tuple[dict[str, tup
 
 
 def _atlas_reference_dimensions(atlas_path: Path, centers: dict[str, tuple[float, float]]) -> tuple[float | None, float | None]:
-    atlas_mrc = atlas_path.with_suffix(".mrc")
-    if atlas_mrc.is_file():
+    atlas_mrc = _find_atlas_mrc(atlas_path)
+    if atlas_mrc and atlas_mrc.is_file():
         try:
             import mrcfile  # local import to avoid hard dependency at module import
 
@@ -253,10 +273,8 @@ def _render_atlas_overlay(
 ) -> bytes | None:
     if active_key not in centers:
         return None
-    try:
-        with Image.open(atlas_path) as atlas_image:
-            atlas_rgb = atlas_image.convert("RGB")
-    except Exception:
+    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=True)
+    if atlas_rgb is None:
         return None
 
     width, height = atlas_rgb.size
@@ -310,6 +328,30 @@ def _category_marker_color(category: int | None) -> tuple[int, int, int]:
     return _EPU_CATEGORY_COLORS.get(category, (99, 102, 241))
 
 
+def _open_atlas_rgb(atlas_path: Path, prefer_mrc: bool = True) -> Image.Image | None:
+    """Open the best atlas source available, preferring the full-resolution MRC."""
+    if prefer_mrc:
+        mrc_path = _find_atlas_mrc(atlas_path)
+        if mrc_path and mrc_path.is_file():
+            image = _mrc_to_image(mrc_path, 1.0, 99.0)
+            if image is not None:
+                return image.convert("RGB")
+    try:
+        with Image.open(atlas_path) as atlas_image:
+            return atlas_image.convert("RGB")
+    except Exception:
+        return None
+
+
+def _render_atlas_raw(atlas_path: Path) -> bytes | None:
+    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=True)
+    if atlas_rgb is None:
+        return None
+    buf = io.BytesIO()
+    atlas_rgb.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
 def _render_atlas_screened_overview(
     atlas_path: Path,
     centers: dict[str, tuple[float, float]],
@@ -319,10 +361,8 @@ def _render_atlas_screened_overview(
 ) -> bytes | None:
     if not centers or not screened_items:
         return None
-    try:
-        with Image.open(atlas_path) as atlas_image:
-            atlas_rgb = atlas_image.convert("RGB")
-    except Exception:
+    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=False)
+    if atlas_rgb is None:
         return None
 
     width, height = atlas_rgb.size
@@ -368,10 +408,8 @@ def _render_atlas_category_overview(
 ) -> bytes | None:
     if not centers:
         return None
-    try:
-        with Image.open(atlas_path) as atlas_image:
-            atlas_rgb = atlas_image.convert("RGB")
-    except Exception:
+    atlas_rgb = _open_atlas_rgb(atlas_path, prefer_mrc=False)
+    if atlas_rgb is None:
         return None
 
     width, height = atlas_rgb.size
@@ -813,7 +851,7 @@ def create_app(
         grid_img = find_grid_image(gdir)
         mrc_path = find_grid_mrc(gdir)
         atlas_path = _resolve_atlas_path(atlas_name, gdir, base_dir) if atlas_name else None
-        atlas_mrc_path = _find_mrc_for_jpg(atlas_path) if atlas_path else None
+        atlas_mrc_path = _find_atlas_mrc(atlas_path) if atlas_path else None
         atlas_centers: dict[str, tuple[float, float]] = {}
         atlas_categories: dict[str, int | None] = {}
         atlas_ref_w: float | None = None
@@ -888,6 +926,7 @@ def create_app(
 
     atlas_screened_preview: bytes | None = None
     atlas_category_preview: bytes | None = None
+    atlas_raw_preview: bytes | None = None
     atlas_preview_message: str | None = None
     atlas_preview_path: Path | None = None
     atlas_sample_item = next(
@@ -901,6 +940,7 @@ def create_app(
     if atlas_sample_item is not None:
         atlas_preview_path = atlas_sample_item["atlas"]
         centers, categories, ref_w, ref_h, atlas_msg = _load_atlas_mapping(atlas_preview_path)
+        atlas_raw_preview = _render_atlas_raw(atlas_preview_path)
         screened_items: list[tuple[str, str]] = []
         for idx_item, item in enumerate(items, start=1):
             center_key = item.get("atlas_center_key")
@@ -1097,6 +1137,36 @@ def create_app(
             "rows": _export_rows(),
         }
 
+    def _dashboard_grid_summaries() -> list[dict]:
+        summaries: list[dict] = []
+        for idx_item, item in enumerate(items):
+            response = _normalize_review_entry(responses.get(item["dir"].name, {}), default_include=True)
+            center_key = item.get("atlas_center_key")
+            center = (item.get("atlas_centers") or {}).get(center_key) if center_key else None
+            ref_w = item.get("atlas_ref_w")
+            ref_h = item.get("atlas_ref_h")
+            position = None
+            if center and ref_w and ref_h and ref_w > 0 and ref_h > 0:
+                position = {
+                    "x": max(0.0, min(100.0, float(center[0]) / float(ref_w) * 100.0)),
+                    "y": max(0.0, min(100.0, float(center[1]) / float(ref_h) * 100.0)),
+                }
+            summaries.append(
+                {
+                    "idx": idx_item,
+                    "id": str(item["id"]),
+                    "name": item["name"],
+                    "position": position,
+                    "category": item.get("epu_category_score"),
+                    "foil_count": len(item["foils"]),
+                    "data_count": len(item["data"]),
+                    "reviewed": item["dir"].name in responses,
+                    "rating": response["rating"] if item["dir"].name in responses else 0,
+                    "include": response["include"],
+                }
+            )
+        return summaries
+
     def _job_state(job_id: str) -> dict | None:
         with report_jobs_lock:
             job = report_jobs.get(job_id)
@@ -1184,7 +1254,7 @@ def create_app(
         category_subtitle_html = f"<div class=\"subtitle\">EPU category score: {category_text}</div>"
         atlas_note_html = ""
         if item["atlas"]:
-            atlas_html = f"<img id=\"atlasimg\" src=\"/atlas?idx={idx}&t={ts}\" class=\"atlas-img\" data-kind=\"atlas\" data-has-mrc=\"{1 if atlas_has_mrc else 0}\"/>"
+            atlas_html = f"<img id=\"atlasimg\" src=\"/thumb?idx={idx}&kind=atlas&size=600\" class=\"atlas-img\" data-kind=\"atlas\" data-has-mrc=\"{1 if atlas_has_mrc else 0}\"/>"
             if item.get("atlas_center_key"):
                 atlas_note_html = "<div class=\"note\">Current GridSquare is marked in red.</div>"
             elif item.get("atlas_overlay_message"):
@@ -1254,32 +1324,39 @@ def create_app(
         next_idx_val = idx + 1 if idx + 1 < len(items) else "null"
         prev_idx_val = idx - 1 if idx - 1 >= 0 else "null"
         total_len = len(items)
+        prev_nav_html = f"<a class=\"btn nav-btn\" href=\"/review/{idx - 1}\">← Previous</a>" if idx > 0 else ""
+        next_nav_html = f"<a class=\"btn nav-btn\" href=\"/review/{idx + 1}\">Next →</a>" if idx + 1 < total_len else ""
         return f"""<html><head><meta charset=\"utf-8\"><title>Review GridSquare {item['id']}</title>
 <style>
-:root{{color-scheme:light;--img-size:420px;--thumb-size:280px;}}
-body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}}
-.page{{max-width:1300px;margin:0 auto;padding:24px;}}
-.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}}
-.title{{font-size:20px;font-weight:600;}}
+:root{{color-scheme:light;--img-size:560px;--thumb-size:190px;--ink:#172033;--muted:#68758b;--line:#dfe5ee;--accent:#2563eb;}}
+*{{box-sizing:border-box;}}
+body{{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f4f7fb;color:var(--ink);}}
+.page{{max-width:1640px;margin:0 auto;padding:20px 28px 40px;}}
+.header{{position:sticky;top:0;z-index:10;display:flex;justify-content:space-between;align-items:center;margin:0 -28px 18px;padding:13px 28px;background:rgba(255,255,255,.94);border-bottom:1px solid var(--line);backdrop-filter:blur(10px);}}
+.header-actions{{display:flex;align-items:center;gap:7px;}}
+.title{{font-size:19px;font-weight:750;letter-spacing:-.02em;}}
 .subtitle{{color:#666;font-size:13px;margin-top:2px;}}
-.progress{{color:#666;}}
-.layout{{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start;}}
-.card{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:14px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}
+.progress{{color:#66748a;font-size:12px;font-weight:700;padding:0 5px;}}
+.layout{{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px;align-items:start;}}
+.right{{position:sticky;top:88px;display:flex;flex-direction:column;gap:12px;}}
+.right .card{{margin:0;}}
+.card{{background:#fff;border:1px solid var(--line);border-radius:14px;padding:15px;box-shadow:0 1px 2px rgba(24,36,60,.03);}}
 .grid-panel{{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:16px;}}
-.image-frame{{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;flex:1 1 360px;max-width:100%;}}
+.image-frame{{background:#fff;border:1px solid var(--line);border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:8px;flex:1 1 480px;max-width:100%;}}
 .image-caption{{font-size:13px;font-weight:600;color:#222;}}
 .image-frame img.frame-image{{width:100%;max-width:var(--img-size);max-height:var(--img-size);height:auto;object-fit:contain;display:block;}}
-.viewer-viewport{{position:relative;width:100%;max-width:var(--img-size);height:var(--img-size);overflow:hidden;border:1px solid #e1e4e8;border-radius:8px;background:#fbfcff;display:flex;align-items:center;justify-content:center;}}
-.viewer-viewport.pan-enabled{{touch-action:none;}}
+.viewer-viewport{{position:relative;width:100%;max-width:var(--img-size);height:var(--img-size);overflow:hidden;border:1px solid #e1e4e8;border-radius:8px;background:#101827;display:flex;align-items:center;justify-content:center;touch-action:none;}}
 .atlas-img{{max-width:100%;height:auto;display:block;}}
 .atlas-img.selected{{outline:2px solid #1b6ef3;border-radius:6px;}}
-#gridimg{{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;transform-origin:center center;transition:transform 0.05s linear;cursor:pointer;user-select:none;-webkit-user-drag:none;}}
-.viewer-viewport.pan-enabled #gridimg{{cursor:grab;}}
-.viewer-viewport.pan-enabled #gridimg.dragging{{cursor:grabbing;}}
-.actions{{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;}}
-.btn{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;}}
+#gridimg{{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;transform-origin:center center;transition:transform 0.05s linear;cursor:zoom-in;user-select:none;-webkit-user-drag:none;}}
+.viewer-viewport.zoomed #gridimg{{cursor:grab;}}
+.viewer-viewport.zoomed #gridimg.dragging{{cursor:grabbing;}}
+.actions{{margin:8px 0;display:flex;gap:7px;flex-wrap:wrap;}}
+.btn{{border:1px solid #c9d2df;background:#fff;color:#344258;border-radius:9px;padding:8px 10px;font-size:12px;font-weight:650;cursor:pointer;text-decoration:none;}}
 .btn:hover{{background:#f0f2f5;}}
 .btn.active{{background:#1b6ef3;color:#fff;border-color:#1b6ef3;}}
+.btn.primary{{background:var(--accent);border-color:var(--accent);color:#fff;}}
+.btn.nav-btn{{padding:7px 9px;}}
 .btn:disabled{{opacity:0.5;cursor:default;}}
 .rate-buttons{{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;}}
 .rate{{border:1px solid #c9ced6;background:#fff;border-radius:8px;padding:8px 10px;font-size:14px;cursor:pointer;min-width:38px;}}
@@ -1291,7 +1368,7 @@ body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helv
 .preflight-title{{font-size:13px;font-weight:600;margin-bottom:4px;}}
 .preflight-list{{margin:0;padding-left:18px;font-size:12px;color:#455;}}
 .preflight-list li{{margin:2px 0;}}
-.status-card{{margin-top:16px;}}
+.status-card{{margin-top:0;}}
 .status-log{{max-height:180px;overflow:auto;font-size:12px;color:#333;background:#fafafa;border-radius:8px;padding:8px;border:1px solid #e1e4e8;}}
 .status-log div{{padding:2px 0;border-bottom:1px solid #eceff3;}}
 .status-log div:last-child{{border-bottom:0;}}
@@ -1316,12 +1393,14 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 #loading-overlay.hidden{{opacity:0;pointer-events:none;}}
 .spinner{{width:40px;height:40px;border:4px solid #d0d7e7;border-top-color:#1b6ef3;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:12px;}}
 @keyframes spin{{to{{transform:rotate(360deg);}}}}
+@media(max-width:1050px){{.layout{{grid-template-columns:1fr;}}.right{{position:static;}}}}
+@media(max-width:700px){{:root{{--img-size:420px;--thumb-size:140px;}}.page{{padding:12px;}}.header{{margin:-12px -12px 14px;padding:12px;align-items:flex-start;gap:10px;}}.header-actions{{flex-wrap:wrap;justify-content:flex-end;}}.subtitle{{max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}}}
 </style>
 </head>
 <body>
 <div id=\"loading-overlay\"><div class=\"spinner\"></div><div>Loading images…</div></div>
 <div class=\"page\">
-<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div>{category_subtitle_html}</div><div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div></div>
+<div class=\"header\"><div><div class=\"title\">GridSquare {item['id']}</div><div class=\"subtitle\">{item['name']}</div>{category_subtitle_html}</div><div class=\"header-actions\"><a class=\"btn nav-btn\" href=\"/\">Atlas overview</a>{prev_nav_html}<div class=\"progress\" id=\"progress\">{idx + 1} / {total_len}</div>{next_nav_html}</div></div>
 {overlay_banner}
 {nodata_html}
 {preflight_html}
@@ -1359,12 +1438,11 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <button type=\"button\" id=\"zoom-out\" class=\"btn\">Zoom -</button>
 <button type=\"button\" id=\"zoom-in\" class=\"btn\">Zoom +</button>
 <button type=\"button\" id=\"zoom-reset\" class=\"btn\">Reset zoom</button>
-<button type=\"button\" id=\"pan-toggle\" class=\"btn\">Pan: Off</button>
 </div>
 <div id=\"zoom-level\" class=\"note\">Zoom: 100%</div>
 {grid_mrc_note}
 <div class=\"note\">Viewer defaults to the Atlas when available. Click Atlas, GridSquare, FoilHole, or Data images to switch what is shown here.</div>
-<div class=\"note\">Use MRC + sliders for contrast, then enable Pan to drag the zoomed image within the viewer.</div>
+<div class=\"note\">Scroll over the viewer to zoom. Drag whenever zoomed; double-click to reset. No tool switching is needed.</div>
 <div id=\"contrast-panel\" style=\"display:none;margin-bottom:8px;\">
 <div>Low: <span id=\"lowv\">2</span>% <input type=\"range\" id=\"low\" min=\"0\" max=\"99\" value=\"2\"></div>
 <div>High: <span id=\"highv\">98</span>% <input type=\"range\" id=\"high\" min=\"1\" max=\"100\" value=\"98\"></div>
@@ -1382,7 +1460,7 @@ textarea{{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;p
 <div>Comments:</div>
 <textarea id=\"comment\" rows=\"4\"></textarea>
 <div id=\"autosave-state\" class=\"note autosave-state\"></div>
-<div class=\"submit-row\"><button type=\"button\" id=\"submit\" class=\"btn\">Submit (Ctrl+Enter)</button></div>
+<div class=\"submit-row\"><button type=\"button\" id=\"submit\" class=\"btn primary\">Save & continue (Ctrl+Enter)</button></div>
 <div id=\"submit-status\" class=\"note\"></div>
 </div>
 </div>
@@ -1410,7 +1488,6 @@ let selectedKind = DEFAULT_KIND;
 let selectedName = '';
 let selectedHasMrc = DEFAULT_HAS_MRC;
 let zoomLevel = 1.0;
-let panEnabled = false;
 let panX = 0;
 let panY = 0;
 let isDragging = false;
@@ -1506,27 +1583,27 @@ function clampPan(){{
 }}
 function applyZoom(){{
   const img = document.getElementById('gridimg');
+  const viewport = document.getElementById('viewer-viewport');
   clampPan();
   img.style.transform = 'translate(' + panX.toFixed(1) + 'px,' + panY.toFixed(1) + 'px) scale(' + zoomLevel.toFixed(3) + ')';
   document.getElementById('zoom-level').textContent = 'Zoom: ' + Math.round(zoomLevel * 100) + '%';
+  if (viewport) viewport.classList.toggle('zoomed', zoomLevel > 1.001);
 }}
-function updatePanUi(){{
-  const btn = document.getElementById('pan-toggle');
-  const viewport = document.getElementById('viewer-viewport');
-  if (btn) {{
-    btn.textContent = panEnabled ? 'Pan: On' : 'Pan: Off';
-    btn.classList.toggle('active', panEnabled);
-  }}
-  if (viewport) {{
-    viewport.classList.toggle('pan-enabled', panEnabled);
-  }}
-}}
-function setZoom(value){{
+function setZoom(value, clientX=null, clientY=null){{
   const next = Math.max(0.5, Math.min(4.0, value));
   const ratio = zoomLevel > 0 ? (next / zoomLevel) : 1.0;
+  if (clientX !== null && clientY !== null) {{
+    const viewport = document.getElementById('viewer-viewport');
+    const rect = viewport.getBoundingClientRect();
+    const pointerX = clientX - rect.left - rect.width / 2;
+    const pointerY = clientY - rect.top - rect.height / 2;
+    panX = pointerX - (pointerX - panX) * ratio;
+    panY = pointerY - (pointerY - panY) * ratio;
+  }} else {{
+    panX *= ratio;
+    panY *= ratio;
+  }}
   zoomLevel = next;
-  panX *= ratio;
-  panY *= ratio;
   if (zoomLevel <= 1.0) {{
     panX = 0;
     panY = 0;
@@ -1558,8 +1635,6 @@ function selectImage(kind,name,hasMrc){{
   }}
   document.getElementById('gridimg').src = jpgUrl(kind,name);
   document.getElementById('contrast-panel').style.display = 'none';
-  panEnabled = false;
-  updatePanUi();
   resetViewerTransform();
   updateButtons();
   document.querySelectorAll('.thumb').forEach(t=>t.classList.toggle('selected', t.dataset.kind === kind && t.dataset.name === name));
@@ -1590,7 +1665,7 @@ viewerImg.addEventListener('load', () => {{
   applyZoom();
 }});
 viewerImg.onpointerdown = (e) => {{
-  if (!panEnabled || zoomLevel <= 1.0) return;
+  if (zoomLevel <= 1.0 || e.button !== 0) return;
   isDragging = true;
   suppressNextGridClick = false;
   dragStartX = e.clientX - panX;
@@ -1622,14 +1697,20 @@ function stopPanDrag(e){{
 }}
 viewerImg.onpointerup = stopPanDrag;
 viewerImg.onpointercancel = stopPanDrag;
+document.getElementById('viewer-viewport').addEventListener('wheel', (e) => {{
+  e.preventDefault();
+  setZoom(zoomLevel * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+}}, {{passive:false}});
+document.getElementById('viewer-viewport').addEventListener('dblclick', (e) => {{
+  e.preventDefault();
+  resetViewerTransform();
+}});
 const atlasImg = document.getElementById('atlasimg');
 if (atlasImg) {{
   atlasImg.onclick = () => selectImage('atlas', '', ATLAS_HAS_MRC);
 }}
 if (DEFAULT_KIND === 'atlas' && atlasImg) {{
-  selectImage('atlas', '', ATLAS_HAS_MRC);
-}} else {{
-  selectImage('grid', '', GRID_HAS_MRC);
+  atlasImg.classList.add('selected');
 }}
 function updateContrast(){{
   const lowEl = document.getElementById('low');
@@ -1655,14 +1736,6 @@ document.getElementById('show-jpeg').onclick = () => {{
 document.getElementById('zoom-in').onclick = () => setZoom(zoomLevel * 1.25);
 document.getElementById('zoom-out').onclick = () => setZoom(zoomLevel / 1.25);
 document.getElementById('zoom-reset').onclick = () => resetViewerTransform();
-document.getElementById('pan-toggle').onclick = () => {{
-  panEnabled = !panEnabled;
-  if (!panEnabled) {{
-    isDragging = false;
-    viewerImg.classList.remove('dragging');
-  }}
-  updatePanUi();
-}};
 function persistState(){{
   const nowTs = Date.now() / 1000.0;
   const data = {{
@@ -1782,7 +1855,6 @@ includeEl.addEventListener('change', persistState);
 document.getElementById('low').oninput = updateContrast;
 document.getElementById('high').oninput = updateContrast;
 updateButtons();
-updatePanUi();
 applyZoom();
 document.getElementById('submit').onclick = submitReview;
 document.addEventListener('keydown', (e)=>{{
@@ -1822,82 +1894,79 @@ setInterval(refreshStatus, 5000);
 
     @app.get("/")
     def root():
-        root_html = """<html><head><meta charset=\"utf-8\"><title>Grid review</title>
+        grid_summaries = _dashboard_grid_summaries()
+        reviewed_count = sum(1 for entry in grid_summaries if entry["reviewed"])
+        mapped_count = sum(1 for entry in grid_summaries if entry["position"])
+        image_count = sum(1 + entry["foil_count"] + entry["data_count"] for entry in grid_summaries)
+        root_html = """<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper dashboard</title>
 <style>
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f6f8;color:#111;}
-.page{max-width:900px;margin:0 auto;padding:32px;}
-.card{background:#fff;border:1px solid #e1e4e8;border-radius:12px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}
-.title{font-size:22px;font-weight:600;margin-bottom:8px;}
-.note{color:#555;font-size:14px;line-height:1.4;margin-bottom:10px;}
-.btn{display:inline-block;margin-top:14px;border:1px solid #1b6ef3;background:#1b6ef3;color:#fff;border-radius:8px;padding:10px 14px;font-size:14px;text-decoration:none;margin-right:8px;}
-.btn.secondary{background:#fff;color:#1b6ef3;}
-.preflight{margin-top:14px;padding:10px;border-radius:10px;border:1px solid #d7deea;background:#fbfcff;font-size:13px;}
-.preflight.ok{border-color:#b8d7c3;background:#f5fbf6;}
-.preflight.warn{border-color:#e8d7ad;background:#fffaf0;}
-.preflight.err{border-color:#e7b9b9;background:#fff6f6;}
-.preflight ul{margin:6px 0 0;padding-left:18px;}
-.atlas-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:14px;}
-.atlas-card{border:1px solid #d7deea;border-radius:10px;padding:8px;background:#fbfcff;}
-.atlas-title{font-size:13px;font-weight:600;color:#33415c;margin-bottom:6px;}
-.atlas-card img{display:block;width:100%;height:auto;border-radius:6px;border:1px solid #d5dcea;}
-@media (max-width: 1200px){.atlas-row{grid-template-columns:1fr 1fr;}}
-@media (max-width: 900px){.atlas-row{grid-template-columns:1fr;}}
-</style>
-</head><body><div class=\"page\"><div class=\"card\"><div class=\"title\">Grid review</div>
-<div class=\"note\">Review GridSquare, FoilHole, and Data images. Click any thumbnail to inspect it. Use "Show MRC" to adjust contrast when available. Rate each GridSquare and leave comments. A PDF report is generated at the end.</div>
-<a class=\"btn\" id=\"start-btn\" href=\"/review/0\">Start review</a>
-<a class=\"btn secondary\" id=\"resume-btn\" style=\"display:none;\" href=\"#\">Resume last visited</a>
-<div id=\"preflight\" class=\"preflight\">Running preflight checks…</div>
-__ATLAS_MSG_HTML__
-__ATLAS_OVERVIEW_HTML__
-</div></div>
+:root{color-scheme:light;--ink:#172033;--muted:#68758b;--line:#dfe5ee;--soft:#f4f7fb;--panel:#fff;--nav:#101a2f;--nav-muted:#aeb9cc;--brand:#5eead4;--accent:#2563eb;--accent-dark:#1d4ed8;--good:#0f9f74;--warn:#b45309;--shadow:0 10px 30px rgba(26,39,67,.08);}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--soft);color:var(--ink)}button,input{font:inherit}.shell{min-height:100vh;display:grid;grid-template-columns:236px minmax(0,1fr)}
+.sidebar{position:sticky;top:0;height:100vh;background:var(--nav);color:#fff;padding:24px 18px;display:flex;flex-direction:column;z-index:5}.brand{display:flex;align-items:center;gap:11px;font-size:17px;font-weight:750;letter-spacing:-.02em;margin:0 8px 28px}.brand-mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(145deg,#5eead4,#3b82f6);display:grid;place-items:center;color:#10213b;font-weight:900}.nav-label{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#71809a;margin:15px 10px 7px}.nav-item{display:flex;align-items:center;gap:10px;color:var(--nav-muted);text-decoration:none;padding:10px;border-radius:9px;font-size:13px;margin:2px 0}.nav-item.active{background:#1c2943;color:#fff}.nav-dot{width:7px;height:7px;border-radius:50%;background:#53617a}.nav-item.active .nav-dot{background:var(--brand);box-shadow:0 0 0 4px rgba(94,234,212,.12)}.session-health{margin-top:auto;border-top:1px solid #27344d;padding:16px 8px 0}.health-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--nav-muted)}.health-light{width:8px;height:8px;border-radius:50%;background:#f59e0b}.health-light.ok{background:#34d399}.health-light.err{background:#fb7185}.session-name{font-size:11px;color:#76859e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:8px}
+.main{min-width:0}.topbar{height:70px;background:rgba(255,255,255,.94);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 30px;position:sticky;top:0;z-index:4;backdrop-filter:blur(10px)}.top-title{font-size:17px;font-weight:700;letter-spacing:-.015em}.top-subtitle{font-size:12px;color:var(--muted);margin-top:3px}.top-actions{display:flex;gap:9px}.button{border:1px solid #cfd7e4;background:#fff;color:#314059;border-radius:9px;padding:9px 13px;font-size:12px;font-weight:650;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px}.button:hover{border-color:#aeb9ca;background:#f9fbfd}.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.button.primary:hover{background:var(--accent-dark)}
+.content{padding:24px 30px 40px;max-width:1800px;margin:0 auto}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 16px;display:flex;align-items:baseline;justify-content:space-between}.stat-value{font-size:22px;font-weight:750;letter-spacing:-.04em}.stat-label{font-size:11px;color:var(--muted);font-weight:650}.workspace{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(350px,.75fr);gap:16px;align-items:start}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 1px 2px rgba(24,36,60,.03);overflow:hidden}.panel-head{min-height:57px;padding:13px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.panel-title{font-size:13px;font-weight:750}.panel-note{font-size:11px;color:var(--muted);margin-top:3px}.segmented{display:flex;padding:3px;background:#eef2f7;border-radius:9px}.segmented button{border:0;background:transparent;color:#66748a;border-radius:7px;padding:7px 9px;font-size:11px;font-weight:650;cursor:pointer}.segmented button.active{background:#fff;color:#1c2940;box-shadow:0 1px 3px rgba(18,31,53,.12)}
+.atlas-viewport{height:clamp(500px,62vh,760px);background:#111827;overflow:hidden;position:relative;touch-action:none;cursor:grab}.atlas-viewport.dragging{cursor:grabbing}.atlas-content{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}.atlas-image-wrap{position:relative;display:inline-block;line-height:0;max-width:100%;max-height:100%}.atlas-image{display:block;max-width:100%;max-height:clamp(500px,62vh,760px);width:auto;height:auto;user-select:none;-webkit-user-drag:none}.marker-layer{position:absolute;inset:0;pointer-events:none}.grid-marker{position:absolute;width:28px;height:28px;transform:translate(-50%,-50%);border-radius:50%;border:2px solid rgba(255,255,255,.9);background:#2563eb;color:#fff;font-size:10px;font-weight:800;line-height:1;cursor:pointer;pointer-events:auto;box-shadow:0 3px 10px rgba(0,0,0,.4);transition:transform .12s,background .12s}.grid-marker:hover,.grid-marker.active{transform:translate(-50%,-50%) scale(1.18);background:#0f9f74;z-index:2}.grid-marker.reviewed{background:#0f9f74}.grid-marker.excluded{background:#64748b}.atlas-empty{height:100%;display:grid;place-items:center;color:#cbd5e1;text-align:center;padding:30px}.atlas-tools{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:5px;background:rgba(13,22,38,.86);padding:5px;border-radius:9px;color:#d8e0ec}.atlas-tools button{width:31px;height:31px;border:0;border-radius:7px;background:transparent;color:#fff;font-size:16px;cursor:pointer}.atlas-tools button:hover{background:rgba(255,255,255,.12)}.atlas-zoom{font-size:10px;min-width:40px;text-align:center}.atlas-help{position:absolute;left:12px;bottom:12px;background:rgba(13,22,38,.78);color:#d8e0ec;font-size:10px;padding:7px 9px;border-radius:7px;pointer-events:none}
+.inspector{min-height:620px}.inspector-empty{min-height:520px;display:grid;place-items:center;text-align:center;color:var(--muted);padding:42px}.empty-target{width:48px;height:48px;border-radius:50%;border:1px dashed #9cabc0;margin:0 auto 12px;display:grid;place-items:center;color:#789}.inspector-body{display:none}.inspector-body.visible{display:block}.selected-summary{padding:15px 16px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.selected-title{font-size:17px;font-weight:760;letter-spacing:-.025em}.selected-file{font-size:10px;color:var(--muted);margin-top:4px;max-width:270px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}.badge{font-size:10px;font-weight:650;color:#4f5f76;background:#edf2f7;padding:4px 7px;border-radius:999px}.inspector-gallery{padding:12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;max-height:540px;overflow:auto}.gallery-item{border:1px solid var(--line);background:#fff;border-radius:10px;overflow:hidden;padding:0;cursor:pointer;text-align:left;color:var(--ink)}.gallery-item:hover{border-color:#94a3b8}.gallery-item img{width:100%;aspect-ratio:1/1;object-fit:contain;background:#101827;display:block}.gallery-caption{padding:8px;font-size:10px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gallery-meta{padding:0 8px 8px;color:var(--muted);font-size:9px;line-height:1.35}.inspector-actions{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px}.inspector-actions .button{flex:1}
+.browser-panel{margin-top:16px}.browser-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.search{width:230px;border:1px solid #d3dbe7;border-radius:8px;padding:8px 10px;font-size:11px;outline:none}.search:focus{border-color:#5b8def;box-shadow:0 0 0 3px rgba(37,99,235,.08)}.grid-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:9px;padding:12px;max-height:300px;overflow:auto}.grid-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px;display:flex;align-items:center;gap:9px;cursor:pointer;text-align:left;color:var(--ink)}.grid-card:hover,.grid-card.active{border-color:#6b93e7;background:#f7faff}.grid-card-index{width:29px;height:29px;flex:0 0 auto;border-radius:8px;background:#eaf0fb;color:#2856ad;display:grid;place-items:center;font-size:10px;font-weight:800}.grid-card.reviewed .grid-card-index{background:#daf5ec;color:#08765a}.grid-card-title{font-size:11px;font-weight:700}.grid-card-meta{font-size:9px;color:var(--muted);margin-top:3px}.preflight-pop{display:none;margin:0 30px 16px;padding:10px 13px;border:1px solid #f1d19b;background:#fff9ed;color:#85530d;border-radius:10px;font-size:11px}.preflight-pop.show{display:block}.preflight-pop.err{border-color:#f3b8c1;background:#fff4f5;color:#9f1239}
+.lightbox{position:fixed;inset:0;background:rgba(5,10,20,.88);z-index:20;display:none;align-items:center;justify-content:center;padding:30px}.lightbox.open{display:flex}.lightbox img{max-width:92vw;max-height:88vh;object-fit:contain}.lightbox-close{position:absolute;right:22px;top:18px;border:0;background:rgba(255,255,255,.12);color:#fff;border-radius:8px;width:38px;height:38px;font-size:20px;cursor:pointer}
+@media(max-width:1100px){.shell{grid-template-columns:76px minmax(0,1fr)}.sidebar{padding:22px 12px}.brand{margin:0 auto 28px}.brand span:last-child,.nav-item span:last-child,.nav-label,.session-health{display:none}.nav-item{justify-content:center}.workspace{grid-template-columns:1fr}.inspector{min-height:0}.inspector-empty{min-height:220px}.inspector-gallery{max-height:none;grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.shell{display:block}.sidebar{display:none}.topbar{padding:0 15px}.content{padding:15px}.stats{grid-template-columns:1fr}.top-subtitle{display:none}.workspace{display:block}.inspector{margin-top:12px}.atlas-viewport{height:56vh}.atlas-image{max-height:56vh}.inspector-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.browser-head{align-items:stretch;flex-direction:column}.search{width:100%}}
+</style></head><body>
+<div class="shell"><aside class="sidebar"><div class="brand"><span class="brand-mark">E</span><span>EPU Mapper</span></div><div class="nav-label">Workspace</div><a class="nav-item active" href="/"><span class="nav-dot"></span><span>Atlas overview</span></a><a class="nav-item" href="/review/0"><span class="nav-dot"></span><span>Systematic review</span></a><a class="nav-item" href="/done"><span class="nav-dot"></span><span>Reports & export</span></a><div class="session-health"><div class="health-row"><span id="health-light" class="health-light"></span><span id="health-text">Checking session</span></div><div class="session-name">__SESSION_PATH__</div></div></aside>
+<main class="main"><header class="topbar"><div><div class="top-title">Screening dashboard</div><div class="top-subtitle">Select a screened square on the atlas to inspect every associated image</div></div><div class="top-actions"><a class="button" id="resume-btn" style="display:none" href="#">Resume</a><a class="button primary" href="/review/0">Start systematic review</a></div></header><div id="preflight" class="preflight-pop"></div>
+<div class="content"><section class="stats"><div class="stat"><span><span class="stat-value">__TOTAL__</span></span><span class="stat-label">Screened GridSquares</span></div><div class="stat"><span class="stat-value">__REVIEWED__</span><span class="stat-label">Reviewed</span></div><div class="stat"><span class="stat-value">__IMAGES__</span><span class="stat-label">Associated images</span></div></section>
+<section class="workspace"><div class="panel"><div class="panel-head"><div><div class="panel-title">Interactive grid atlas</div><div class="panel-note">__MAPPED__ mapped squares · high-resolution source when Atlas.mrc is available</div></div>__ATLAS_MODES__</div><div id="atlas-viewport" class="atlas-viewport"><div id="atlas-content" class="atlas-content">__ATLAS_CONTENT__</div>__ATLAS_AUX__</div></div>
+<aside class="panel inspector"><div class="panel-head"><div><div class="panel-title">GridSquare images</div><div class="panel-note">GridSquare, overlay, FoilHole and data images</div></div></div><div id="inspector-empty" class="inspector-empty"><div><div class="empty-target">＋</div><div>Select a numbered atlas marker<br>or a GridSquare below</div></div></div><div id="inspector-body" class="inspector-body"><div class="selected-summary"><div><div id="selected-title" class="selected-title"></div><div id="selected-file" class="selected-file"></div><div id="selected-badges" class="badges"></div></div></div><div id="inspector-gallery" class="inspector-gallery"></div><div class="inspector-actions"><a id="review-selected" class="button primary" href="#">Review this square</a></div></div></aside></section>
+<section class="panel browser-panel"><div class="panel-head browser-head"><div><div class="panel-title">All screened GridSquares</div><div class="panel-note">Acquisition order</div></div><input id="grid-search" class="search" type="search" placeholder="Find GridSquare ID…" aria-label="Find GridSquare"></div><div id="grid-list" class="grid-list"></div></section></div></main></div>
+<div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Image preview"><button type="button" id="lightbox-close" class="lightbox-close" aria-label="Close">×</button><img id="lightbox-image" alt="Selected microscopy image"></div>
 <script>
-const resumeBtn = document.getElementById('resume-btn');
-const startBtn = document.getElementById('start-btn');
-const preflightEl = document.getElementById('preflight');
-const SESSION_STORAGE_KEY = __SESSION_STORAGE_KEY_JSON__;
-const LAST_IDX_KEY = 'last_idx_' + SESSION_STORAGE_KEY;
-const lastIdx = localStorage.getItem(LAST_IDX_KEY);
-if (lastIdx !== null){{
-  resumeBtn.style.display = 'inline-block';
-  resumeBtn.href = '/review/' + lastIdx;
-  resumeBtn.onclick = () => {{ window.location = '/review/' + lastIdx; return false; }};
-}}
-fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
-  const level = data.level || 'ok';
-  preflightEl.classList.remove('ok', 'warn', 'err');
-  preflightEl.classList.add(level === 'ok' ? 'ok' : (level === 'warn' ? 'warn' : 'err'));
-  const rows = (data.errors || []).concat(data.warnings || []).concat((data.info || []).slice(0, 2));
-  if (!rows.length) {{
-    preflightEl.textContent = 'Preflight checks passed.';
-    return;
-  }}
-  preflightEl.innerHTML = '<strong>Preflight</strong><ul>' + rows.slice(0, 6).map(x => '<li>' + x + '</li>').join('') + '</ul>';
-}}).catch(() => {{
-  preflightEl.textContent = 'Preflight status unavailable.';
-}});
-</script>
-</body></html>"""
-        atlas_msg_html = ""
-        if atlas_preview_message:
-            atlas_msg_html = f"<div class=\"note\">{atlas_preview_message}</div>"
-        atlas_overview_html = ""
-        if atlas_screened_preview or atlas_category_preview or atlas_preview_path:
-            ts = int(time.time() * 1000)
-            atlas_overview_html = (
-                f"<div class=\"atlas-row\">"
-                f"<div class=\"atlas-card\"><div class=\"atlas-title\">Atlas overview: screened GridSquares</div>"
-                f"<img src=\"/atlas_overview_screened?t={ts}\" alt=\"Atlas overview with screened GridSquares\"></div>"
-                f"<div class=\"atlas-card\"><div class=\"atlas-title\">Atlas overview: all squares by EPU color / category (arbitrary colors)</div>"
-                f"<img src=\"/atlas_overview_categories?t={ts}\" alt=\"Atlas overview by EPU category\"></div>"
-                f"<div class=\"atlas-card\"><div class=\"atlas-title\">Atlas overview: raw (no overlay)</div>"
-                f"<img src=\"/atlas_overview_raw?t={ts}\" alt=\"Raw atlas overview\"></div>"
-                f"</div>"
-                f"<div class=\"note\">Note: category colors are currently arbitrary and do not match the EPU GUI color code.</div>"
+const GRIDS=__GRIDS_JSON__;const HAS_ATLAS=__HAS_ATLAS__;const SESSION_STORAGE_KEY=__SESSION_KEY__;const LAST_IDX_KEY='last_idx_'+SESSION_STORAGE_KEY;const atlasViewport=document.getElementById('atlas-viewport');const atlasContent=document.getElementById('atlas-content');const markerLayer=document.getElementById('marker-layer');let selectedIdx=null;let atlasScale=1,atlasX=0,atlasY=0,atlasDragging=false,atlasStartX=0,atlasStartY=0;
+function esc(value){return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+function renderMarkers(){if(!markerLayer)return;markerLayer.innerHTML='';GRIDS.filter(g=>g.position).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-marker'+(g.reviewed?' reviewed':'')+(!g.include?' excluded':'');b.dataset.idx=g.idx;b.style.left=g.position.x+'%';b.style.top=g.position.y+'%';b.textContent=String(g.idx+1);b.title='GridSquare '+g.id;b.setAttribute('aria-label','Open GridSquare '+g.id);b.addEventListener('pointerdown',e=>e.stopPropagation());b.onclick=e=>{e.stopPropagation();selectGrid(g.idx)};markerLayer.appendChild(b)})}
+function renderGridList(filter=''){const list=document.getElementById('grid-list');const needle=filter.trim().toLowerCase();list.innerHTML='';GRIDS.filter(g=>!needle||g.id.toLowerCase().includes(needle)||g.name.toLowerCase().includes(needle)).forEach(g=>{const b=document.createElement('button');b.type='button';b.className='grid-card'+(g.reviewed?' reviewed':'')+(g.idx===selectedIdx?' active':'');b.dataset.idx=g.idx;b.innerHTML='<span class="grid-card-index">'+(g.idx+1)+'</span><span><span class="grid-card-title">GridSquare '+esc(g.id)+'</span><span class="grid-card-meta">'+g.foil_count+' foils · '+g.data_count+' data'+(g.reviewed?' · reviewed':'')+'</span></span>';b.onclick=()=>selectGrid(g.idx);list.appendChild(b)})}
+async function selectGrid(idx){selectedIdx=idx;document.querySelectorAll('.grid-marker,.grid-card').forEach(el=>el.classList.toggle('active',Number(el.dataset.idx)===idx));const empty=document.getElementById('inspector-empty'),body=document.getElementById('inspector-body'),gallery=document.getElementById('inspector-gallery');empty.style.display='none';body.classList.add('visible');gallery.innerHTML='<div class="panel-note">Loading images…</div>';try{const res=await fetch('/grid_details?idx='+idx);if(!res.ok)throw new Error('HTTP '+res.status);const data=await res.json();document.getElementById('selected-title').textContent='GridSquare '+data.id;document.getElementById('selected-file').textContent=data.name;document.getElementById('selected-badges').innerHTML='<span class="badge">EPU '+esc(data.category??'N/A')+'</span><span class="badge">'+data.foil_count+' foils</span><span class="badge">'+data.data_count+' data</span>';document.getElementById('review-selected').href=data.review_url;gallery.innerHTML='';data.images.forEach(img=>{const b=document.createElement('button');b.type='button';b.className='gallery-item';const meta=(img.meta||[]).slice(0,2).map(esc).join('<br>');b.innerHTML='<img loading="lazy" src="'+esc(img.thumb)+'" alt="'+esc(img.label)+'"><div class="gallery-caption">'+esc(img.label)+'</div>'+(meta?'<div class="gallery-meta">'+meta+'</div>':'');b.onclick=()=>openLightbox(img.src,img.label);gallery.appendChild(b)});renderGridList(document.getElementById('grid-search').value)}catch(err){gallery.innerHTML='<div class="panel-note">Images could not be loaded.</div>'}}
+function openLightbox(src,label){const box=document.getElementById('lightbox');document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=label;box.classList.add('open')}
+function closeLightbox(){document.getElementById('lightbox').classList.remove('open');document.getElementById('lightbox-image').src=''}
+function applyAtlas(){atlasContent.style.transform='translate('+atlasX.toFixed(1)+'px,'+atlasY.toFixed(1)+'px) scale('+atlasScale.toFixed(3)+')';document.getElementById('atlas-zoom').textContent=Math.round(atlasScale*100)+'%'}
+function setAtlasScale(value,clientX=null,clientY=null){const next=Math.max(1,Math.min(8,value)),ratio=next/atlasScale;if(clientX!==null){const r=atlasViewport.getBoundingClientRect(),px=clientX-r.left-r.width/2,py=clientY-r.top-r.height/2;atlasX=px-(px-atlasX)*ratio;atlasY=py-(py-atlasY)*ratio}else{atlasX*=ratio;atlasY*=ratio}atlasScale=next;if(next===1){atlasX=0;atlasY=0}applyAtlas()}
+function resetAtlas(){atlasScale=1;atlasX=0;atlasY=0;applyAtlas()}
+if(HAS_ATLAS){renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.atlas-tools'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;img.src=b.dataset.mode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw';if(markerLayer)markerLayer.style.display=b.dataset.mode==='screened'?'block':'none';resetAtlas()})}
+renderGridList();document.getElementById('grid-search').addEventListener('input',e=>renderGridList(e.target.value));document.getElementById('lightbox-close').onclick=closeLightbox;document.getElementById('lightbox').onclick=e=>{if(e.target.id==='lightbox')closeLightbox()};document.addEventListener('keydown',e=>{if(e.key==='Escape')closeLightbox()});const lastIdx=localStorage.getItem(LAST_IDX_KEY);if(lastIdx!==null&&Number(lastIdx)>=0&&Number(lastIdx)<GRIDS.length){const resume=document.getElementById('resume-btn');resume.style.display='inline-flex';resume.href='/review/'+lastIdx}if(GRIDS.length)selectGrid(0);
+fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data.level||'ok',health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');health.className='health-light '+(level==='ok'?'ok':level==='error'?'err':'');text.textContent=level==='ok'?'Session ready':level==='error'?'Session issue':'Ready with warnings';const rows=(data.errors||[]).concat(data.warnings||[]);if(rows.length){box.className='preflight-pop show'+(level==='error'?' err':'');box.innerHTML='<strong>'+(level==='error'?'Session issue':'Preflight note')+':</strong> '+rows.slice(0,3).map(esc).join(' · ')}}).catch(()=>{document.getElementById('health-text').textContent='Status unavailable'});
+</script></body></html>"""
+        if atlas_preview_path:
+            atlas_content = (
+                "<div class=\"atlas-image-wrap\"><img id=\"atlas-image\" class=\"atlas-image\" "
+                "src=\"/atlas_overview_raw\" alt=\"High-resolution grid atlas\"><div id=\"marker-layer\" class=\"marker-layer\"></div></div>"
             )
-        root_html = root_html.replace("__SESSION_STORAGE_KEY_JSON__", json.dumps(session_storage_key))
-        root_html = root_html.replace("__ATLAS_MSG_HTML__", atlas_msg_html)
-        root_html = root_html.replace("__ATLAS_OVERVIEW_HTML__", atlas_overview_html)
+            atlas_modes = (
+                "<div class=\"segmented\"><button type=\"button\" class=\"atlas-mode active\" data-mode=\"screened\">Screened</button>"
+                "<button type=\"button\" class=\"atlas-mode\" data-mode=\"categories\">EPU categories</button>"
+                "<button type=\"button\" class=\"atlas-mode\" data-mode=\"raw\">Raw</button></div>"
+            )
+            atlas_aux = (
+                "<div class=\"atlas-help\">Scroll to zoom · drag to pan · double-click to reset</div>"
+                "<div class=\"atlas-tools\"><button type=\"button\" id=\"atlas-minus\" aria-label=\"Zoom out\">−</button>"
+                "<span id=\"atlas-zoom\" class=\"atlas-zoom\">100%</span>"
+                "<button type=\"button\" id=\"atlas-plus\" aria-label=\"Zoom in\">+</button>"
+                "<button type=\"button\" id=\"atlas-reset\" aria-label=\"Reset view\">↺</button></div>"
+            )
+        else:
+            atlas_content = "<div class=\"atlas-empty\"><div><strong>Atlas unavailable</strong><br><span>Add the EPU Atlas folder when launching to enable spatial navigation.</span></div></div>"
+            atlas_modes = ""
+            atlas_aux = ""
+        safe_grids_json = json.dumps(grid_summaries, separators=(",", ":")).replace("</", "<\\/")
+        root_html = root_html.replace("__GRIDS_JSON__", safe_grids_json)
+        root_html = root_html.replace("__HAS_ATLAS__", "true" if atlas_preview_path else "false")
+        root_html = root_html.replace("__SESSION_KEY__", json.dumps(session_storage_key))
+        root_html = root_html.replace("__SESSION_PATH__", str(base_dir).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        root_html = root_html.replace("__TOTAL__", str(len(grid_summaries)))
+        root_html = root_html.replace("__REVIEWED__", str(reviewed_count))
+        root_html = root_html.replace("__IMAGES__", str(image_count))
+        root_html = root_html.replace("__MAPPED__", str(mapped_count))
+        root_html = root_html.replace("__ATLAS_CONTENT__", atlas_content)
+        root_html = root_html.replace("__ATLAS_MODES__", atlas_modes)
+        root_html = root_html.replace("__ATLAS_AUX__", atlas_aux)
         return HTMLResponse(root_html)
 
     @app.get("/review/{idx}")
@@ -1905,6 +1974,86 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
         if idx < 0 or idx >= len(items):
             return HTMLResponse("<html><body>Invalid index</body></html>", status_code=404)
         return HTMLResponse(review_html(idx))
+
+    @app.get("/grid_details")
+    def grid_details(idx: int):
+        if idx < 0 or idx >= len(items):
+            raise HTTPException(status_code=404)
+        item = items[idx]
+        images = [
+            {
+                "kind": "grid",
+                "name": "",
+                "label": "GridSquare",
+                "src": f"/grid?idx={idx}",
+                "thumb": f"/thumb?idx={idx}&kind=grid&size=420",
+                "has_mrc": bool(item.get("mrc")),
+                "meta": [],
+            }
+        ]
+        if item.get("atlas"):
+            images.insert(
+                0,
+                {
+                    "kind": "atlas",
+                    "name": "",
+                    "label": "Atlas location",
+                    "src": f"/atlas?idx={idx}",
+                    "thumb": f"/thumb?idx={idx}&kind=atlas&size=420",
+                    "has_mrc": bool(item.get("atlas_mrc")),
+                    "meta": [],
+                },
+            )
+        if item.get("overlay"):
+            images.append(
+                {
+                    "kind": "overlay",
+                    "name": "",
+                    "label": "Foil overlay",
+                    "src": f"/overlay?idx={idx}",
+                    "thumb": f"/thumb?idx={idx}&kind=overlay&size=420",
+                    "has_mrc": False,
+                    "meta": [],
+                }
+            )
+        for foil in item["foils"]:
+            encoded = urllib.parse.quote(foil["path"].name)
+            images.append(
+                {
+                    "kind": "foil",
+                    "name": foil["path"].name,
+                    "label": f"FoilHole {foil['id']}",
+                    "src": f"/foil?idx={idx}&name={encoded}",
+                    "thumb": f"/thumb?idx={idx}&kind=foil&name={encoded}&size=420",
+                    "has_mrc": bool(foil.get("mrc")),
+                    "meta": [],
+                }
+            )
+        for data_image in item["data"]:
+            encoded = urllib.parse.quote(data_image["path"].name)
+            images.append(
+                {
+                    "kind": "data",
+                    "name": data_image["path"].name,
+                    "label": f"Data {data_image['id']}",
+                    "src": f"/data?idx={idx}&name={encoded}",
+                    "thumb": f"/thumb?idx={idx}&kind=data&name={encoded}&size=420",
+                    "has_mrc": bool(data_image.get("mrc")),
+                    "meta": data_image.get("meta") or [],
+                }
+            )
+        return JSONResponse(
+            {
+                "idx": idx,
+                "id": str(item["id"]),
+                "name": item["name"],
+                "category": item.get("epu_category_score"),
+                "foil_count": len(item["foils"]),
+                "data_count": len(item["data"]),
+                "review_url": f"/review/{idx}",
+                "images": images,
+            }
+        )
 
     @app.get("/preflight")
     def preflight():
@@ -1965,6 +2114,8 @@ fetch('/preflight?t=' + Date.now()).then(r => r.json()).then(data => {{
 
     @app.get("/atlas_overview_raw")
     def atlas_overview_raw():
+        if atlas_raw_preview:
+            return Response(content=atlas_raw_preview, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
         if atlas_preview_path and atlas_preview_path.is_file():
             return FileResponse(atlas_preview_path)
         raise HTTPException(status_code=404)

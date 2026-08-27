@@ -4,10 +4,12 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 
 ## Why use it
 - Inspect GridSquare, FoilHole, and Data images in one page.
+- Use the atlas-first dashboard to jump directly to any screened GridSquare and
+  browse all of its associated images without leaving the overview.
 - Map the acquired FoilHoles onto the GridSquare and the current GridSquare
   position on the atlas to pick the best areas.
-- Switch between JPEG and MRC, adjust contrast, zoom, and pan inside the main
-  viewer.
+- Switch between JPEG and MRC, adjust contrast, and zoom or pan continuously in
+  the main viewer (scroll to zoom, then drag—no separate pan tool).
 - Rate each GridSquare, add reviewer comments, and choose whether it stays in
   the final report.
 
@@ -102,7 +104,12 @@ Images-Disc1/
 
 ![EPU Mapper first page](images/EPU_mapper_1st_page.png)
 
-The start page runs preflight checks, confirms that the session folders were found, and shows three atlas previews: screened GridSquares, all atlas squares by EPU category, and the raw atlas.
+The start page is an interactive screening dashboard. It runs preflight checks,
+confirms that the session folders were found, and uses the full-resolution atlas
+MRC when available. Click a numbered screened-square marker to open its
+GridSquare, foil overlay, FoilHole, and data images in the inspector. You can
+also search the acquisition-order list, switch to the EPU-category or raw atlas,
+and enter the systematic review at any selected square.
 
 ### 4. Review GridSquares in the web app
 
