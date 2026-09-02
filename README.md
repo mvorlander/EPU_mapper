@@ -1,8 +1,29 @@
 # EPU Screening Review App
 
-The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth following up. It renders every square, lets you add per-square ratings/comments, and exports PDF reports.
+The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions so you can quickly decide which GridSquares (and FoilHoles inside them) are worth following up. It renders every square, lets you add per-square ratings/comments, and exports PDF or self-contained HTML reports.
+
+## Recent changes
+
+### [v0.5.1](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.5.1) — Flexible reports
+
+- **Report scope:** Choose one highest-rated suitable GridSquare or all screened
+  GridSquares with their available images.
+- **Export formats:** Generate either report as a **PDF** or portable,
+  self-contained **HTML** file.
+
+### [v0.3–v0.5](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.5.0) — Dashboard redesign
+
+- **Unified dashboard:** Linked the **Atlas, GridSquare, FoilHole, and Data**
+  viewers with hover previews and Previous/Next navigation.
+- **Faster image review:** Added **PNG-first previews** with on-demand **MRC**
+  loading, contrast adjustment, zoom, and pan.
+- **Review and targeting:** Added persistent ratings, comments, suitability
+  decisions, live Atlas annotations, and manual unscreened targets.
+- **Portable and reliable:** Added portable sessions, session-safe image
+  matching, and more dependable **macOS and Windows launchers**.
 
 ## Why use it
+
 - Inspect GridSquare, FoilHole, and Data images in one page.
 - Use the atlas-first dashboard to jump directly to any screened GridSquare and
   browse all of its associated images without leaving the overview.
@@ -30,6 +51,12 @@ EPU Mapper generates PDF or self-contained HTML reports with Atlas overviews,
 ratings, collection-suitability annotations, comments, and the requested
 GridSquare/FoilHole/Data imagery. These reports provide a portable record for
 choosing targets and setting up high-resolution data collection.
+
+**New**: To avoid oversized PDFs, you can now choose between exporting one
+representative GridSquare marked as suitable for collection, with its screening
+images, or all screened GridSquares and images.
+
+![EPU Mapper report export options for a compact or all-screened report](images/EPU_mapper_export_dialog.png)
 
 ## Installation
 
@@ -110,7 +137,7 @@ Images-Disc1/
 
 ### 2. Start the launcher and fill the launcher fields
 
-![EPU Mapper launcher](images/EPU_mapper_Launcher.png)
+![EPU Mapper launcher](images/EPU_mapper_GUI_new.png)
 
 - `EPU session output folder:` use the EPU `Output folder` path shown above.
 - `Use EPU atlas data (Recommended):` point this to the `Atlas/` folder that EPU created when generating the atlases.
