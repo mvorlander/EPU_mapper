@@ -1,5 +1,6 @@
 import argparse
 import csv
+import copy
 import io
 import errno
 import hashlib
@@ -501,10 +502,12 @@ def _load_review_summary(base_dir: Path) -> str:
 def _save_review_summary(base_dir: Path, text: str | None) -> str:
     normalized = _normalize_summary_text(text)
     path = _summary_file_path(base_dir)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     try:
-        path.write_text(normalized, encoding="utf-8")
-    except Exception:
-        pass
+        temporary.write_text(normalized, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return normalized
 
 
@@ -523,10 +526,16 @@ def _load_json_dict(path: Path) -> dict:
 
 
 def _save_json_dict(path: Path, payload: dict) -> None:
+    """Atomically replace annotations; never report success after a failed write."""
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     try:
-        path.write_text(json.dumps(payload), encoding="utf-8")
-    except Exception:
-        return
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _preflight_checks(
@@ -884,21 +893,18 @@ def create_app(
             foil_processing_note = "FoilHole processing skipped in Atlas/GridSquare-only mode."
         else:
             foils, datas = gather_foil_and_data(gdir)
-            foils = _latest_only(foils)
-            datas = _latest_only(datas)
             for foil_id in sorted(foils.keys()):
                 for foil_path in foils[foil_id]:
                     foil_list.append({"id": foil_id, "path": foil_path, "mrc": _find_mrc_for_jpg(foil_path)})
             for data_id in sorted(datas.keys()):
                 for data_path in datas[data_id]:
-                    if data_id in foils:
-                        meta_lines = []
-                        xml_path = data_path.with_suffix(".xml")
-                        if xml_path.is_file():
-                            meta_lines = _format_meta(parse_metadata(xml_path))
-                        data_list.append(
-                            {"id": data_id, "path": data_path, "mrc": _find_mrc_for_jpg(data_path), "meta": meta_lines}
-                        )
+                    meta_lines = []
+                    xml_path = data_path.with_suffix(".xml")
+                    if xml_path.is_file():
+                        meta_lines = _format_meta(parse_metadata(xml_path))
+                    data_list.append(
+                        {"id": data_id, "path": data_path, "mrc": _find_mrc_for_jpg(data_path), "meta": meta_lines}
+                    )
         overlay_path = None
         overlay_message = None
         foil_markers: list[dict] = []
@@ -1007,6 +1013,7 @@ def create_app(
         _save_json_dict(drafts_file, current)
 
     responses = _load_responses()
+    responses_lock = threading.RLock()
     drafts = _load_drafts()
     manual_targets = {
         str(key): value
@@ -1047,6 +1054,8 @@ def create_app(
             updated_at = time.time()
         return {
             "rating": rating,
+            "priority": payload.get("priority") if payload.get("priority") in ("primary", "backup", "needs_screening") else "primary",
+            "preferred_hole": str(payload.get("preferred_hole", "") or "")[:200],
             "comment": comment,
             "include": include,
             "collect": collect,
@@ -1221,6 +1230,8 @@ def create_app(
                     "category": item.get("epu_category_score"),
                     "foil_count": len(item["foils"]),
                     "data_count": len(item["data"]),
+                    "priority": response["priority"],
+                    "target_order": responses.get(item["dir"].name, {}).get("target_order", idx_item),
                     "reviewed": item["dir"].name in responses and response["reviewed"],
                     "rating": response["rating"] if item["dir"].name in responses and response["reviewed"] else 0,
                     "include": response["include"],
@@ -1254,38 +1265,30 @@ def create_app(
         return summaries
 
     def _hole_preview_records(idx: int, item: dict) -> list[dict]:
-        foil_by_name = {entry["path"].name: entry for entry in item["foils"]}
-        data_by_id: dict[str, list[dict]] = {}
-        for entry in item["data"]:
-            data_by_id.setdefault(entry["id"], []).append(entry)
-        records: list[dict] = []
-        for marker in item.get("foil_markers", []):
-            foil = foil_by_name.get(marker.get("foil_name", ""))
-            if foil is None:
-                continue
-            matched = data_by_id.get(foil["id"], [])
-            data_entry = matched[-1] if matched else None
-            foil_name = foil["path"].name
-            data_name = data_entry["path"].name if data_entry else ""
-            records.append(
-                {
-                    "x": marker.get("x", 0),
-                    "y": marker.get("y", 0),
-                    "marker_label": marker.get("label"),
-                    "foil_id": str(foil["id"]),
-                    "foil_name": foil_name,
-                    "foil_preview": f"/preview.png?idx={idx}&kind=foil&name={urllib.parse.quote(foil_name)}&size=2048&session={session_cache_key}",
-                    "foil_has_mrc": bool(foil.get("mrc")),
-                    "data_name": data_name,
-                    "data_preview": (
-                        f"/preview.png?idx={idx}&kind=data&name={urllib.parse.quote(data_name)}&size=2048&session={session_cache_key}"
-                        if data_entry
-                        else ""
-                    ),
-                    "data_has_mrc": bool(data_entry and data_entry.get("mrc")),
-                    "meta": data_entry.get("meta", []) if data_entry else [],
-                }
-            )
+        from collection_plan import pair_media
+        foils, datas, entries = {}, {}, {}
+        for kind, grouped in (("foils", foils), ("data", datas)):
+            for entry in item[kind]:
+                grouped.setdefault(str(entry["id"]), []).append(entry["path"])
+                entries[entry["path"]] = entry
+        markers = {Path(m.get("foil_name", "")).stem: m for m in item.get("foil_markers", [])}
+        records = []
+        for fid, foil_path, data_path in pair_media(foils, datas):
+            foil, data = entries.get(foil_path), entries.get(data_path)
+            foil_name = foil_path.name if foil_path else ""
+            data_name = data_path.name if data_path else ""
+            marker = markers.get(Path(foil_name).stem, {})
+            def preview(kind, name):
+                return f"/preview.png?idx={idx}&kind={kind}&name={urllib.parse.quote(name)}&size=2048&session={session_cache_key}" if name else ""
+            records.append({
+                "x": marker.get("x"), "y": marker.get("y"),
+                "marker_label": marker.get("label"), "foil_id": fid,
+                "foil_name": foil_name, "foil_preview": preview("foil", foil_name),
+                "foil_has_mrc": bool(foil and foil.get("mrc")),
+                "data_name": data_name, "data_preview": preview("data", data_name),
+                "data_has_mrc": bool(data and data.get("mrc")),
+                "meta": data.get("meta", []) if data else [],
+            })
         return records
 
     def _job_state(job_id: str) -> dict | None:
@@ -1307,43 +1310,49 @@ def create_app(
             job.update(updates)
             job["updated_at"] = time.time()
 
-    def _run_report_job(job_id: str, kind: str, scope: str = "representative") -> None:
+    def _run_report_job(job_id: str, kind: str, scope: str, snapshot: dict, summary_snapshot: str) -> None:
         _update_job(job_id, status="running", progress=10, message="Preparing report...")
         all_screened_images = scope == "all_screened"
         report_path, details_path = _report_paths(all_screened_images=all_screened_images)
         job_kind = "full" if kind == "overview" else kind
-        target_path = report_path if job_kind == "full" else details_path
+        target_path = _temp_report_path(job_id + "_" + (report_path.name if job_kind != "details" else details_path.name))
+        if kind == "html":
+            target_path = target_path.with_suffix(".html")
 
         def _write_target(path: Path) -> None:
-            if job_kind == "full":
+            if job_kind == "html":
+                write_embedded_html_report(base_dir, path, atlas_name, snapshot, overlay=overlay_enabled, atlas_overlay=atlas_overlay, global_summary=summary_snapshot, skip_foil_processing=skip_foil_processing, all_screened_images=all_screened_images, collection_targets_only=scope == "targets")
+            elif job_kind == "full":
                 write_combined_report(
                     base_dir,
                     path,
                     atlas_name,
-                    responses,
+                    snapshot,
                     overlay=overlay_enabled,
                     atlas_overlay=atlas_overlay,
-                    global_summary=summary_state["text"],
+                    global_summary=summary_snapshot,
                     skip_foil_processing=skip_foil_processing,
                     all_screened_images=all_screened_images,
+                    collection_targets_only=scope == "targets",
                 )
             elif job_kind == "details":
                 write_selected_report(
                     base_dir,
                     path,
                     atlas_name,
-                    responses,
+                    snapshot,
                     overlay=overlay_enabled,
                     atlas_overlay=atlas_overlay,
-                    global_summary=summary_state["text"],
+                    global_summary=summary_snapshot,
                     skip_foil_processing=skip_foil_processing,
                     all_screened_images=all_screened_images,
+                    collection_targets_only=scope == "targets",
                 )
             else:
                 raise ValueError(f"unknown report kind: {job_kind}")
 
         try:
-            _update_job(job_id, progress=35, message="Rendering PDF pages...")
+            _update_job(job_id, progress=35, message="Rendering confirmed review snapshot…")
             _write_target(target_path)
         except (PermissionError, OSError):
             target_path = _temp_report_path(target_path.name)
@@ -1395,7 +1404,9 @@ def create_app(
         def log(message: str) -> None:
             clean = str(message).strip()
             if clean:
-                _update_portable_job(job_id, progress=45, message=clean)
+                match = re.search(r"Copying session: (\d+)%", clean)
+                progress = 5 + int(match.group(1)) * .75 if match else 5
+                _update_portable_job(job_id, progress=progress, message=clean)
 
         try:
             manifest_path = export_portable_session(
@@ -1412,8 +1423,7 @@ def create_app(
                 },
                 log=log,
             )
-            _update_portable_job(job_id, progress=90, message="Refreshing reviews and collection targets…")
-            _refresh_portable_annotations(manifest_path)
+            _update_portable_job(job_id, progress=95, message="Portable session copy and manifest verified.")
         except Exception as exc:
             _update_portable_job(
                 job_id,
@@ -2281,19 +2291,10 @@ document.addEventListener('pointerover',event=>{const target=event.target.closes
 document.addEventListener('pointermove',event=>{if(gridHoverPreview.classList.contains('visible'))positionGridHover(event)});
 document.addEventListener('pointerout',event=>{const target=event.target.closest('.grid-marker,.grid-card');if(target&&!target.contains(event.relatedTarget))hideGridHover()});
 document.addEventListener('pointerdown',hideGridHover);
-function renderMarkers(){if(!markerLayer)return;markerLayer.innerHTML='';GRIDS.filter(g=>g.position).forEach(g=>{const noData=g.data_count===0,b=document.createElement('button');b.type='button';b.className='grid-marker'+(g.reviewed?' reviewed':'')+(!g.include?' excluded':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'')+(noData?' no-data':'');b.dataset.idx=g.idx;b.style.left=g.position.x+'%';b.style.top=g.position.y+'%';b.textContent=String(g.idx+1);const decision=g.collection_status==='suitable'?' · suitable for collection':g.collection_status==='unsuitable'?' · unsuitable for collection':'',availability=noData?' · NO SCREENING DATA':'';b.title='GridSquare '+g.id+availability+decision;b.setAttribute('aria-label','Open GridSquare '+g.id+(noData?', no screening data':''));b.addEventListener('pointerdown',e=>e.stopPropagation());b.onclick=e=>{e.stopPropagation();selectGrid(g.idx)};markerLayer.appendChild(b)})}
 function renderGridList(filter=''){const list=document.getElementById('grid-list');const needle=filter.trim().toLowerCase();list.innerHTML='';GRIDS.filter(g=>!needle||g.id.toLowerCase().includes(needle)||g.name.toLowerCase().includes(needle)).forEach(g=>{const noData=g.data_count===0,b=document.createElement('button');b.type='button';b.className='grid-card'+(g.reviewed?' reviewed':'')+(g.collection_status==='suitable'?' collection':'')+(g.collection_status==='unsuitable'?' unsuitable':'')+(noData?' no-data':'')+(g.idx===selectedIdx?' active':'');b.dataset.idx=g.idx;const decision=g.collection_status==='suitable'?' · suitable':g.collection_status==='unsuitable'?' · unsuitable':'',availability=noData?'No screening data':g.foil_count+' foils · '+g.data_count+' data';b.innerHTML='<span class="grid-card-index">'+(g.idx+1)+'</span><span><span class="grid-card-title">GridSquare '+esc(g.id)+'</span><span class="grid-card-meta">'+availability+(g.reviewed?' · reviewed':'')+decision+'</span></span>';b.onclick=()=>selectGrid(g.idx);list.appendChild(b)})}
 let selectedGridData=null,dashboardSaveTimer=null,activeHole=null,activeHoleIndex=-1,dashboardHoles=[];
-function setDashboardRating(value,save=true){document.querySelectorAll('.dashboard-rating').forEach(button=>button.classList.toggle('active',Number(button.dataset.rating)===Number(value)));if(selectedGridData)selectedGridData.rating=Number(value)||0;if(save)queueDashboardSave()}
-function setDashboardCollectionStatus(status,save=true){if(selectedGridData){selectedGridData.collection_status=status;selectedGridData.collect=status==='suitable'}document.getElementById('mark-suitable').classList.toggle('active',status==='suitable');document.getElementById('mark-unsuitable').classList.toggle('active',status==='unsuitable');if(save)queueDashboardSave()}
-function queueDashboardSave(){if(selectedIdx===null||!selectedGridData)return;const state=document.getElementById('dashboard-save-state');state.textContent='Saving…';if(dashboardSaveTimer)clearTimeout(dashboardSaveTimer);dashboardSaveTimer=setTimeout(saveDashboardReview,450)}
-async function saveDashboardReview(){if(selectedIdx===null||!selectedGridData)return;const payload={idx:selectedIdx,rating:selectedGridData.rating||0,comment:document.getElementById('dashboard-comment').value,include:document.getElementById('dashboard-include').checked,collection_status:selectedGridData.collection_status||'',collect:selectedGridData.collection_status==='suitable'};const state=document.getElementById('dashboard-save-state');try{const response=await fetch('/review_state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!response.ok)throw new Error('HTTP '+response.status);const result=await response.json(),grid=GRIDS.find(entry=>entry.idx===selectedIdx);if(grid){grid.reviewed=true;grid.rating=payload.rating;grid.include=payload.include;grid.collect=payload.collect;grid.collection_status=payload.collection_status}state.textContent='Saved';renderMarkers();renderGridList(document.getElementById('grid-search').value)}catch(error){state.textContent='Save failed — retry after reconnecting'}}
 function pngUrl(kind,name,size=1400){return '/preview.png?idx='+selectedIdx+'&kind='+kind+(name?'&name='+encodeURIComponent(name):'')+'&size='+size+'&session='+encodeURIComponent(CACHE_KEY)}
 function mrcPreviewUrl(kind,name,low=2,high=98){return '/mrc_file?idx='+selectedIdx+'&kind='+kind+'&name='+encodeURIComponent(name||'')+'&low='+encodeURIComponent(low)+'&high='+encodeURIComponent(high)+'&t='+Date.now()}
-function arrangeSelectedWorkspace(){const layout=document.querySelector('.selected-detail-layout'),media=document.querySelector('.selected-media-card'),comparison=document.getElementById('hole-comparison');if(!layout||!media||!comparison)return;media.querySelector('.panel-title').textContent='GridSquare with screened FoilHoles';const ratings=document.getElementById('dashboard-ratings'),ratingTitle=ratings.previousElementSibling,ratingPanel=document.createElement('div');ratingPanel.className='inline-rating-panel';ratingPanel.appendChild(ratingTitle);ratingPanel.appendChild(ratings);media.appendChild(ratingPanel);const visual=document.createElement('div');visual.className='selected-visual-workspace';layout.insertBefore(visual,media);visual.appendChild(media);visual.appendChild(comparison);const foilPanel=document.getElementById('comparison-foil').closest('.comparison-panel'),dataPanel=document.getElementById('comparison-data').closest('.comparison-panel'),grid=comparison.querySelector('.comparison-grid');dataPanel.classList.add('data-panel');grid.appendChild(dataPanel);grid.appendChild(foilPanel);const placeholder=document.createElement('div');placeholder.className='hole-preview-placeholder';placeholder.innerHTML='<div><strong>Hover a screened FoilHole</strong><br><span>Its Data image will appear beside the GridSquare, with the FoilHole image underneath.</span></div>';grid.insertBefore(placeholder,grid.firstChild)}
-function installMrcViewer(imgId,pngButtonId,mrcButtonId,kind,getSource){const img=document.getElementById(imgId),pngButton=document.getElementById(pngButtonId),mrcButton=document.getElementById(mrcButtonId);if(!img||!pngButton||!mrcButton)return;const viewport=document.createElement('div');viewport.className='review-image-viewport';img.parentNode.insertBefore(viewport,img);viewport.appendChild(img);const controls=document.createElement('div');controls.className='mrc-viewer-controls';controls.innerHTML='<div class="mrc-control-row"><label>Low <span class="mrc-low-value">2</span>% <input class="mrc-low" type="range" min="0" max="99" value="2"></label><label>High <span class="mrc-high-value">98</span>% <input class="mrc-high" type="range" min="1" max="100" value="98"></label></div><div class="mrc-control-row"><button type="button" class="button mrc-minus">−</button><span class="mrc-zoom-value">100%</span><button type="button" class="button mrc-plus">+</button><button type="button" class="button mrc-reset">Reset</button><span class="panel-note">Scroll to zoom · drag to pan</span></div>';mrcButton.closest('.media-actions').after(controls);const low=controls.querySelector('.mrc-low'),high=controls.querySelector('.mrc-high'),lowValue=controls.querySelector('.mrc-low-value'),highValue=controls.querySelector('.mrc-high-value'),zoomValue=controls.querySelector('.mrc-zoom-value');let scale=1,x=0,y=0,dragging=false,startX=0,startY=0,renderTimer=null,mrcActive=false;function apply(){img.style.transform='translate('+x.toFixed(1)+'px,'+y.toFixed(1)+'px) scale('+scale.toFixed(3)+')';zoomValue.textContent=Math.round(scale*100)+'%';viewport.classList.toggle('zoomable',mrcActive)}function setScale(value){const next=Math.max(1,Math.min(8,value)),ratio=next/scale;x*=ratio;y*=ratio;scale=next;if(scale===1){x=0;y=0}apply()}function reset(){scale=1;x=0;y=0;apply()}function renderMrc(){const source=getSource();if(!source||!source.name||!source.hasMrc)return;const lowNumber=Number(low.value),highNumber=Number(high.value);lowValue.textContent=low.value;highValue.textContent=high.value;img.style.display='block';img.src=mrcPreviewUrl(kind,source.name,lowNumber,highNumber)}function queueRender(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}lowValue.textContent=low.value;highValue.textContent=high.value;if(renderTimer)clearTimeout(renderTimer);renderTimer=setTimeout(renderMrc,250)}low.oninput=()=>queueRender(low);high.oninput=()=>queueRender(high);mrcButton.onclick=()=>{const source=getSource();if(!source||!source.hasMrc)return;mrcActive=true;controls.classList.add('visible');renderMrc();reset()};pngButton.onclick=()=>{const source=getSource();if(!source||!source.png)return;mrcActive=false;controls.classList.remove('visible');img.style.display='block';img.src=source.png;reset()};controls.querySelector('.mrc-minus').onclick=()=>setScale(scale/1.3);controls.querySelector('.mrc-plus').onclick=()=>setScale(scale*1.3);controls.querySelector('.mrc-reset').onclick=reset;viewport.addEventListener('wheel',event=>{if(!mrcActive)return;event.preventDefault();setScale(scale*Math.exp(-event.deltaY*.0015))},{passive:false});viewport.addEventListener('pointerdown',event=>{if(!mrcActive||scale<=1||event.button!==0)return;dragging=true;startX=event.clientX-x;startY=event.clientY-y;viewport.classList.add('dragging');viewport.setPointerCapture(event.pointerId)});viewport.addEventListener('pointermove',event=>{if(!dragging)return;x=event.clientX-startX;y=event.clientY-startY;apply()});viewport.addEventListener('pointerup',()=>{dragging=false;viewport.classList.remove('dragging')});viewport.addEventListener('pointercancel',()=>{dragging=false;viewport.classList.remove('dragging')});apply()}
-function positionDashboardHolePreview(hole){activeHole=hole;const section=document.getElementById('hole-comparison');section.classList.add('has-selection');document.getElementById('hole-comparison-title').textContent='FoilHole '+hole.foil_id;document.getElementById('comparison-meta').innerHTML=hole.data_preview?(hole.meta||[]).map(esc).join('<br>'):'No matching Data image';document.getElementById('comparison-foil-mrc').disabled=!hole.foil_has_mrc;document.getElementById('comparison-data-mrc').disabled=!hole.data_has_mrc;document.getElementById('comparison-foil-png').click();if(hole.data_preview)document.getElementById('comparison-data-png').click();else document.getElementById('comparison-data').style.display='none'}
-function renderDashboardHoles(holes){const layer=document.getElementById('dashboard-hole-layer');layer.innerHTML='';(holes||[]).forEach(hole=>{const button=document.createElement('button');button.type='button';button.className='dashboard-hole-hit';button.style.left=hole.x+'%';button.style.top=hole.y+'%';button.title='FoilHole '+hole.foil_id;button.setAttribute('aria-label','Preview FoilHole '+hole.foil_id);button.onpointerenter=()=>positionDashboardHolePreview(hole);button.onfocus=()=>positionDashboardHolePreview(hole);button.onclick=()=>positionDashboardHolePreview(hole);layer.appendChild(button)})}
 function syncSelectedGridAnnotation(){if(selectedIdx===null||!selectedGridData)return;const grid=GRIDS.find(entry=>entry.idx===selectedIdx);if(grid){grid.rating=Number(selectedGridData.rating)||0;grid.collect=Boolean(selectedGridData.collect);grid.collection_status=selectedGridData.collection_status||''}renderMarkers();renderGridList(document.getElementById('grid-search').value)}
 function setDashboardRating(value,save=true){document.querySelectorAll('.dashboard-rating').forEach(button=>button.classList.toggle('active',Number(button.dataset.rating)===Number(value)));if(selectedGridData){selectedGridData.rating=Number(value)||0;syncSelectedGridAnnotation()}if(save)queueDashboardSave()}
 function setDashboardCollectionStatus(status,save=true){const normalized=status==='suitable'||status==='unsuitable'?status:'';if(selectedGridData){selectedGridData.collection_status=normalized;selectedGridData.collect=normalized==='suitable';syncSelectedGridAnnotation()}document.getElementById('mark-suitable').classList.toggle('active',normalized==='suitable');document.getElementById('mark-unsuitable').classList.toggle('active',normalized==='unsuitable');if(save)queueDashboardSave()}
@@ -2305,7 +2306,7 @@ function renderMarkers(){
     button.type='button';button.className='grid-marker'+(grid.reviewed?' reviewed':'')+(!grid.include?' excluded':'')+(noData?' no-data':'')+(grid.idx===selectedIdx?' active':'');button.dataset.idx=grid.idx;button.dataset.statusLabel=status==='suitable'?'S':status==='unsuitable'?'U':'-';button.style.setProperty('--status-color',statusColor);button.style.left=grid.position.x+'%';button.style.top=grid.position.y+'%';button.style.background=ratingColors[Number(grid.rating)||0];button.style.color=[3,4].includes(Number(grid.rating))?'#172033':'#fff';button.style.borderColor=statusColor;button.style.boxShadow=noData?'0 0 0 4px rgba(251,191,36,.55),0 3px 10px rgba(0,0,0,.4)':'0 0 0 3px '+statusColor+'55,0 3px 10px rgba(0,0,0,.4)';button.textContent=String(grid.idx+1);
     const decision=status==='suitable'?' · suitable for collection':status==='unsuitable'?' · unsuitable for collection':' · collection status unmarked',availability=noData?' · NO SCREENING DATA':'';button.title='GridSquare '+grid.id+' · rating '+(grid.rating||0)+availability+decision;button.setAttribute('aria-label','Open GridSquare '+grid.id+', rating '+(grid.rating||0)+decision+(noData?', no screening data':''));button.addEventListener('pointerdown',event=>event.stopPropagation());button.onclick=event=>{event.stopPropagation();selectGrid(grid.idx)};markerLayer.appendChild(button);
   });
-  UNSCREENED.filter(target=>target.selected||targetMode).forEach(target=>{const button=document.createElement('button');button.type='button';button.className='manual-target-marker '+(target.selected?'selected':'candidate');button.style.left=target.position.x+'%';button.style.top=target.position.y+'%';button.title=targetMode?((target.selected?'Remove':'Add')+' unscreened GridSquare '+target.id+' as a collection target'):('Manual collection target · GridSquare '+target.id);button.setAttribute('aria-label',button.title);button.addEventListener('pointerdown',event=>event.stopPropagation());button.onclick=async event=>{event.stopPropagation();if(!targetMode&&target.selected)return;button.disabled=true;try{const response=await fetch('/manual_target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:target.key,selected:!target.selected})});if(!response.ok)throw new Error('HTTP '+response.status);const payload=await response.json();target.selected=Boolean(payload.selected);renderMarkers()}catch(error){alert('Could not save target: '+error.message)}};markerLayer.appendChild(button)});
+  UNSCREENED.filter(target=>target.selected||targetMode).forEach(target=>{const button=document.createElement('button');button.type='button';button.className='manual-target-marker '+(target.selected?'selected':'candidate');button.style.left=target.position.x+'%';button.style.top=target.position.y+'%';button.title=targetMode?((target.selected?'Remove':'Add')+' unscreened GridSquare '+target.id+' as a collection target'):('Manual collection target · GridSquare '+target.id);button.setAttribute('aria-label',button.title);button.addEventListener('pointerdown',event=>event.stopPropagation());button.onclick=async event=>{event.stopPropagation();if(!targetMode&&target.selected)return;button.disabled=true;try{const response=await fetch('/manual_target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:target.key,selected:!target.selected})});if(!response.ok)throw new Error('HTTP '+response.status);const payload=await response.json();target.selected=Boolean(payload.selected);renderMarkers();updateCollectionProgress()}catch(error){alert('Could not save target: '+error.message)}};markerLayer.appendChild(button)});
   const targetButton=document.getElementById('manual-target-toggle');if(targetButton){const count=UNSCREENED.filter(target=>target.selected).length;targetButton.classList.toggle('active',targetMode);targetButton.textContent=(targetMode?'Finish target selection':'Add unscreened targets')+(count?' · '+count:'')}
   const atlasHelp=document.getElementById('atlas-help');if(atlasHelp)atlasHelp.textContent=targetMode?'Target mode: click an unscreened square; only selected targets will be marked.':'Scroll to zoom · drag to pan · double-click to reset';
 }
@@ -2338,7 +2339,7 @@ function installMrcViewer(imgId,pngButtonId,mrcButtonId,kind,getSource){
   const img=document.getElementById(imgId),pngButton=document.getElementById(pngButtonId),mrcButton=document.getElementById(mrcButtonId);if(!img||!pngButton||!mrcButton)return;
   const parent=img.parentNode,viewport=document.createElement('div');viewport.className='review-image-viewport';parent.insertBefore(viewport,img);
   const stage=document.createElement('div');stage.className='review-image-stage';viewport.appendChild(stage);stage.appendChild(img);if(kind==='grid'){const layer=document.getElementById('dashboard-hole-layer');if(layer)stage.appendChild(layer)}
-  const controls=document.createElement('div');controls.className='mrc-viewer-controls'+(kind==='grid'?' grid-viewer-controls':'');const controlsTitle=kind==='grid'?'<div class="viewer-controls-title"><span>GridSquare display controls</span><span>Contrast activates with MRC</span></div>':'';controls.innerHTML=controlsTitle+'<div class="mrc-control-row mrc-contrast-row"><label>Low <span class="mrc-low-value">2</span>% <input class="mrc-low" type="range" min="0" max="99" value="2"></label><label>High <span class="mrc-high-value">98</span>% <input class="mrc-high" type="range" min="1" max="100" value="98"></label></div><div class="mrc-control-row"><button type="button" class="button mrc-minus">−</button><span class="mrc-zoom-value">100%</span><button type="button" class="button mrc-plus">+</button><button type="button" class="button mrc-reset">Reset</button><span class="panel-note">Scroll to zoom · drag to pan</span></div>';
+  const controls=document.createElement('div');controls.className='mrc-viewer-controls'+(kind==='grid'?' grid-viewer-controls':'');const controlsTitle=kind==='grid'?'<div class="viewer-controls-title"><span>GridSquare display controls</span><span>PNG + MRC</span></div>':'';controls.innerHTML=controlsTitle+'<div class="mrc-control-row mrc-contrast-row"><label>Low <span class="mrc-low-value">2</span>% <input class="mrc-low" type="range" min="0" max="99" value="2"></label><label>High <span class="mrc-high-value">98</span>% <input class="mrc-high" type="range" min="1" max="100" value="98"></label></div><div class="mrc-control-row"><button type="button" class="button mrc-minus">−</button><span class="mrc-zoom-value">100%</span><button type="button" class="button mrc-plus">+</button><button type="button" class="button mrc-reset">Reset</button><span class="panel-note">Scroll to zoom · drag to pan</span></div>';
   mrcButton.closest('.media-actions').after(controls);
   if(kind==='grid'){const gridNav=document.getElementById('grid-nav');if(gridNav)controls.after(gridNav)}
   const low=controls.querySelector('.mrc-low'),high=controls.querySelector('.mrc-high'),lowValue=controls.querySelector('.mrc-low-value'),highValue=controls.querySelector('.mrc-high-value'),zoomValue=controls.querySelector('.mrc-zoom-value'),contrastRow=controls.querySelector('.mrc-contrast-row');let scale=1,x=0,y=0,dragging=false,startX=0,startY=0,renderTimer=null,mrcActive=false;if(kind==='grid'){low.disabled=true;high.disabled=true;contrastRow.classList.add('disabled')}
@@ -2346,16 +2347,16 @@ function installMrcViewer(imgId,pngButtonId,mrcButtonId,kind,getSource){
   function apply(){stage.style.transform='translate(-50%,-50%) translate('+x.toFixed(1)+'px,'+y.toFixed(1)+'px) scale('+scale.toFixed(3)+')';zoomValue.textContent=Math.round(scale*100)+'%';viewport.classList.toggle('zoomable',scale>1)}
   function setScale(value){const next=Math.max(1,Math.min(8,value)),ratio=next/scale;x*=ratio;y*=ratio;scale=next;if(scale===1){x=0;y=0}apply()}
   function reset(){scale=1;x=0;y=0;apply()}
-  function renderMrc(){const source=getSource();if(!source||!source.hasMrc)return;lowValue.textContent=low.value;highValue.textContent=high.value;img.src=mrcPreviewUrl(kind,source.name||'',Number(low.value),Number(high.value))}
+  function renderMrc(){if(!mrcActive)return;if(img._applyAdjustments?.())return;const source=getSource();if(!source||!source.hasMrc)return;lowValue.textContent=low.value;highValue.textContent=high.value;img.src=mrcPreviewUrl(kind,source.name||'',Number(low.value),Number(high.value))}
   function queueRender(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}lowValue.textContent=low.value;highValue.textContent=high.value;if(renderTimer)clearTimeout(renderTimer);renderTimer=setTimeout(renderMrc,250)}
   low.oninput=()=>queueRender(low);high.oninput=()=>queueRender(high);
   mrcButton.onclick=()=>{const source=getSource();if(!source||!source.hasMrc)return;mrcActive=true;controls.classList.add('mrc-active');low.disabled=false;high.disabled=false;contrastRow.classList.remove('disabled');pngButton.classList.remove('active');mrcButton.classList.add('active');renderMrc();reset()};
-  pngButton.onclick=()=>{const source=getSource();if(!source||!source.png)return;mrcActive=false;controls.classList.remove('mrc-active');if(kind==='grid'){low.disabled=true;high.disabled=true;contrastRow.classList.add('disabled')}mrcButton.classList.remove('active');pngButton.classList.add('active');img.src=source.png;reset()};
+  pngButton.onclick=()=>{clearTimeout(renderTimer);const source=getSource();if(!source||!source.png)return;mrcActive=false;controls.classList.remove('mrc-active');if(kind==='grid'){low.disabled=true;high.disabled=true;contrastRow.classList.add('disabled')}mrcButton.classList.remove('active');pngButton.classList.add('active');if(!img._applyAdjustments?.())img.src=source.png;reset()};
   controls.querySelector('.mrc-minus').onclick=()=>setScale(scale/1.3);controls.querySelector('.mrc-plus').onclick=()=>setScale(scale*1.3);controls.querySelector('.mrc-reset').onclick=reset;
   viewport.addEventListener('wheel',event=>{event.preventDefault();setScale(scale*Math.exp(-event.deltaY*.0015))},{passive:false});
-  viewport.addEventListener('pointerdown',event=>{if(scale<=1||event.button!==0||event.target.closest('.dashboard-hole-hit'))return;dragging=true;startX=event.clientX-x;startY=event.clientY-y;viewport.classList.add('dragging');viewport.setPointerCapture(event.pointerId)});
+  viewport.addEventListener('pointerdown',event=>{if(scale<=1||event.button!==0||event.target.closest('button'))return;dragging=true;startX=event.clientX-x;startY=event.clientY-y;viewport.classList.add('dragging');viewport.setPointerCapture(event.pointerId)});
   viewport.addEventListener('pointermove',event=>{if(!dragging)return;x=event.clientX-startX;y=event.clientY-startY;apply()});viewport.addEventListener('pointerup',()=>{dragging=false;viewport.classList.remove('dragging')});viewport.addEventListener('pointercancel',()=>{dragging=false;viewport.classList.remove('dragging')});
-  img.addEventListener('load',()=>{syncFit();reset()});if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>{syncFit();apply()}).observe(viewport);img._viewerReset=reset;img._viewerShowPng=()=>pngButton.click();syncFit();apply();
+  img.addEventListener('load',()=>{syncFit();apply()});if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>{syncFit();apply()}).observe(viewport);img._viewerReset=reset;img._viewerShowPng=()=>pngButton.click();installImageAdjustments(img,controls,kind,getSource,()=>mrcActive,()=>mrcActive?mrcButton.click():pngButton.click());syncFit();apply();
 }
 function updateHoleNavigation(){
   const count=dashboardHoles.length,status=document.getElementById('hole-nav-status'),prev=document.getElementById('hole-prev'),next=document.getElementById('hole-next');if(!status||!prev||!next)return;
@@ -2366,9 +2367,9 @@ function updateGridNavigation(){
   status.textContent=selectedIdx===null?'Select a GridSquare':'GridSquare '+(selectedIdx+1)+' of '+GRIDS.length;prev.disabled=selectedIdx===null||selectedIdx<=0;next.disabled=selectedIdx===null||selectedIdx>=GRIDS.length-1;
 }
 function positionDashboardHolePreview(hole){
-  if(!hole)return;activeHole=hole;activeHoleIndex=dashboardHoles.indexOf(hole);document.body.classList.add('has-hole');
-  document.querySelectorAll('.dashboard-hole-hit').forEach((button,index)=>button.classList.toggle('active',index===activeHoleIndex));
-  const foilPanel=document.getElementById('comparison-foil').closest('.linked-image-panel'),dataPanel=document.getElementById('comparison-data').closest('.linked-image-panel');foilPanel.classList.remove('no-image');dataPanel.classList.toggle('no-image',!hole.data_preview);
+  if(!hole||activeHole===hole)return;activeHole=hole;activeHoleIndex=dashboardHoles.indexOf(hole);document.body.classList.add('has-hole');
+  document.querySelectorAll('.dashboard-hole-hit').forEach(button=>{const active=button.dataset.foilId===String(activeHole.foil_id);button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));if(active)button.title='Currently displayed FoilHole '+activeHole.foil_id;else button.title='Show FoilHole '+button.dataset.foilId});
+  const foilPanel=document.getElementById('comparison-foil').closest('.linked-image-panel'),dataPanel=document.getElementById('comparison-data').closest('.linked-image-panel');foilPanel.classList.toggle('no-image',!hole.foil_preview);dataPanel.classList.toggle('no-image',!hole.data_preview);
   foilPanel.querySelector('.comparison-label').textContent='FoilHole '+hole.foil_id;dataPanel.querySelector('.comparison-label').textContent=hole.data_preview?'Data · FoilHole '+hole.foil_id:'Data · no matching image';
   document.getElementById('comparison-meta').innerHTML=hole.data_preview?(hole.meta||[]).map(esc).join('<br>'):'No matching Data image for this FoilHole.';
   document.getElementById('comparison-foil-mrc').disabled=!hole.foil_has_mrc;document.getElementById('comparison-data-mrc').disabled=!hole.data_has_mrc;
@@ -2378,11 +2379,11 @@ function positionDashboardHolePreview(hole){
 function showDashboardHoleByIndex(index){if(!dashboardHoles.length)return;const safe=Math.max(0,Math.min(dashboardHoles.length-1,index));positionDashboardHolePreview(dashboardHoles[safe])}
 function renderDashboardHoles(holes){
   dashboardHoles=Array.isArray(holes)?holes:[];activeHole=null;activeHoleIndex=-1;document.body.classList.remove('has-hole');document.querySelectorAll('.linked-image-panel').forEach(panel=>panel.classList.add('no-image'));document.getElementById('comparison-meta').textContent='';const layer=document.getElementById('dashboard-hole-layer');layer.innerHTML='';
-  dashboardHoles.forEach((hole,index)=>{const button=document.createElement('button');button.type='button';button.className='dashboard-hole-hit';button.style.left=hole.x+'%';button.style.top=hole.y+'%';button.dataset.markerLabel=hole.marker_label||String(index+1);button.title='FoilHole '+hole.foil_id;button.setAttribute('aria-label','Show FoilHole '+hole.foil_id);button.onpointerenter=()=>showDashboardHoleByIndex(index);button.onfocus=()=>showDashboardHoleByIndex(index);button.onclick=()=>showDashboardHoleByIndex(index);layer.appendChild(button)});updateHoleNavigation();
+  const drawnHoles=new Set();dashboardHoles.forEach((hole,index)=>{if(hole.x===null||hole.y===null||drawnHoles.has(hole.foil_id))return;drawnHoles.add(hole.foil_id);const button=document.createElement('button');button.type='button';button.className='dashboard-hole-hit';button.dataset.foilId=hole.foil_id;if(hole.x===null||hole.y===null)return;button.style.left=hole.x+'%';button.style.top=hole.y+'%';button.dataset.markerLabel=hole.marker_label||String(index+1);button.title='FoilHole '+hole.foil_id;button.setAttribute('aria-label','Show FoilHole '+hole.foil_id);button.onpointerenter=()=>previewHole(index);button.onpointerleave=cancelHolePreview;button.onfocus=()=>previewHole(index);button.onclick=()=>pinHole(index);layer.appendChild(button)});updateHoleNavigation();
 }
 async function selectGrid(idx,scrollToReview=true){
-  if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null;await saveDashboardReview()}
-  selectedIdx=idx;activeHole=null;updateGridNavigation();
+  if(!await flushDashboardReview())return;
+  selectedIdx=idx;selectedGridData=null;activeHole=null;updateGridNavigation();
   document.querySelectorAll('.grid-marker,.grid-card').forEach(el=>el.classList.toggle('active',Number(el.dataset.idx)===idx));
   const inspector=document.getElementById('selected-detail'),empty=document.getElementById('inspector-empty'),body=document.getElementById('inspector-body');
   inspector.classList.add('has-selection');empty.style.display='none';body.classList.add('visible');
@@ -2394,7 +2395,7 @@ async function selectGrid(idx,scrollToReview=true){
     const response=await fetch('/grid_details?idx='+idx+'&t='+Date.now(),{cache:'no-store'});
     if(!response.ok)throw new Error('HTTP '+response.status);
     if(idx!==selectedIdx)return;
-    const data=await response.json();selectedGridData=data;
+    const data=await response.json();if(idx!==selectedIdx)return;selectedGridData=data;
     const grid=GRIDS.find(entry=>entry.idx===idx);
     if(grid){grid.collect=Boolean(data.collect);grid.collection_status=data.collection_status||''}
     document.getElementById('selected-title').textContent='GridSquare '+data.id;
@@ -2413,17 +2414,18 @@ async function selectGrid(idx,scrollToReview=true){
     document.getElementById('dashboard-include').checked=data.include!==false;
     document.getElementById('dashboard-save-state').textContent=data.reviewed?'Saved review loaded':'Not yet reviewed';
     renderGridList(document.getElementById('grid-search').value);
-    if(scrollToReview)document.getElementById('selected-detail').scrollIntoView({behavior:'smooth',block:'start'});
-  }catch(error){selectedGridData=null;renderDashboardHoles([]);document.getElementById('dashboard-save-state').textContent='GridSquare could not be loaded: '+error.message}
+    onGridLoaded(data);
+    if(scrollToReview)document.getElementById('selected-detail').scrollIntoView({behavior:'smooth',block:'nearest'});
+  }catch(error){if(idx!==selectedIdx)return;selectedGridData=null;renderDashboardHoles([]);document.getElementById('dashboard-save-state').textContent='GridSquare could not be loaded: '+error.message}
 }
 function openLightbox(src,label){const box=document.getElementById('lightbox');document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=label;box.classList.add('open')}
 function closeLightbox(){document.getElementById('lightbox').classList.remove('open');document.getElementById('lightbox-image').src=''}
 function applyAtlas(){atlasContent.style.transform='translate('+atlasX.toFixed(1)+'px,'+atlasY.toFixed(1)+'px) scale('+atlasScale.toFixed(3)+')';document.getElementById('atlas-zoom').textContent=Math.round(atlasScale*100)+'%'}
 function setAtlasScale(value,clientX=null,clientY=null){const next=Math.max(1,Math.min(8,value)),ratio=next/atlasScale;if(clientX!==null){const r=atlasViewport.getBoundingClientRect(),px=clientX-r.left-r.width/2,py=clientY-r.top-r.height/2;atlasX=px-(px-atlasX)*ratio;atlasY=py-(py-atlasY)*ratio}else{atlasX*=ratio;atlasY*=ratio}atlasScale=next;if(next===1){atlasX=0;atlasY=0}applyAtlas()}
 function resetAtlas(){atlasScale=1;atlasX=0;atlasY=0;applyAtlas()}
-function loadAtlasMrc(){const img=document.getElementById('atlas-image');if(!img||atlasMode!=='mrc')return;img.src='/atlas_overview_mrc?low='+encodeURIComponent(atlasLow)+'&high='+encodeURIComponent(atlasHigh)+'&session='+encodeURIComponent(CACHE_KEY)+'&t='+Date.now()}
+function loadAtlasMrc(){const img=document.getElementById('atlas-image');if(!img||atlasMode!=='mrc')return;if(img._applyAdjustments?.())return;img.src='/atlas_overview_mrc?low='+encodeURIComponent(atlasLow)+'&high='+encodeURIComponent(atlasHigh)+'&session='+encodeURIComponent(CACHE_KEY)+'&t='+Date.now()}
 function installAtlasMrcControls(){if(!atlasViewport)return;const panel=document.createElement('div');panel.className='atlas-mrc-contrast';panel.innerHTML='<label>Low <span class="atlas-low-value">1</span>% <input class="atlas-low" type="range" min="0" max="99" value="1"></label><label>High <span class="atlas-high-value">99</span>% <input class="atlas-high" type="range" min="1" max="100" value="99"></label>';atlasViewport.appendChild(panel);const low=panel.querySelector('.atlas-low'),high=panel.querySelector('.atlas-high'),lowValue=panel.querySelector('.atlas-low-value'),highValue=panel.querySelector('.atlas-high-value');function queue(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}atlasLow=Number(low.value);atlasHigh=Number(high.value);lowValue.textContent=low.value;highValue.textContent=high.value;if(atlasMrcTimer)clearTimeout(atlasMrcTimer);atlasMrcTimer=setTimeout(loadAtlasMrc,300)}low.oninput=()=>queue(low);high.oninput=()=>queue(high);return panel}
-if(HAS_ATLAS){const atlasContrast=installAtlasMrcControls();renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.manual-target-marker,.atlas-tools,.atlas-mrc-contrast'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker,.manual-target-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;atlasMode=b.dataset.mode;atlasContrast.classList.toggle('visible',atlasMode==='mrc');if(atlasMode==='mrc')loadAtlasMrc();else img.src=(atlasMode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=atlasMode==='screened'?'block':'none';resetAtlas()})}
+if(HAS_ATLAS){const atlasContrast=installAtlasMrcControls();renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.manual-target-marker,.atlas-tools,.atlas-mrc-contrast,.viewer-shrink'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker,.manual-target-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;atlasMode=b.dataset.mode;atlasContrast.classList.toggle('visible',atlasMode==='mrc');if(atlasMode==='mrc')loadAtlasMrc();else img.src=(atlasMode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=atlasMode==='screened'?'block':'none';resetAtlas()})}
 const manualTargetToggle=document.getElementById('manual-target-toggle');if(manualTargetToggle)manualTargetToggle.onclick=()=>{targetMode=!targetMode;if(targetMode&&atlasMode!=='screened')document.querySelector('.atlas-mode[data-mode="screened"]').click();renderMarkers()};
 arrangeSelectedWorkspace();
 renderGridList();
@@ -2454,15 +2456,15 @@ function updatePortableStatus(job){const progress=Math.max(0,Math.min(100,Number
 async function pollPortableExport(jobId){try{const response=await fetch('/portable_export/'+encodeURIComponent(jobId)+'?t='+Date.now(),{cache:'no-store'});const job=await response.json();if(!response.ok)throw new Error(job.error||('HTTP '+response.status));updatePortableStatus(job);if(job.status!=='done'&&job.status!=='error')portablePollTimer=setTimeout(()=>pollPortableExport(jobId),900)}catch(error){updatePortableStatus({status:'error',progress:100,message:'Could not read export progress: '+error.message})}}
 document.getElementById('portable-export-dashboard').onclick=()=>{portableStatus.classList.remove('visible','error');portableProgressBar.style.width='0%';if(typeof portableDialog.showModal==='function')portableDialog.showModal();else portableDialog.setAttribute('open','')};
 document.getElementById('portable-dialog-close').onclick=closePortableDialog;document.getElementById('portable-cancel').onclick=closePortableDialog;
-portableStart.onclick=async()=>{const destination=portableDestination.value.trim();if(!destination){updatePortableStatus({status:'error',progress:100,message:'Choose a destination folder.'});return}portableStart.disabled=true;portableStart.textContent='Exporting…';updatePortableStatus({status:'queued',progress:0,message:'Saving current review and preparing export…'});try{if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null;await saveDashboardReview()}const response=await fetch('/portable_export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({destination})});const payload=await response.json();if(!response.ok)throw new Error(payload.error||('HTTP '+response.status));updatePortableStatus(payload.job||{status:'queued',progress:0,message:'Queued…'});pollPortableExport(payload.job_id)}catch(error){updatePortableStatus({status:'error',progress:100,message:'Could not start portable export: '+error.message})}};
-document.addEventListener('keydown',async event=>{if(event.key==='Escape'){closeLightbox();return}if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)&&selectedIdx!==null){event.preventDefault();if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null}await saveDashboardReview();if(selectedIdx<GRIDS.length-1)await selectGrid(selectedIdx+1,true)}});
+portableStart.onclick=async()=>{const destination=portableDestination.value.trim();if(!destination){updatePortableStatus({status:'error',progress:100,message:'Choose a destination folder.'});return}portableStart.disabled=true;portableStart.textContent='Exporting…';updatePortableStatus({status:'queued',progress:0,message:'Saving current review and preparing export…'});try{if(!await flushDashboardReview())throw new Error('Current review is not saved');const response=await fetch('/portable_export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({destination})});const payload=await response.json();if(!response.ok)throw new Error(payload.error||('HTTP '+response.status));updatePortableStatus(payload.job||{status:'queued',progress:0,message:'Queued…'});pollPortableExport(payload.job_id)}catch(error){updatePortableStatus({status:'error',progress:100,message:'Could not start portable export: '+error.message})}};
+document.addEventListener('keydown',async event=>{if(event.key==='Escape'){closeLightbox();return}if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)&&selectedIdx!==null){event.preventDefault();if(dashboardSaveTimer){clearTimeout(dashboardSaveTimer);dashboardSaveTimer=null}if(!await flushDashboardReview())return;if(selectedIdx<GRIDS.length-1)await selectGrid(selectedIdx+1,true)}});
 let serverWasDisconnected=false;
 function showServerDisconnected(message='The local EPU Mapper server is not responding. Return to the launcher and click Start review.'){serverWasDisconnected=true;const health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');if(health)health.className='health-light err';if(text)text.textContent='Server disconnected';box.className='preflight-pop show err';box.innerHTML='<strong>Dashboard disconnected:</strong> '+esc(message)}
 const dashboardAtlasImage=document.getElementById('atlas-image');if(dashboardAtlasImage)dashboardAtlasImage.addEventListener('error',()=>showServerDisconnected('The requested atlas image could not be loaded. If this tab was already open, restart the server in the launcher.'));
 async function monitorServer(){try{const response=await fetch('/status?t='+Date.now(),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);if(serverWasDisconnected)location.reload()}catch(_error){showServerDisconnected()}}
 monitorServer();setInterval(monitorServer,5000);
 fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data.level||'ok',health=document.getElementById('health-light'),text=document.getElementById('health-text'),box=document.getElementById('preflight');if(health)health.className='health-light '+(level==='ok'?'ok':level==='error'?'err':'');if(text)text.textContent=level==='ok'?'Session ready':level==='error'?'Session issue':'Ready with warnings';const rows=(data.errors||[]).concat(data.warnings||[]);if(rows.length){box.className='preflight-pop show'+(level==='error'?' err':'');box.innerHTML='<strong>'+(level==='error'?'Session issue':'Preflight note')+':</strong> '+rows.slice(0,3).map(esc).join(' · ')}}).catch(()=>{const text=document.getElementById('health-text');if(text)text.textContent='Status unavailable'});
-</script></body></html>"""
+__DASHBOARD_FEATURES__</script></body></html>"""
         if atlas_preview_path:
             atlas_content = (
                 "<div class=\"atlas-image-wrap\"><img id=\"atlas-image\" class=\"atlas-image\" "
@@ -2513,6 +2515,8 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         root_html = root_html.replace("__ATLAS_CONTENT__", atlas_content)
         root_html = root_html.replace("__ATLAS_MODES__", atlas_modes)
         root_html = root_html.replace("__ATLAS_AUX__", atlas_aux)
+        from dashboard_features import DASHBOARD_FEATURES
+        root_html = root_html.replace("__DASHBOARD_FEATURES__", DASHBOARD_FEATURES)
         return HTMLResponse(root_html)
 
     @app.get("/review/{idx}")
@@ -2600,6 +2604,8 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 "collect": response["collect"],
                 "collection_status": response["collection_status"],
                 "rating": response["rating"],
+                "priority": response["priority"],
+                "preferred_hole": response["preferred_hole"],
                 "comment": response["comment"],
                 "include": response["include"],
                 "reviewed": response["reviewed"] if item["dir"].name in responses else False,
@@ -2645,8 +2651,9 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         target = available.get(key)
         if target is None:
             return JSONResponse({"error": "Atlas GridSquare is not an unscreened target"}, status_code=404)
+        updated_targets = copy.deepcopy(manual_targets)
         if selected:
-            manual_targets[key] = {
+            updated_targets[key] = {
                 "key": key,
                 "gridsquare_id": target["id"],
                 "category": target.get("category"),
@@ -2654,8 +2661,10 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 "selected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             }
         else:
-            manual_targets.pop(key, None)
-        _save_json_dict(manual_targets_file, manual_targets)
+            updated_targets.pop(key, None)
+        _save_json_dict(manual_targets_file, updated_targets)
+        manual_targets.clear()
+        manual_targets.update(updated_targets)
         return JSONResponse({"ok": True, "key": key, "selected": selected, "count": len(manual_targets)})
 
     @app.get("/grid")
@@ -2764,6 +2773,38 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         if cached and cached.is_file():
             return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "no-store"})
         raise HTTPException(status_code=404)
+
+    @app.get("/adjusted_preview")
+    def adjusted_image(idx: int = -1, kind: str = "data", name: str = "", mrc: bool = False,
+                       low: float = 1., high: float = 99., gamma: float = 1., sigma: float = 0., mode: str = "percentile"):
+        from image_adjustments import adjusted_preview
+        if kind not in ("atlas_overview", "atlas", "grid", "overlay", "foil", "data"):
+            raise HTTPException(status_code=400, detail="Unknown image kind")
+        if kind == "atlas_overview":
+            source = _find_atlas_mrc(atlas_preview_path) if mrc and atlas_preview_path else atlas_preview_path
+        else:
+            if not 0 <= idx < len(items):
+                raise HTTPException(status_code=404)
+            item = items[idx]
+            source = _resolve_media_path(item, kind, name)
+            if mrc:
+                if kind in ("grid", "overlay"):
+                    source = item.get("mrc")
+                elif kind == "atlas":
+                    source = item.get("atlas_mrc")
+                else:
+                    source = next((entry.get("mrc") for entry in item.get("foils" if kind == "foil" else "data", []) if entry["path"].name == name), None)
+        if source is None or not source.is_file():
+            raise HTTPException(status_code=404)
+        try:
+            rendered = adjusted_preview(source, low=low, high=high, gamma=gamma, sigma=sigma, mode=mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail="The requested image could not be processed") from exc
+        buffer = io.BytesIO()
+        rendered.save(buffer, format="PNG", compress_level=3)
+        return Response(buffer.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @app.get("/data")
     def data(idx: int, name: str):
@@ -2955,16 +2996,66 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
             return JSONResponse({"error": "invalid request"}, status_code=400)
         if idx < 0 or idx >= len(items):
             return JSONResponse({"error": "invalid idx"}, status_code=400)
-        normalized = _normalize_review_entry(payload, default_include=True)
+        normalized = _normalize_review_entry({**responses.get(_item_key(idx), {}), **payload}, default_include=True)
+        normalized["target_order"] = responses.get(_item_key(idx), {}).get("target_order", idx)
         normalized["reviewed"] = True
         normalized["updated_at"] = time.time()
         name = _item_key(idx)
-        responses[name] = normalized
-        _save_responses(responses)
+        try:
+            with responses_lock:
+                updated = dict(responses)
+                updated[name] = normalized
+                _save_responses(updated)
+                responses.update(updated)
+        except OSError as exc:
+            return JSONResponse({"error": f"Review was not saved: {exc}"}, status_code=500)
         with drafts_lock:
             drafts.pop(name, None)
-            _save_drafts(drafts)
+            try:
+                _save_drafts(drafts)
+            except OSError:
+                pass  # The confirmed review is safe; stale draft cleanup is non-critical.
         return JSONResponse({"ok": True, "review": normalized})
+
+    @app.post("/target_order")
+    async def set_target_order(request: Request):
+        try:
+            order = (await request.json())["order"]
+            if not isinstance(order, list) or any(type(i) is not int or i < 0 or i >= len(items) for i in order) or len(set(order)) != len(order):
+                raise ValueError("Invalid target order")
+        except (ValueError, KeyError, TypeError):
+            return JSONResponse({"error": "Invalid target order"}, status_code=400)
+        with responses_lock:
+            updated = copy.deepcopy(responses)
+            for position, idx in enumerate(order):
+                name = _item_key(idx)
+                if name not in updated or updated[name].get("collection_status") != "suitable":
+                    return JSONResponse({"error": "Only suitable targets can be reordered"}, status_code=400)
+                updated[name]["target_order"] = position
+            try:
+                _save_responses(updated)
+            except OSError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=500)
+            responses.update(updated)
+        return JSONResponse({"ok": True})
+
+    @app.get("/export_preview")
+    def export_preview(scope: str = "targets"):
+        from collection_plan import candidates, image_records
+        if scope not in ("representative", "targets", "all_screened"):
+            raise HTTPException(status_code=400, detail="Unknown export scope")
+        with responses_lock:
+            rows = candidates(grids, copy.deepcopy(responses), scope)
+        paths = set()
+        for _, _, directory, _ in rows:
+            try:
+                paths.add(find_grid_image(directory))
+            except FileNotFoundError:
+                pass
+            if not skip_foil_processing:
+                for _, foil, data in image_records(directory, scope == "all_screened"):
+                    paths.update(p for p in (foil, data) if p)
+        return JSONResponse({"grids": len(rows), "images": len(paths), "source_mb": round(sum(p.stat().st_size for p in paths) / 1024**2, 1)})
 
     @app.get("/summary")
     def summary():
@@ -2979,7 +3070,10 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         raw_summary = data.get("summary", "")
         if not isinstance(raw_summary, str):
             raw_summary = str(raw_summary)
-        normalized = _save_review_summary(base_dir, raw_summary)
+        try:
+            normalized = _save_review_summary(base_dir, raw_summary)
+        except OSError as exc:
+            return JSONResponse({"error": f"Summary was not saved: {exc}"}, status_code=500)
         summary_state["text"] = normalized
         return JSONResponse({"summary": normalized})
 
@@ -3053,8 +3147,10 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
 
     @app.get("/report.html")
     def embedded_html_report(scope: str = "representative"):
-        if scope not in {"representative", "all_screened"}:
-            return JSONResponse({"error": "scope must be 'representative' or 'all_screened'"}, status_code=400)
+        if scope not in {"representative", "targets", "all_screened"}:
+            return JSONResponse({"error": "scope must be 'representative', 'targets', or 'all_screened'"}, status_code=400)
+        with responses_lock:
+            snapshot = copy.deepcopy(responses)
         all_screened_images = scope == "all_screened"
         suffix = "Screening_report_all_screened.html" if all_screened_images else "Screening_report.html"
         filename = f"{label_prefix}{suffix}" if label_prefix else suffix
@@ -3064,12 +3160,13 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 base_dir,
                 target,
                 atlas_name,
-                responses,
+                snapshot,
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
                 all_screened_images=all_screened_images,
+                collection_targets_only=scope == "targets",
             )
         except (PermissionError, OSError):
             target = _temp_report_path(filename)
@@ -3077,12 +3174,13 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 base_dir,
                 target,
                 atlas_name,
-                responses,
+                snapshot,
                 overlay=overlay_enabled,
                 atlas_overlay=atlas_overlay,
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
                 all_screened_images=all_screened_images,
+                collection_targets_only=scope == "targets",
             )
         return FileResponse(target, media_type="text/html", filename=filename, headers={"Cache-Control": "no-store"})
 
@@ -3098,10 +3196,10 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         scope = str(payload.get("scope", "representative")).strip().lower()
         if kind == "overview":
             kind = "full"
-        if kind not in {"full", "details"}:
-            return JSONResponse({"error": "kind must be 'full' or 'details'"}, status_code=400)
-        if scope not in {"representative", "all_screened"}:
-            return JSONResponse({"error": "scope must be 'representative' or 'all_screened'"}, status_code=400)
+        if kind not in {"full", "details", "html"}:
+            return JSONResponse({"error": "kind must be 'full', 'details', or 'html'"}, status_code=400)
+        if scope not in {"representative", "targets", "all_screened"}:
+            return JSONResponse({"error": "scope must be 'representative', 'targets', or 'all_screened'"}, status_code=400)
         job_id = secrets.token_urlsafe(8)
         now = time.time()
         with report_jobs_lock:
@@ -3115,7 +3213,9 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
                 "created_at": now,
                 "updated_at": now,
             }
-        threading.Thread(target=_run_report_job, args=(job_id, kind, scope), daemon=True).start()
+        with responses_lock:
+            snapshot = copy.deepcopy(responses)
+        threading.Thread(target=_run_report_job, args=(job_id, kind, scope, snapshot, summary_state["text"]), daemon=True).start()
         return JSONResponse({"job_id": job_id, "job": _job_state(job_id)})
 
     @app.get("/report_jobs/{job_id}")
@@ -3140,7 +3240,7 @@ fetch('/preflight?t='+Date.now()).then(r=>r.json()).then(data=>{const level=data
         path = Path(raw)
         if not path.is_file():
             raise HTTPException(status_code=404)
-        return FileResponse(path, media_type="application/pdf", filename=filename, headers={"Cache-Control": "no-store"})
+        return FileResponse(path, media_type="text/html" if path.suffix == ".html" else "application/pdf", filename=filename, headers={"Cache-Control": "no-store"})
 
     @app.post("/portable_export")
     async def create_portable_export(request: Request):
@@ -3203,7 +3303,7 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 .scope-help{display:block;margin:3px 0 0 25px;color:#667085;font-size:12px;}
 </style>
 </head><body><div class="page"><div class="card">
-<div class="title">All GridSquares reviewed</div>
+<div class="title">Reports & collection plan</div>
 <div class="note">Before generating reports, optionally add one session-level summary sentence.</div>
 <label class="summary-label" for="global-summary">Session summary (one sentence, optional)</label>
 <textarea id="global-summary" rows="2" maxlength="__SUMMARY_MAX_LEN__"></textarea>
@@ -3213,6 +3313,7 @@ textarea{width:100%;max-width:100%;border:1px solid #c9ced6;border-radius:8px;pa
 <div class="scope-card">
   <div class="scope-title">Screening images to include</div>
   <label class="scope-option"><input type="radio" name="report-scope" value="representative" checked>One highest-rated suitable GridSquare<span class="scope-help">Recommended compact report.</span></label>
+  <label class="scope-option"><input type="radio" name="report-scope" value="targets">All included collection targets</label>
   <label class="scope-option"><input type="radio" name="report-scope" value="all_screened">All screened GridSquares and images<span class="scope-help">Explicit full-session export; may produce a very large PDF or HTML file.</span></label>
 </div>
 <a class="btn" id="report-link" href="#">Generate full PDF report</a>
@@ -3351,8 +3452,8 @@ document.getElementById('html-report-link').addEventListener('click', async (ev)
 
     @app.get("/report")
     def report(scope: str = "representative"):
-        if scope not in {"representative", "all_screened"}:
-            return JSONResponse({"error": "scope must be 'representative' or 'all_screened'"}, status_code=400)
+        if scope not in {"representative", "targets", "all_screened"}:
+            return JSONResponse({"error": "scope must be 'representative', 'targets', or 'all_screened'"}, status_code=400)
         all_screened_images = scope == "all_screened"
         report_path, _details_path = _report_paths(all_screened_images=all_screened_images)
         target_path = report_path
@@ -3367,6 +3468,7 @@ document.getElementById('html-report-link').addEventListener('click', async (ev)
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
                 all_screened_images=all_screened_images,
+                collection_targets_only=scope == "targets",
             )
         except (PermissionError, OSError):
             # Common on read-only/network session folders; fall back to a writable temp directory.
@@ -3381,6 +3483,7 @@ document.getElementById('html-report-link').addEventListener('click', async (ev)
                 global_summary=summary_state["text"],
                 skip_foil_processing=skip_foil_processing,
                 all_screened_images=all_screened_images,
+                collection_targets_only=scope == "targets",
             )
         except Exception as exc:
             return JSONResponse({"error": f"failed to generate full report: {exc}"}, status_code=500)
@@ -3532,6 +3635,7 @@ def main():
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--auto-port", action="store_true", help="select a free port if the requested port is occupied")
     parser.add_argument("--open", action="store_true", help="automatically open browser")
     args = parser.parse_args()
     preferred_disc = args.images_subdir or os.environ.get("IMAGES_SUBDIR")
@@ -3561,30 +3665,21 @@ def main():
             raise SystemExit(1) from exc
         print(f"[review_app] Detailed PDF written to {details_path}")
         return
-    app = create_app(
-        grid_root,
-        args.atlas,
-        args.report,
-        args.overlay,
-        overlay_transform,
-        session_label=args.session_label,
-        atlas_overlay=args.atlas_overlay,
-        skip_foil_processing=args.skip_foil_processing,
-    )
-    if args.open:
-        url = f"http://{args.host}:{args.port}"
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    from server_startup import reserve_socket, announce_address, run_reserved_server
     try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            print(
-                f"[review_app] Cannot start server: {args.host}:{args.port} is already in use. "
-                "Use --port to choose a free port or stop the other process.",
-                file=sys.stderr,
-            )
-            raise SystemExit(2) from exc
-        raise
+        listener = reserve_socket(args.host, args.port, args.auto_port)
+    except (OSError, ValueError) as exc:
+        print(f"[review_app] Cannot reserve {args.host}:{args.port}: {exc}. "
+              "Choose another --port or use --auto-port. No session images were loaded.", file=sys.stderr, flush=True)
+        raise SystemExit(2) from exc
+    with listener:
+        address = announce_address(args.host, args.port, listener)
+        app = create_app(
+            grid_root, args.atlas, args.report, args.overlay, overlay_transform,
+            session_label=args.session_label, atlas_overlay=args.atlas_overlay,
+            skip_foil_processing=args.skip_foil_processing,
+        )
+        run_reserved_server(app, listener, address, open_browser=args.open)
 
 
 if __name__ == "__main__":

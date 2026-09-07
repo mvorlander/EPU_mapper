@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import mrcfile
 import tempfile
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.lib import colors
@@ -189,9 +189,12 @@ def find_grid_mrc(grid_dir: Path) -> Path | None:
     except FileNotFoundError:
         selected_image = None
     if selected_image is not None:
-        matching = selected_image.with_suffix(".mrc")
-        if matching.is_file():
-            return matching
+        for suffix in (".mrc", ".mrcs"):
+            matching = selected_image.with_suffix(suffix)
+            if matching.is_file():
+                return matching
+        # Another acquisition is not a high-resolution version of this preview.
+        return None
     candidates = [
         entry
         for entry in grid_dir.iterdir()
@@ -264,6 +267,14 @@ def _overlay_prefixes(grid_dir: Path) -> list[str]:
     return ordered
 
 
+def _report_overlay_image(grid_dir: Path, base_dir: Path) -> Path | None:
+    # Use the same source-fingerprinted overlay as the dashboard. A loose
+    # filename search can accidentally reuse annotations from an older visit.
+    from review_app import _ensure_overlay_image
+    path, _message, _markers = _ensure_overlay_image(grid_dir, base_dir)
+    return path
+
+
 def _find_overlay_image(grid_dir: Path, base_dir: Path | None = None) -> Path | None:
     """Locate a foil overlay PNG for `grid_dir`, optionally matching prefixed outputs."""
     overlay_names = ("foil_overlay.png",)
@@ -304,6 +315,16 @@ def _find_overlay_image(grid_dir: Path, base_dir: Path | None = None) -> Path | 
     return None
 
 
+def _preview_files(directory: Path) -> list[Path]:
+    by_stem = {}
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and path.suffix.lower() in (".png", ".jpg", ".jpeg"):
+            key = path.stem
+            if key not in by_stem or path.suffix.lower() == ".png":
+                by_stem[key] = path
+    return list(by_stem.values())
+
+
 def gather_foil_and_data(grid_dir: Path) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
     foil_dir = grid_dir / "FoilHoles"
     data_dir = grid_dir / "Data"
@@ -311,13 +332,13 @@ def gather_foil_and_data(grid_dir: Path) -> tuple[dict[str, list[Path]], dict[st
     datas: dict[str, list[Path]] = defaultdict(list)
 
     if foil_dir.is_dir():
-        for f in foil_dir.glob("*.jpg"):
+        for f in _preview_files(foil_dir):
             parts = f.stem.split("_")
             if len(parts) >= 2 and parts[0] == "FoilHole":
                 foil_id = parts[1]
                 foils[foil_id].append(f)
     if data_dir.is_dir():
-        for f in data_dir.glob("*.jpg"):
+        for f in _preview_files(data_dir):
             parts = f.stem.split("_")
             if len(parts) >= 3 and parts[0] == "FoilHole" and parts[2] == "Data":
                 foil_id = parts[1]
@@ -947,6 +968,7 @@ def _atlas_with_category_markers(
 
 
 @lru_cache(maxsize=16)
+@lru_cache(maxsize=64)
 def _get_font(size: int = 18) -> ImageFont.ImageFont:
     """Return a reasonably sized font; prefer a truetype if available."""
     try:
@@ -954,9 +976,13 @@ def _get_font(size: int = 18) -> ImageFont.ImageFont:
         return ImageFont.truetype("DejaVuSans.ttf", size)
     except Exception:
         try:
-            return ImageFont.load_default()
+            from matplotlib import get_data_path
+            return ImageFont.truetype(str(Path(get_data_path()) / "fonts/ttf/DejaVuSans.ttf"), size)
         except Exception:
-            return None  # ultimately drawing will ignore font
+            try:
+                return ImageFont.load_default(size=size)
+            except TypeError:
+                return ImageFont.load_default()
 
 
 def _label_image(img: Image.Image, label: str) -> Image.Image:
@@ -1091,37 +1117,37 @@ def _draw_grid_summary_page(
 
     def _rows() -> list[dict]:
         rows: list[dict] = []
-        hole_indices = {fid: idx + 1 for idx, fid in enumerate(sorted(foils.keys()))}
-        for foil_id in sorted(foils.keys()):
-            foil_paths = foils[foil_id]
-            data_paths = datas.get(foil_id, [])
-            slots = max(len(foil_paths), len(data_paths), 1)
-            for idx_row in range(slots):
-                foil_path = foil_paths[idx_row] if idx_row < len(foil_paths) else None
-                data_path = data_paths[idx_row] if idx_row < len(data_paths) else None
-                meta_lines: list[str] = []
-                if data_path:
-                    xml_path = data_path.with_suffix('.xml')
-                    if xml_path.is_file():
-                        meta = parse_metadata(xml_path)
-                        for key in ('pixel_size', 'exposure', 'dose', 'defocus'):
-                            if key in meta:
-                                meta_lines.append(f"{key.replace('_', ' ').title()}: {meta[key]}")
-                rows.append(
-                    {
-                        'foil_reader': _pil_to_reader(_load_image(foil_path, 'L')) if foil_path else None,
-                        'data_reader': _pil_to_reader(_load_image(data_path, 'L')) if data_path else None,
-                        'hole_index': hole_indices.get(foil_id),
-                        'shot_index': idx_row + 1 if len(foil_paths) > 1 else None,
-                        'data_path': data_path,
-                        'foil_name': foil_path.name if foil_path else None,
-                        'data_name': data_path.name if data_path else None,
-                        'meta_lines': meta_lines,
-                    }
-                )
+        hole_indices = {fid: idx + 1 for idx, fid in enumerate(sorted(set(foils) | set(datas)))}
+        from collection_plan import pair_media
+        shot_counts = defaultdict(int)
+        for foil_id, foil_path, data_path in pair_media(foils, datas):
+            shot_counts[foil_id] += 1
+            meta_lines: list[str] = []
+            if data_path:
+                xml_path = data_path.with_suffix('.xml')
+                if xml_path.is_file():
+                    meta = parse_metadata(xml_path)
+                    for key in ('pixel_size', 'exposure', 'dose', 'defocus'):
+                        if key in meta:
+                            meta_lines.append(f"{key.replace('_', ' ').title()}: {meta[key]}")
+            rows.append(
+                {
+                    'foil_reader': _pil_to_reader(_load_image(foil_path, 'L')) if foil_path else None,
+                    'data_reader': _pil_to_reader(_load_image(data_path, 'L')) if data_path else None,
+                    'hole_index': hole_indices.get(foil_id),
+                    'shot_index': shot_counts[foil_id] if len(datas.get(foil_id, [])) > 1 else None,
+                    'data_path': data_path,
+                    'foil_name': foil_path.name if foil_path else None,
+                    'data_name': data_path.name if data_path else None,
+                    'meta_lines': meta_lines,
+                }
+            )
         return rows
 
     row_entries = _rows()
+    preferred = (resp or {}).get("preferred_hole", "")
+    if preferred:
+        row_entries.sort(key=lambda row: row.get("data_name") != preferred)
 
     def _row_height(entry: dict) -> float:
         meta_block = len(entry['meta_lines']) * 36
@@ -1195,11 +1221,9 @@ def _draw_grid_summary_page(
 
     c.setFillColor(card_color)
     c.roundRect(base_margin, y - hero_card_height, card_width, hero_card_height, 34, stroke=0, fill=1)
-    panels: list[tuple[ImageReader | None, str]] = [(_pil_to_reader(grid_img), grid_image_name)]
+    panels: list[tuple[ImageReader | None, str]] = [(_pil_to_reader(overlay_img if overlay_img is not None else grid_img), 'GridSquare with screened holes' if overlay_img is not None else grid_image_name)]
     if atlas_img:
         panels.insert(0, (_pil_to_reader(atlas_img), 'Atlas overview'))
-    if overlay_img is not None:
-        panels.append((_pil_to_reader(overlay_img), 'Foil overlay'))
     inner_width = card_width - 2 * card_inner_pad
     panel_width = (inner_width - hero_panel_gap * (len(panels) - 1)) / max(len(panels), 1)
     img_y = y - hero_card_height + card_inner_pad
@@ -2352,6 +2376,7 @@ def _build_overview_page_image(
     atlas_overlay: bool = True,
     global_summary: str | None = None,
     all_screened_images: bool = False,
+    collection_targets_only: bool = False,
 ) -> Image.Image:
     grids = _collect_grids(base_dir)
     if not grids:
@@ -2367,7 +2392,8 @@ def _build_overview_page_image(
                 return fallback
         return font
 
-    page_w, page_h = 2400, 3000
+    table_lines = sum(max(1, len(textwrap.wrap(str(responses.get(g.name, {}).get("comment", "")), width=58))) for _, g in grids)
+    page_w, page_h = 2400, max(3000, 2500 + table_lines * 32 + len(global_summary or "") * 2)
     margin = 40
     atlas_gap = 24
     atlas_panel_w = int((page_w - 2 * margin - atlas_gap) / 2)
@@ -2402,7 +2428,7 @@ def _build_overview_page_image(
     atlas_raw_panel = Image.new("RGB", (atlas_panel_w, atlas_box_h), color=(245, 245, 245))
     if atlas_img is not None:
         atlas_raw = atlas_img.convert("RGB")
-        atlas_raw.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
+        atlas_raw = ImageOps.contain(atlas_raw, (atlas_panel_w - 20, atlas_box_h - 140), Image.LANCZOS)
         ox = (atlas_panel_w - atlas_raw.width) // 2
         oy = (atlas_box_h - atlas_raw.height) // 2
         atlas_raw_panel.paste(atlas_raw, (ox, oy))
@@ -2429,13 +2455,13 @@ def _build_overview_page_image(
                 show_rating_legend=False,
             )
         atlas_screened = _atlas_with_manual_targets(atlas_screened, manual_targets)
-        atlas_screened.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
+        atlas_screened = ImageOps.contain(atlas_screened, (atlas_panel_w - 20, atlas_box_h - 140), Image.LANCZOS)
         ox = (atlas_panel_w - atlas_screened.width) // 2
         oy = (atlas_box_h - atlas_screened.height) // 2
         atlas_screened_panel.paste(atlas_screened, (ox, oy))
 
         atlas_category = _atlas_with_category_markers(atlas_img.convert("RGB"), atlas_path_for_report)
-        atlas_category.thumbnail((atlas_panel_w - 20, atlas_box_h - 20), Image.LANCZOS)
+        atlas_category = ImageOps.contain(atlas_category, (atlas_panel_w - 20, atlas_box_h - 140), Image.LANCZOS)
         ox = (atlas_panel_w - atlas_category.width) // 2
         oy = (atlas_box_h - atlas_category.height) // 2
         atlas_category_panel.paste(atlas_category, (ox, oy))
@@ -2469,6 +2495,8 @@ def _build_overview_page_image(
     representative = _representative_suitable_grid(grids, responses)
     if all_screened_images:
         detail_scope_text = f"All {len(grids)} screened GridSquares"
+    elif collection_targets_only:
+        detail_scope_text = "All included suitable collection targets"
     else:
         detail_scope_text = (
             f"GridSquare {representative[1]} (rating {_normalized_rating(representative[3].get('rating')) or 0})"
@@ -2566,7 +2594,7 @@ def _build_overview_page_image(
             draw.text((comment_col, comment_y), c_line, fill=0, font=fonts["table"])
             comment_y += row_height
         y_offset = max(y_offset + row_height, comment_y)
-    return page
+    return page.crop((0, 0, page_w, min(page_h, y_offset + margin)))
 
 
 def _append_pil_page(pdf: pdf_canvas.Canvas, page_image: Image.Image) -> None:
@@ -2609,6 +2637,7 @@ def _append_selected_report_pages(
     skip_foil_processing: bool = False,
     representative_suitable_only: bool = False,
     all_screened_images: bool = False,
+    collection_targets_only: bool = False,
 ) -> None:
     grids = _collect_grids(base_dir)
     if not grids:
@@ -2618,6 +2647,9 @@ def _append_selected_report_pages(
         for idx, (gid, gdir) in enumerate(grids, start=1):
             response = responses.get(gdir.name)
             include_list.append((idx, gid, gdir, response if isinstance(response, dict) else {}))
+    elif collection_targets_only:
+        from collection_plan import candidates
+        include_list = candidates(grids, responses, "targets")
     elif representative_suitable_only:
         representative = _representative_suitable_grid(grids, responses)
         if representative is not None:
@@ -2671,7 +2703,7 @@ def _append_selected_report_pages(
             category_score = _atlas_category_for_grid(atlas_nodes, gdir, gid) if atlas_nodes else None
             overlay_img_local = None
             if overlay and not skip_foil_processing:
-                overlay_path = _find_overlay_image(gdir, base_dir)
+                overlay_path = _report_overlay_image(gdir, base_dir)
                 if overlay_path:
                     overlay_img_local = _load_image(overlay_path, "RGB")
             heading = f"GridSquare {idx}: {grid_image_path.name}"
@@ -2682,8 +2714,19 @@ def _append_selected_report_pages(
                 foil_section_note = "FoilHole processing was skipped in Atlas/GridSquare-only mode."
             else:
                 foils, datas = gather_foil_and_data(gdir)
-                foils = _latest_only(foils)
-                datas = _latest_only(datas)
+                if not all_screened_images:
+                    from collection_plan import pair_media
+                    selected_data = _latest_only(datas)
+                    preferred = str(resp.get("preferred_hole", ""))
+                    for fid, paths in datas.items():
+                        preferred_paths = [p for p in paths if p.name == preferred]
+                        if preferred_paths:
+                            selected_data[fid] = preferred_paths
+                    selected_foils = defaultdict(list)
+                    for fid, foil, _ in pair_media(foils, selected_data, False):
+                        if foil and foil not in selected_foils[fid]:
+                            selected_foils[fid].append(foil)
+                    foils, datas = dict(selected_foils), selected_data
             try:
                 _draw_grid_summary_page(
                     pdf,
@@ -2741,6 +2784,7 @@ def write_selected_report(
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
     all_screened_images: bool = False,
+    collection_targets_only: bool = False,
 ):
     """Generate a detailed PDF with included or, when requested, all screened GridSquares."""
     _ensure_pdf_fonts()
@@ -2756,6 +2800,7 @@ def write_selected_report(
         include_summary_page=True,
         skip_foil_processing=skip_foil_processing,
         all_screened_images=all_screened_images,
+        collection_targets_only=collection_targets_only,
     )
     pdf.save()
 
@@ -2770,6 +2815,7 @@ def write_combined_report(
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
     all_screened_images: bool = False,
+    collection_targets_only: bool = False,
 ):
     """Generate a merged PDF with either one representative or every screened GridSquare."""
     _ensure_pdf_fonts()
@@ -2781,8 +2827,11 @@ def write_combined_report(
         atlas_overlay=atlas_overlay,
         global_summary=global_summary,
         all_screened_images=all_screened_images,
+        collection_targets_only=collection_targets_only,
     )
     _append_pil_page(pdf, overview_page)
+    from collection_plan import append_pdf_checklist
+    append_pdf_checklist(pdf, base_dir, responses)
     _append_selected_report_pages(
         pdf,
         base_dir,
@@ -2795,6 +2844,7 @@ def write_combined_report(
         skip_foil_processing=skip_foil_processing,
         representative_suitable_only=not all_screened_images,
         all_screened_images=all_screened_images,
+        collection_targets_only=collection_targets_only,
     )
     pdf.save()
 
@@ -2805,170 +2855,32 @@ def _embedded_image_uri(image: Image.Image | None, max_size: int = 1800) -> str:
     rendered = image.convert("RGB").copy()
     rendered.thumbnail((max_size, max_size), Image.LANCZOS)
     buffer = io.BytesIO()
-    rendered.save(buffer, format="PNG", compress_level=6)
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    # Lightweight browser handoff, not a replacement for scientific originals.
+    # Keep colored overlay labels sharp with full chroma resolution.
+    # Stream normally: Pillow's optimized 4:4:4 encoder can exhaust its buffer
+    # on noisy microscopy images, even when writing to an in-memory stream.
+    rendered.save(buffer, format="JPEG", quality=90, subsampling=0)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def _embedded_path_uri(path: Path | None, max_size: int = 1800) -> str:
-    if path is None:
+    if path is None or path.suffix.lower() in (".mrc", ".mrcs"):
         return ""
     return _embedded_image_uri(_load_image(path, "RGB"), max_size=max_size)
 
 
 def build_embedded_html_report(
-    base_dir: Path,
-    atlas_name: str | None,
-    responses: dict,
-    overlay: bool = False,
-    atlas_overlay: bool = True,
-    global_summary: str | None = None,
-    skip_foil_processing: bool = False,
-    all_screened_images: bool = False,
+    base_dir: Path, atlas_name: str | None, responses: dict, overlay: bool = False,
+    atlas_overlay: bool = True, global_summary: str | None = None,
+    skip_foil_processing: bool = False, all_screened_images: bool = False,
+    collection_targets_only: bool = False,
 ) -> str:
-    """Build a self-contained HTML report with all displayed images embedded."""
-    grids = _collect_grids(base_dir)
-    if not grids:
-        raise RuntimeError(f"no GridSquare directories found in {base_dir}")
-    manual_targets = _load_manual_collection_targets(base_dir)
-
-    atlas_path = None
-    atlas_image = None
-    if atlas_name:
-        for _gid, grid_dir in grids:
-            candidate = _resolve_atlas_path(atlas_name, grid_dir, base_dir)
-            if candidate:
-                atlas_path = candidate
-                atlas_image = _load_image(candidate, "RGB")
-                if atlas_image is not None:
-                    break
-    marker_items = [
-        (
-            idx,
-            grid_dir,
-            grid_id,
-            False,
-            responses.get(grid_dir.name, {}).get("rating") if isinstance(responses.get(grid_dir.name), dict) else None,
-            _normalized_collection_status(responses.get(grid_dir.name)),
-        )
-        for idx, (grid_id, grid_dir) in enumerate(grids, start=1)
-    ]
-    screened_atlas = (
-        _atlas_with_grid_markers(atlas_image, atlas_path, marker_items, show_rating_legend=False)
-        if atlas_overlay and atlas_image is not None
-        else atlas_image
-    )
-    if screened_atlas is not None:
-        screened_atlas = _atlas_with_manual_targets(screened_atlas, manual_targets)
-    category_atlas = _atlas_with_category_markers(atlas_image, atlas_path) if atlas_image is not None else None
-
-    atlas_cards = []
-    for title, image in (
-        ("Screened Atlas", screened_atlas),
-        ("EPU category Atlas", category_atlas),
-        ("Raw Atlas - no overlays", atlas_image),
-    ):
-        uri = _embedded_image_uri(image)
-        body = f'<img src="{uri}" alt="{html.escape(title)}">' if uri else '<div class="empty">Atlas unavailable</div>'
-        atlas_cards.append(f'<article class="image-card"><h2>{html.escape(title)}</h2>{body}</article>')
-
-    table_rows = []
-    for idx, (grid_id, grid_dir) in enumerate(grids, start=1):
-        response = responses.get(grid_dir.name) if isinstance(responses.get(grid_dir.name), dict) else {}
-        status = _normalized_collection_status(response)
-        table_rows.append(
-            "<tr>"
-            f"<td>{idx}</td><td>{html.escape(str(grid_id))}</td><td>{html.escape(str(response.get('rating', 0) or 0))}</td>"
-            f"<td><span class=\"status {status}\">{html.escape(status.title())}</span></td>"
-            f"<td>{'Yes' if bool(response.get('include', True)) else 'No'}</td>"
-            f"<td>{html.escape(str(response.get('comment', '') or ''))}</td>"
-            "</tr>"
-        )
-
-    representative = _representative_suitable_grid(grids, responses)
-    if all_screened_images:
-        detail_candidates = [
-            (
-                idx,
-                grid_id,
-                grid_dir,
-                responses.get(grid_dir.name) if isinstance(responses.get(grid_dir.name), dict) else {},
-            )
-            for idx, (grid_id, grid_dir) in enumerate(grids, start=1)
-        ]
-        detail_heading = "Screening data - all screened GridSquares"
-        empty_detail_message = "No screened GridSquares were found."
-    else:
-        detail_candidates = [representative] if representative is not None else []
-        detail_heading = "Screening data - one suitable GridSquare"
-        empty_detail_message = "No included GridSquare is marked suitable for collection."
-
-    detail_sections = []
-    for idx, grid_id, grid_dir, response in detail_candidates:
-        try:
-            grid_path = find_grid_image(grid_dir)
-        except FileNotFoundError:
-            grid_path = None
-        overlay_path = _find_overlay_image(grid_dir, base_dir) if overlay and not skip_foil_processing else None
-        primary_path = overlay_path or grid_path
-        primary_uri = _embedded_path_uri(primary_path)
-        pairs = []
-        if not skip_foil_processing:
-            foils, datas = gather_foil_and_data(grid_dir)
-            foils = _latest_only(foils)
-            datas = _latest_only(datas)
-            for foil_id in sorted(foils):
-                foil_path = foils[foil_id][-1] if foils[foil_id] else None
-                data_path = datas.get(foil_id, [])[-1] if datas.get(foil_id) else None
-                foil_uri = _embedded_path_uri(foil_path)
-                data_uri = _embedded_path_uri(data_path)
-                pairs.append(
-                    '<div class="pair">'
-                    f'<article class="image-card"><h3>FoilHole {html.escape(str(foil_id))}</h3>'
-                    + (f'<img src="{foil_uri}" alt="FoilHole {html.escape(str(foil_id))}">' if foil_uri else '<div class="empty">FoilHole image unavailable</div>')
-                    + '</article>'
-                    f'<article class="image-card"><h3>Data - FoilHole {html.escape(str(foil_id))}</h3>'
-                    + (f'<img src="{data_uri}" alt="Data image for FoilHole {html.escape(str(foil_id))}">' if data_uri else '<div class="empty">No matching Data image</div>')
-                    + '</article></div>'
-                )
-        collection_status = _normalized_collection_status(response)
-        collection_label = {
-            "suitable": "Suitable for collection",
-            "unsuitable": "Not suitable for collection",
-        }.get(collection_status, "Collection suitability unmarked")
-        detail_sections.append(
-            '<section class="section">'
-            f'<div class="review-summary"><strong>GridSquare {html.escape(str(grid_id))}</strong>'
-            f'<span>Rating {html.escape(str(response.get("rating", 0) or 0))}</span><span>{html.escape(collection_label)}</span>'
-            f'<p>{html.escape(str(response.get("comment", "") or ""))}</p></div>'
-            + (f'<article class="image-card primary"><h3>GridSquare with foil overlay</h3><img src="{primary_uri}" alt="GridSquare {html.escape(str(grid_id))}"></article>' if primary_uri else '<div class="empty">GridSquare image unavailable</div>')
-            + ''.join(pairs)
-            + '</section>'
-        )
-    detail_html = (
-        f'<div class="screening-details"><h2>{html.escape(detail_heading)}</h2>{"".join(detail_sections)}</div>'
-        if detail_sections
-        else f'<section class="section"><h2>{html.escape(detail_heading)}</h2><div class="empty">{html.escape(empty_detail_message)}</div></section>'
-    )
-
-    summary = html.escape((global_summary or "").strip())
-    target_rows = "".join(
-        f"<li>Atlas GridSquare {html.escape(str(target.get('gridsquare_id') or target.get('key') or 'unknown'))}"
-        f" - EPU category {html.escape(str(target.get('category') if target.get('category') is not None else 'N/A'))}</li>"
-        for target in manual_targets
-    )
-    manual_target_html = (
-        f'<section class="section"><h2>Manual unscreened collection targets</h2><ul>{target_rows}</ul></section>'
-        if manual_targets
-        else '<section class="section"><h2>Manual unscreened collection targets</h2><p class="muted">None selected.</p></section>'
-    )
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper screening report</title>
-<style>body{{margin:0;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{max-width:1500px;margin:auto;padding:28px}}h1{{margin-bottom:5px}}h2,h3{{margin:0 0 12px}}.muted{{color:#68758b}}.atlas-grid,.pair{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:18px 0}}.image-card,.section,.legend,.review-summary{{background:#fff;border:1px solid #dfe5ee;border-radius:14px;padding:16px;box-shadow:0 2px 8px rgba(26,39,67,.05)}}.image-card img{{display:block;width:100%;max-height:760px;object-fit:contain;background:#101827;border-radius:10px}}.image-card.primary{{margin:18px 0}}.legend{{display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin:18px 0}}.legend-group{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.dot{{width:18px;height:18px;border-radius:50%;display:inline-grid;place-items:center;color:#fff;font-size:9px;font-weight:800;border:4px solid #64748b}}.r1{{background:#c62828}}.r2{{background:#ef6c00}}.r3{{background:#f9a825}}.r4{{background:#7cb342}}.r5{{background:#2e7d32}}.suitable{{border-color:#059669}}.unsuitable{{border-color:#dc2626}}.unmarked{{border-color:#64748b}}.target{{border-radius:3px;background:#0891b2;border-color:#a5f3fc}}table{{width:100%;border-collapse:collapse;background:#fff;margin:18px 0}}th,td{{border-bottom:1px solid #e3e8ef;padding:10px;text-align:left;vertical-align:top}}th{{background:#eef2f7}}.status{{display:inline-block;padding:3px 7px;border-radius:999px;border:2px solid}}.empty{{min-height:180px;display:grid;place-items:center;color:#68758b;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px}}.review-summary{{display:flex;gap:18px;align-items:center;flex-wrap:wrap}}.review-summary p{{flex-basis:100%;margin:0}}@media(max-width:800px){{.atlas-grid,.pair{{grid-template-columns:1fr}}main{{padding:14px}}}}</style></head><body><main>
-<h1>EPU Mapper screening report</h1><div class="muted">Self-contained HTML export; all images are embedded.</div>{f'<p>{summary}</p>' if summary else ''}
-<section class="legend"><strong>Atlas marker legend (kept outside images)</strong><span class="legend-group">Rating <span class="dot r1">1</span><span class="dot r2">2</span><span class="dot r3">3</span><span class="dot r4">4</span><span class="dot r5">5</span></span><span class="legend-group"><span class="dot suitable">S</span>Suitable <span class="dot unsuitable">U</span>Not suitable <span class="dot unmarked">-</span>Unmarked</span><span class="legend-group"><span class="dot target">T</span>Unscreened target</span></section>
-<section class="atlas-grid">{''.join(atlas_cards)}</section>
-{manual_target_html}
-<section class="section"><h2>GridSquare review summary</h2><table><thead><tr><th>Order</th><th>GridSquare</th><th>Rating</th><th>Collection</th><th>Included</th><th>Comment</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></section>
-{detail_html}</main></body></html>"""
+    from collection_plan import build_plan
+    return build_plan(base_dir, atlas_name, responses, overlay=overlay,
+                      atlas_overlay=atlas_overlay, global_summary=global_summary,
+                      skip_foil_processing=skip_foil_processing,
+                      all_screened_images=all_screened_images,
+                      collection_targets_only=collection_targets_only)
 
 
 def write_embedded_html_report(
@@ -2981,6 +2893,7 @@ def write_embedded_html_report(
     global_summary: str | None = None,
     skip_foil_processing: bool = False,
     all_screened_images: bool = False,
+    collection_targets_only: bool = False,
 ) -> None:
     report_file.write_text(
         build_embedded_html_report(
@@ -2992,6 +2905,7 @@ def write_embedded_html_report(
             global_summary=global_summary,
             skip_foil_processing=skip_foil_processing,
             all_screened_images=all_screened_images,
+            collection_targets_only=collection_targets_only,
         ),
         encoding="utf-8",
     )

@@ -4,6 +4,33 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 
 ## Recent changes
 
+### [v0.6.0](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.6.0) — Collection plans and image tools
+
+- **Independent exports:** HTML/PDF plans and full-session bundles have separate
+  buttons and background jobs. Bundles no longer generate HTML as an extra step.
+- **Enlarge restored:** Visible controls below Atlas, GridSquare, FoilHole, and
+  Data viewers, with an explicit close button and Escape to return.
+- **Smaller HTML:** Embedded JPEG previews instead of PNG; no MRC files are
+  loaded or embedded. Full portable session bundles still preserve originals.
+- **Reliable launch:** Automatically uses a free port when the preferred one is
+  busy; the browser waits for this session's server, never an older instance.
+- **Image tools:** Auto-contrast presets, black/white percentiles, gamma, and
+  optional Gaussian low-pass filtering for PNG and MRC previews. Open **Adjust
+  image** below a viewer; changes affect the display only, not originals or exports.
+- **Active FoilHole:** A persistent cyan ring marks the currently displayed hole
+  on the GridSquare, following hover and Previous/Next navigation.
+- **Offline collection plans:** Interactive, embedded-image HTML with a clickable
+  Atlas, searchable shortlist, raw/annotated views, and zoomable images.
+- **Faster review:** Primary/backup priorities, target ordering, preferred
+  exposures, delayed hover previews, undo, filters, and keyboard navigation.
+- **Safer saves and matching:** Atomic review saves with visible failures and
+  recoverable local drafts; exact-acquisition MRC matching and timestamp-aware
+  FoilHole/Data associations.
+- **Complete exports:** One export dialog for HTML, PDF, or a full portable
+  session. Choose representative, collection-target, or all-exposure scope.
+  Portable sessions preserve originals and reviews; PDFs include a collection
+  checklist with original EPU IDs.
+
 ### [v0.5.1](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.5.1) — Flexible reports
 
 - **Report scope:** Choose one highest-rated suitable GridSquare or all screened
@@ -52,11 +79,36 @@ ratings, collection-suitability annotations, comments, and the requested
 GridSquare/FoilHole/Data imagery. These reports provide a portable record for
 choosing targets and setting up high-resolution data collection.
 
-**New**: To avoid oversized PDFs, you can now choose between exporting one
-representative GridSquare marked as suitable for collection, with its screening
-images, or all screened GridSquares and images.
+Use **Export collection plan** in the dashboard. Choose **Interactive HTML** or
+**PDF**, then choose the screening detail
+scope: one representative suitable square, all included collection targets, or
+all screening images (including repeat exposures and unmatched Data images).
+The dialog shows the number of source previews before export. Annotations for
+all squares remain available even when the image scope is restricted.
 
-![EPU Mapper report export options for a compact or all-screened report](images/EPU_mapper_export_dialog.png)
+Double-click the HTML file to open the read-only plan in a modern browser:
+no server, EPU Mapper installation, or Internet connection is needed. Full
+session bundles are exported separately with **Export full session** and include
+`EPUMapperSession.epumap` for resuming edits in the launcher. Neither export waits
+for or automatically generates the other. The original MRCs
+remain in the full bundle; the lightweight HTML embeds JPEG previews only
+(quality 90, up to 1800 px for screening images and 3000 px for the raw Atlas).
+
+### Review to collection
+
+Mark a square **suitable**, assign **Primary**, **Backup**, or **Needs screening**,
+and reorder it in the collection shortlist. Click a hole to pin its exposure
+for the report; **Enable hover previews** resumes browsing without losing that
+preference. Manual Atlas targets are explicitly labelled as needing screening.
+
+Use **1–5** for rating, **S/X** for suitable/unsuitable, **←/→** for holes,
+**[/]** for squares, and **N** for the next unreviewed square. While writing a
+comment, **Cmd/Ctrl + Enter** saves and advances. **Undo last saved edit** restores
+the previous review values for the selected square. Failed saves block
+navigation/export and can be retried by clicking the save-status message.
+
+Developer checks: `python -m unittest discover -s tests -v` in the application
+environment. No GitHub publication is required to build/install local changes.
 
 ## Installation
 

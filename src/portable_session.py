@@ -51,6 +51,12 @@ def export_portable_session(
 ) -> Path:
     """Copy a complete session and write a relocatable `.epumap` manifest."""
     session_source = portable_session_source(session_path)
+    selected_source = session_path.expanduser().resolve()
+    annotation_snapshot = {
+        name: (selected_source / name).read_bytes()
+        for name in ("review_responses.json", "manual_collection_targets.json", "review_summary.txt", "review_drafts.json")
+        if (selected_source / name).is_file()
+    }
     if not session_source.is_dir():
         raise RuntimeError(f"Session folder not found: {session_source}")
     atlas_source = atlas_path.expanduser().resolve() if atlas_path else None
@@ -74,9 +80,23 @@ def export_portable_session(
 
     data_root = partial_root / "data"
     copied_session = data_root / "session"
+    total_bytes = sum(p.stat().st_size for p in session_source.rglob("*") if p.is_file())
+    copied_bytes = 0
+    last_progress = -1
+
+    def copy_with_progress(source, target):
+        nonlocal copied_bytes, last_progress
+        result = shutil.copy2(source, target)
+        copied_bytes += Path(source).stat().st_size
+        percent = min(100, int(copied_bytes * 100 / max(1, total_bytes)))
+        if percent != last_progress:
+            log(f"Copying session: {percent}% ({copied_bytes / 1024**2:.1f} / {total_bytes / 1024**2:.1f} MB)\n")
+            last_progress = percent
+        return result
+
     log(f"Portable export: copying complete session from {session_source}\n")
     data_root.mkdir(parents=True)
-    shutil.copytree(session_source, copied_session, copy_function=shutil.copy2)
+    shutil.copytree(session_source, copied_session, copy_function=copy_with_progress)
 
     atlas_relative = ""
     if atlas_source is not None:
@@ -108,11 +128,20 @@ def export_portable_session(
         "session_label": label,
         "options": options,
     }
+    # Bundles copy originals and annotations only. HTML rendering is a separate
+    # export job, so its cost or failure cannot delay publication of this copy.
+    from build_collage import _collect_grids
+    review_base = copied_session / session_path.expanduser().resolve().relative_to(session_source)
+    for name, content in annotation_snapshot.items():
+        (review_base / name).write_bytes(content)
+    if not _collect_grids(review_base):
+        raise RuntimeError("No GridSquares found in copied session; portable export is incomplete.")
     manifest_path = partial_root / PORTABLE_SESSION_FILENAME
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     (partial_root / "README.txt").write_text(
         "Portable EPU Mapper session\n\n"
-        "Open EPUMapperSession.epumap from the EPU Mapper launcher. All paths in the manifest are relative to this folder.\n",
+        "This bundle preserves original data and review annotations. HTML reports are exported separately using Export collection plan in the dashboard.\n\n"
+        "To resume editing, open EPUMapperSession.epumap from the EPU Mapper launcher. All paths in the manifest are relative to this folder.\n",
         encoding="utf-8",
     )
     partial_root.rename(bundle_root)

@@ -36,6 +36,8 @@ from portable_session import (  # noqa: E402
     portable_bundle_name,
     portable_session_source,
 )
+from server_startup import ADDRESS_PREFIX, READY_PREFIX, browser_url
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8000"
 DEFAULT_LABEL = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX") or ""
@@ -67,14 +69,14 @@ def _startup_page_html(target_url: str) -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EPU Mapper is preparing</title>
 <style>:root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{width:min(560px,calc(100vw - 36px));background:#fff;border:1px solid #dfe5ee;border-radius:16px;padding:28px;box-shadow:0 18px 50px rgba(26,39,67,.12)}}main.error{{border:2px solid #e11d48;background:#fff7f8}}.mark{{width:42px;height:42px;border-radius:12px;background:linear-gradient(145deg,#5eead4,#3b82f6);display:grid;place-items:center;font-weight:850;color:#10213b;margin-bottom:18px}}main.error .mark{{background:#e11d48;color:#fff}}h1{{font-size:21px;margin:0 0 8px}}p{{font-size:13px;line-height:1.55;color:#657289;margin:0}}.progress{{height:5px;background:#e8edf5;border-radius:9px;overflow:hidden;margin:22px 0 14px}}.progress span{{display:block;width:35%;height:100%;background:#2563eb;border-radius:9px;animation:move 1.4s ease-in-out infinite}}#status{{font-size:12px;color:#7a8799;white-space:pre-wrap;line-height:1.5}}main.error #status{{margin-top:18px;padding:14px;border-radius:10px;background:#ffe4e6;color:#9f1239;font-size:14px;font-weight:700}}main.error .progress{{display:none}}@keyframes move{{0%{{transform:translateX(-110%)}}100%{{transform:translateX(330%)}}}}</style></head>
 <body><main id="launch-card"><div class="mark" id="launch-mark">E</div><h1 id="launch-title">Preparing the screening dashboard</h1><p id="launch-description">EPU Mapper is reading the session and atlas. Sessions on OffloadData can take a few minutes; this page will open the dashboard automatically.</p><div class="progress"><span></span></div><div id="status">Waiting for the local server…</div></main>
-<script>const target={target_json};async function poll(){{try{{const response=await fetch('/ready?t='+Date.now(),{{cache:'no-store'}});const state=await response.json();if(state.ready){{location.replace(state.url);return}}if(state.error){{document.getElementById('launch-card').classList.add('error');document.getElementById('launch-mark').textContent='!';document.getElementById('launch-title').textContent='Server launch failed';document.getElementById('launch-description').textContent='Return to the EPU Mapper launcher for the full error and troubleshooting log.';document.getElementById('status').textContent=state.error;return}}}}catch(_error){{}}setTimeout(poll,1000)}}poll();</script></body></html>"""
+<script>const target={target_json};async function poll(){{try{{const response=await fetch('/ready?t='+Date.now(),{{cache:'no-store'}});const state=await response.json();if(state.ready){{location.replace(state.url);return}}if(state.message){{document.getElementById('status').textContent=state.message}}if(state.error){{document.getElementById('launch-card').classList.add('error');document.getElementById('launch-mark').textContent='!';document.getElementById('launch-title').textContent='Server launch failed';document.getElementById('launch-description').textContent='Return to the EPU Mapper launcher for the full error and troubleshooting log.';document.getElementById('status').textContent=state.error;return}}}}catch(_error){{}}setTimeout(poll,1000)}}poll();</script></body></html>"""
 
 
 def _start_browser_wait_page(
-    proc: subprocess.Popen[str], host: str, port: str, error_state: dict[str, str | None] | None = None
+    proc: subprocess.Popen[str], host: str, port: str, error_state: dict | None = None
 ) -> tuple[ThreadingHTTPServer, str]:
-    connect_host = _browser_host(host)
-    target_url = f"http://{connect_host}:{port}"
+    state = error_state if error_state is not None else {}
+    target_url = browser_url(host, int(port))
     page = _startup_page_html(target_url).encode("utf-8")
 
     class StartupHandler(BaseHTTPRequestHandler):
@@ -84,16 +86,15 @@ def _start_browser_wait_page(
                 ready = False
                 exit_code = proc.poll()
                 if exit_code is not None:
-                    error = (error_state or {}).get("message") or (
+                    error = state.get("message") or (
                         f"EPU Mapper stopped before the server was ready (exit code {exit_code}). Check the launcher log."
                     )
                 else:
-                    try:
-                        with socket.create_connection((connect_host, int(port)), timeout=0.25):
-                            ready = True
-                    except OSError:
-                        pass
-                payload = json.dumps({"ready": ready, "url": target_url, "error": error}).encode("utf-8")
+                    # A listening port could belong to a different application
+                    # or merely be reserved while this child is still scanning.
+                    ready = bool(state.get("ready"))
+                payload = json.dumps({"ready": ready, "url": state.get("url", target_url), "error": error,
+                                      "message": state.get("notice", "Waiting for the local server…")}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -116,6 +117,30 @@ def _start_browser_wait_page(
     threading.Thread(target=server.serve_forever, daemon=True).start()
     wait_url = f"http://127.0.0.1:{server.server_address[1]}"
     return server, wait_url
+
+
+def _consume_server_event(line: str, state: dict) -> str | None:
+    """Only our child's explicit protocol can announce its address/readiness."""
+    prefix = next((p for p in (ADDRESS_PREFIX, READY_PREFIX) if line.startswith(p)), None)
+    if prefix is None:
+        return None
+    try:
+        payload = json.loads(line[len(prefix):])
+        port = payload["port"]
+        if type(port) is not int or not 1 <= port <= 65535 or not isinstance(payload["url"], str):
+            return None
+        if prefix == ADDRESS_PREFIX:
+            state.update(url=payload["url"], port=port, ready=False)
+            requested = payload.get("requested_port")
+            state["notice"] = (f"Port {requested} is already in use. Using {payload['url']} instead. "
+                               if requested and requested != port else f"Using {payload['url']}. ") + "Reading the session and Atlas…"
+            return "address"
+        if state.get("url") == payload["url"] and state.get("port") == port:
+            state["ready"] = True
+            return "ready"
+    except (ValueError, TypeError, KeyError):
+        return None
+    return None
 
 
 def _server_failure_message(exit_code: int, output_lines: list[str], during_launch: bool) -> str:
@@ -228,12 +253,15 @@ def _review_command(
     details_only: bool = False,
     details_output: str | None = None,
     open_browser: bool = True,
+    auto_port: bool = False,
 ) -> list[str]:
     if _is_frozen():
         cmd = [sys.executable, "--run-review", session_path]
     else:
         cmd = [_default_python(), str(SCRIPT_PATH), "--run-review", session_path]
     cmd.extend(["--host", host, "--port", port, "--overlay-transform", transform])
+    if auto_port and not details_only:
+        cmd.append("--auto-port")
     if atlas_path:
         cmd.extend(["--atlas", atlas_path])
     if atlas_overlay:
@@ -285,11 +313,14 @@ def _run_frozen_smoke_test() -> int:
         from build_collage import find_grid_image  # noqa: F401
         from portable_session import export_portable_session as portable_export  # noqa: F401
         from review_app import create_app  # noqa: F401
+        from server_startup import reserve_socket, run_reserved_server
+        from image_adjustments import adjusted_preview
         from scripts.plot_foilhole_positions import compute_markers  # noqa: F401
 
         if tk is None or ttk is None:
             raise RuntimeError("Tkinter is unavailable")
-        if not all(callable(value) for value in (find_grid_image, portable_export, create_app, compute_markers)):
+        if not all(callable(value) for value in (find_grid_image, portable_export, create_app, compute_markers,
+                                                 reserve_socket, run_reserved_server, adjusted_preview)):
             raise RuntimeError("A packaged runtime entry point is not callable")
     except Exception as exc:
         print(f"[launcher] Windows smoke test failed: {exc}", file=sys.stderr)
@@ -308,7 +339,8 @@ class ReviewLauncher:
         self.startup_server: ThreadingHTTPServer | None = None
         self.server_ready = False
         self.stop_requested = False
-        self.startup_error_state: dict[str, str | None] = {"message": None}
+        self.startup_error_state: dict = {"message": None}
+        self.active_server_url = ""
         self.preferences = self._load_preferences()
         self.session_history = list(self.preferences.get("sessions", []))
         saved_atlas_by_session = self.preferences.get("atlas_by_session", {})
@@ -690,7 +722,7 @@ class ReviewLauncher:
 
     def start_server(self) -> None:
         if self.proc and self.proc.poll() is None:
-            messagebox.showinfo("Already running", "The review app is already running.")
+            messagebox.showinfo("Already running", "The review app is already running (or stopping).\n" + self.active_server_url)
             return
         session_path = self.session_var.get().strip()
         if not session_path:
@@ -713,6 +745,12 @@ class ReviewLauncher:
                 return
         host = self.host_var.get().strip() or DEFAULT_HOST
         port = self.port_var.get().strip() or DEFAULT_PORT
+        try:
+            if not 0 <= int(port) <= 65535:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Invalid port", "Enter a port from 1 to 65535, or 0 to select a free port.")
+            return
         transform_value = self.transform_var.get()
         transform = self._transform_value(transform_value)
 
@@ -732,6 +770,7 @@ class ReviewLauncher:
             transform,
             session_label=label or None,
             open_browser=False,
+            auto_port=True,
         )
 
         env = self._build_env()
@@ -751,13 +790,14 @@ class ReviewLauncher:
             return
         self.server_ready = False
         self.stop_requested = False
-        self.startup_error_state = {"message": None}
+        self.startup_error_state = {"message": None, "ready": False, "stop_requested": False}
+        self.active_server_url = ""
         self.log_text.configure(background="#ffffff")
         self._set_server_status("starting", "Starting server - reading session and Atlas data…")
         self._remember_session(session_path)
         self._persist_preferences(transform)
         self.launch_btn.configure(state="disabled")
-        threading.Thread(target=self._stream_output, daemon=True).start()
+        threading.Thread(target=self._stream_output, args=(self.proc, self.startup_error_state), daemon=True).start()
         self._log(f"Persistent server log: {_server_log_file()}\n")
         try:
             self._stop_startup_server()
@@ -824,12 +864,15 @@ class ReviewLauncher:
     def stop_server(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.stop_requested = True
+            self.startup_error_state["stop_requested"] = True
             self.proc.terminate()
             self._log("Stopping server...\n")
-        self.proc = None
+            self.launch_btn.configure(state="disabled")
+            self._set_server_status("stopped", "Stopping server - waiting for it to release its port…")
+        else:
+            self.launch_btn.configure(state="normal")
+            self._set_server_status("stopped", "Server stopped")
         self._stop_startup_server()
-        self.launch_btn.configure(state="normal")
-        self._set_server_status("stopped", "Server stopped")
 
     def _set_server_status(self, state: str, message: str) -> None:
         colors = {
@@ -868,7 +911,10 @@ class ReviewLauncher:
         server = self.startup_server
         self.startup_server = None
         if server is not None:
-            threading.Thread(target=server.shutdown, daemon=True).start()
+            def close_wait_page():
+                server.shutdown()
+                server.server_close()
+            threading.Thread(target=close_wait_page, daemon=True).start()
 
     def _transform_value(self, label: str) -> str:
         for text, value in TRANSFORM_OPTIONS:
@@ -940,8 +986,7 @@ class ReviewLauncher:
         env.setdefault("FONTCONFIG_PATH", os.path.join(temp_dir, "mplcache"))
         return env
 
-    def _stream_output(self) -> None:
-        proc = self.proc
+    def _stream_output(self, proc, state: dict) -> None:
         assert proc and proc.stdout
         output_tail: deque[str] = deque(maxlen=30)
         log_path = _server_log_file()
@@ -957,16 +1002,22 @@ class ReviewLauncher:
         for line in proc.stdout:
             output_tail.append(line.rstrip())
             self._log(line)
-            if not self.server_ready and line.strip():
+            event = _consume_server_event(line.strip(), state)
+            if not state.get("ready") and line.strip():
                 clean_line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip()
-                self.startup_error_state["message"] = (
-                    "EPU Mapper stopped before the server was ready.\n\n"
-                    f"Last server message: {clean_line}\n\n"
-                    "Return to the launcher for the full error log."
-                )
-            if not self.server_ready and ("Uvicorn running on" in line or "Application startup complete" in line):
-                self.server_ready = True
-                self.root.after(0, lambda: self._set_server_status("running", "Server running - dashboard is ready"))
+                state["message"] = "EPU Mapper stopped before the server was ready.\n\n" + clean_line
+            if event:
+                def update_status(event=event):
+                    if self.proc is not proc or state.get("stop_requested"):
+                        return
+                    self.active_server_url = state["url"]
+                    self.port_var.set(str(state["port"]))
+                    if event == "ready":
+                        self.server_ready = True
+                        self._set_server_status("running", "Dashboard ready at " + state["url"])
+                    else:
+                        self._set_server_status("starting", state["notice"])
+                self.root.after(0, update_status)
             if log_handle:
                 log_handle.write(line)
                 log_handle.flush()
@@ -976,19 +1027,21 @@ class ReviewLauncher:
         if log_handle:
             log_handle.write(exit_line)
             log_handle.close()
-        if self.proc is proc:
+        # Finish on the UI thread. Do not enable a replacement launch until
+        # the old process has exited; its reader must not update a new launch.
+        def finish():
+            if self.proc is not proc:
+                return
             self.proc = None
-        during_launch = not self.server_ready
-        if not self.stop_requested:
-            failure_message = _server_failure_message(exit_code, list(output_tail), during_launch)
-            self.startup_error_state["message"] = failure_message
-            self.root.after(
-                0,
-                lambda message=failure_message, startup=during_launch: self._show_server_error(message, startup),
-            )
-        else:
-            self.root.after(0, lambda: self._set_server_status("stopped", "Server stopped"))
-        self.root.after(0, lambda: self.launch_btn.configure(state="normal"))
+            during_launch = not bool(state.get("ready"))
+            if not state.get("stop_requested"):
+                failure_message = _server_failure_message(exit_code, list(output_tail), during_launch)
+                state["message"] = failure_message
+                self._show_server_error(failure_message, during_launch)
+            else:
+                self._set_server_status("stopped", "Server stopped")
+            self.launch_btn.configure(state="normal")
+        self.root.after(0, finish)
 
     def _run_details_job(self, cmd: list[str], session_path: str, transform: str) -> None:
         env = self._build_env()
