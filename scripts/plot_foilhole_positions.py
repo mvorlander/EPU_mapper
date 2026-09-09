@@ -580,6 +580,7 @@ def _markers_from_coords(
 def compute_markers(
     grid_dir: Path,
     debug_dump: Path | None = None,
+    foil_paths: dict | None = None,
 ) -> tuple[Image.Image, list[tuple[float, float, bool, int, Path]]]:
     grid_image_path = find_grid_image(grid_dir)
     grid_image = _load_image(grid_image_path)
@@ -635,7 +636,7 @@ def compute_markers(
         inv_matrix = None
 
     markers: list[tuple[float, float, bool, int, Path]] = []
-    foils, _ = gather_foil_and_data(grid_dir)
+    foils = foil_paths if foil_paths is not None else gather_foil_and_data(grid_dir, include_data=False)[0]
     marker_idx = 1
     hole_positions = _load_hole_positions(grid_dir)
     pixel_centers = _load_dm_pixel_centers(grid_dir)
@@ -654,7 +655,10 @@ def compute_markers(
                     position_path = candidate
                     break
         if position_path is None:
-            continue
+            if foil_id in pixel_centers or foil_id in hole_positions:
+                position_path = latest_path
+            else:
+                continue
         selected_foils.append((foil_id, position_path, latest_path))
         latest_paths[foil_id] = latest_path
 

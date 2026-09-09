@@ -811,7 +811,13 @@ def create_app(
     session_label: str | None = None,
     atlas_overlay: bool = True,
     skip_foil_processing: bool = False,
+    review_mode: str = 'screening',
 ) -> FastAPI:
+    if review_mode in ('acquisition','foilhole'):
+        from acquisition_app import create_acquisition_app
+        return create_acquisition_app(base_dir,atlas_name,review_mode,overlay_transform,session_label)
+    if review_mode != 'screening':
+        raise ValueError('Unknown review mode')
     _OVERLAY_EVENTS.clear()
     _configure_overlay_transform(overlay_transform)
     base_dir = base_dir.resolve()
@@ -3567,6 +3573,7 @@ def generate_details_report(
 
 def main():
     parser = argparse.ArgumentParser(description="Web review app for GridSquare folders")
+    parser.add_argument('--mode',choices=('screening','acquisition','foilhole'),default='screening',help='Acquisition indexes multiple JPEG/PNG exposures per hole; foilhole skips Data directories entirely')
     parser.add_argument("grid_dir", type=Path, help="path to a GridSquare directory, Images-Disc*, or session root")
     parser.add_argument(
         "--atlas",
@@ -3640,12 +3647,14 @@ def main():
     args = parser.parse_args()
     preferred_disc = args.images_subdir or os.environ.get("IMAGES_SUBDIR")
     try:
-        grid_root = _resolve_grid_root(args.grid_dir, preferred_disc)
+        grid_root = _resolve_grid_root(args.grid_dir, preferred_disc) if args.mode=='screening' else args.grid_dir.expanduser().absolute()
     except RuntimeError as exc:
         print(f"[review_app] {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     overlay_transform = args.overlay_transform if args.overlay else None
     if args.details_only:
+        if args.mode != 'screening':
+            parser.error('Detailed PDF export is available in Screening mode; it is not run automatically on acquisition collections')
         try:
             details_path = generate_details_report(
                 grid_root,
@@ -3678,6 +3687,7 @@ def main():
             grid_root, args.atlas, args.report, args.overlay, overlay_transform,
             session_label=args.session_label, atlas_overlay=args.atlas_overlay,
             skip_foil_processing=args.skip_foil_processing,
+            review_mode=args.mode,
         )
         run_reserved_server(app, listener, address, open_browser=args.open)
 

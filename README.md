@@ -4,32 +4,29 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 
 ## Recent changes
 
+### Unreleased — Acquisition browsing and particle density
+
+- **Acquisition mode:** browse many JPEG/PNG exposures per FoilHole, with separate square, hole, and exposure navigation.
+- **FoilHole-only mode:** map and inspect holes without scanning Data directories.
+- **Automatic overlays:** use FoilHole XML positions when the session's DM metadata is missing or still copying; refresh to add newly arrived holes.
+- **Beam-shift groups:** solid centering-hole outlines and matching-color dashed neighbors, with adjustable circle radius/fill and optional clickable planned Data footprints from EPU metadata.
+- **Stable acquisition selection:** click instead of hover, zoom to the selected hole, clearer Data footprints, and explicit explanations for beam-shifted targets without their own FoilHole preview.
+- **Network-friendly loading:** background indexing, local caching and annotations, explicit refresh, and optional Atlas/GridSquare MRC loading.
+- **Optional CryoSPARC density:** gradient fills independent of acquisition-group outlines, per-square particle counts, and a collapsible import panel with Clear.
+- **Clearer atlas handling:** availability/suitability legends and refreshed atlas metadata when reopening a cached session. Missing count fields are never displayed as zero.
+
 ### [v0.6.0](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.6.0) — Collection plans and image tools
 
-- **Independent exports:** HTML/PDF plans and full-session bundles have separate
-  buttons and background jobs. Bundles no longer generate HTML as an extra step.
-- **Enlarge restored:** Visible controls below Atlas, GridSquare, FoilHole, and
-  Data viewers, with an explicit close button and Escape to return.
-- **Smaller HTML:** Embedded JPEG previews instead of PNG; no MRC files are
-  loaded or embedded. Full portable session bundles still preserve originals.
-- **Reliable launch:** Automatically uses a free port when the preferred one is
-  busy; the browser waits for this session's server, never an older instance.
-- **Image tools:** Auto-contrast presets, black/white percentiles, gamma, and
-  optional Gaussian low-pass filtering for PNG and MRC previews. Open **Adjust
-  image** below a viewer; changes affect the display only, not originals or exports.
-- **Active FoilHole:** A persistent cyan ring marks the currently displayed hole
-  on the GridSquare, following hover and Previous/Next navigation.
-- **Offline collection plans:** Interactive, embedded-image HTML with a clickable
-  Atlas, searchable shortlist, raw/annotated views, and zoomable images.
-- **Faster review:** Primary/backup priorities, target ordering, preferred
-  exposures, delayed hover previews, undo, filters, and keyboard navigation.
-- **Safer saves and matching:** Atomic review saves with visible failures and
-  recoverable local drafts; exact-acquisition MRC matching and timestamp-aware
-  FoilHole/Data associations.
-- **Complete exports:** One export dialog for HTML, PDF, or a full portable
-  session. Choose representative, collection-target, or all-exposure scope.
-  Portable sessions preserve originals and reviews; PDFs include a collection
-  checklist with original EPU IDs.
+- **Portable results:** Interactive JPEG-only HTML plans (no MRCs), PDF checklists,
+  and independent full-session exports that preserve originals and annotations.
+- **Image tools:** Enlarge, auto-contrast, black/white levels, gamma, optional
+  low-pass filtering, and a persistent highlight for the displayed FoilHole.
+- **Faster review:** Prioritized shortlists, preferred exposures, hover previews,
+  filters, undo, and keyboard navigation.
+- **Safer data:** Recoverable review drafts, visible save failures, and improved
+  acquisition-aware FoilHole/Data and MRC matching.
+- **Reliable launch:** Automatic free-port selection and browser readiness checks
+  tied to the newly started session.
 
 ### [v0.5.1](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.5.1) — Flexible reports
 
@@ -49,21 +46,46 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 - **Portable and reliable:** Added portable sessions, session-safe image
   matching, and more dependable **macOS and Windows launchers**.
 
+## CryoSPARC particle density
+
+In the normal launcher select **Acquisition (multiple exposures per hole)**, choose
+the session and atlas, then open **CryoSPARC particle density · optional** in the
+dashboard. Import your particle `.cs` file and its matching passthrough `.cs` if
+requested. **Clear density** restores ordinary acquisition overlays.
+
+The particle table needs `uid`, `location/micrograph_path`,
+`location/center_x_frac`, and `location/center_y_frac`, either itself or split
+between the main and UID-matched passthrough table. For J53, use both
+`particles_selected.cs` and `J53_passthrough_particles_selected.cs`. No CryoSPARC
+server, particle stacks, class averages, `job.json`, or Data MRCs are needed.
+EPU previews and XML/DM metadata are still required to map particles onto
+GridSquares and calculate physical density from planned acquisition footprints.
+
+Counts describe the imported subset, not all particles in the acquisition. The
+color scale is linear and relative within each square. Density is held in memory
+until the server stops and is not yet included in portable reports/session bundles.
+After new files finish copying, use **Refresh index**, wait for completion, then
+reimport the particle files. When upgrading, restart the server first;
+reloading the browser alone does not update its backend.
+
+**Atlas colors:** teal/green fill = Data previews indexed; orange fill = no Data
+previews indexed (possibly incomplete copying or a stale index). Green/red rings
+mean suitable/unsuitable. These are separate from particle-density colors.
+
 ## Why use it
 
 - Inspect GridSquare, FoilHole, and Data images in one page.
 - Use the atlas-first dashboard to jump directly to any screened GridSquare and
   browse all of its associated images without leaving the overview.
 - Hover screened atlas squares for a large GridSquare preview. Click a square
-  to open only the GridSquare foil-overlay view. Hover a screened FoilHole to
-  show its matched Data image beside the GridSquare and its FoilHole image
-  underneath.
+  to open its foil-overlay view beside the Atlas. Hover a screened FoilHole to
+  update the linked FoilHole and Data viewers below.
 - Map the acquired FoilHoles onto the GridSquare and the current GridSquare
   position on the atlas to pick the best areas.
 - Load fast PNG previews by default, request an MRC only for the particular
   atlas, GridSquare, FoilHole, or Data image that needs closer inspection, and
-  adjust contrast, zoom, or pan continuously (scroll to zoom, then drag—no
-  separate pan tool) once the MRC is loaded.
+  enlarge, adjust contrast, zoom, or pan continuously (scroll to zoom, then
+  drag—no separate pan tool). These controls work for PNG and MRC previews.
 - Spot GridSquares without screening Data immediately: their atlas markers and
   acquisition-list cards carry an amber warning state.
 - Rate each GridSquare, add reviewer comments, mark it suitable or unsuitable
@@ -114,6 +136,8 @@ environment. No GitHub publication is required to build/install local changes.
 
 ### Lightweight macOS launcher
 
+The launcher now has a **Review mode** selector. Choose **Acquisition** for multi-exposure collections or **FoilHole only** to ignore Data images. Screening retains the existing report/export workflow. See [acquisition input requirements](docs/acquisition-input-data.md) for the folders to request from your facility.
+
 After creating the Conda environment below, build a small native launcher and
 install it into your user Applications folder:
 
@@ -135,13 +159,13 @@ quitting the launcher stops the local site. Server output is also retained at
 The app reuses the local Conda environment rather than bundling a second Python runtime. See
 [`macos/README.md`](macos/README.md) for selecting a specific Python environment.
 
-### Windows installer
+### Windows portable app
 
-1. Download the latest `EPUMapperReviewInstaller_<version>.exe` from the
+1. Download the latest `EPUMapperReview_portable_<version>.zip` from the
    [Releases page](https://github.com/mvorlander/EPU_mapper/releases).
-2. Double-click the installer and accept the defaults (the installer bundles
-   Python, so no extra dependencies are needed).
-3. Launch **EPU Mapper Review** from the Start Menu shortcut.
+2. Extract the complete ZIP to a local folder; keep its bundled files together.
+3. Run `EPUMapperReview.exe`. Python and dependencies are bundled; no separate
+   installation is needed.
 
 
 ### Install in conda env (for macOS or Linux)
@@ -222,17 +246,19 @@ Command+Enter on macOS (or Ctrl+Enter elsewhere) to save and advance to the
 next GridSquare.
 
 Use **Previous GridSquare** / **Next GridSquare** directly under the GridSquare
-viewer to step through the acquisition order. That viewer also exposes its
-**Load GridSquare MRC**, zoom/pan, reset, and MRC contrast controls. The
-dashboard's **Export portable session** button copies the full session to a
+viewer to step through the acquisition order. Each viewer has **Enlarge** and
+**Adjust image** controls below it: auto-contrast, black/white percentiles,
+gamma, and optional Gaussian low-pass filtering. Changes affect display only,
+not originals or exports. Close the enlarged view with its button or Escape.
+The dashboard's **Export full session** button copies the full session to a
 destination folder while showing background progress; the same export remains
 available from the desktop launcher.
 
 Every viewer loads a PNG by default, supports scroll-to-zoom and drag-to-pan,
-and offers MRC loading plus contrast controls when an MRC exists. Atlas markers
-update live: fill color represents rating, while a green, red, or gray outline
-and S/U/- badge represents collection suitability. The legend is outside the
-Atlas image so it never hides image data.
+and offers MRC loading when a matching MRC exists. The displayed FoilHole is
+highlighted with a cyan ring on the GridSquare. Atlas markers update live;
+choose **Collection status colors** or **Rating colors** to control their fill.
+The S/U/- badges indicate suitability. The legend stays outside the Atlas image.
 
 After screening, choose **Add unscreened targets** in the Atlas header (or use
 the shortcut on the review-complete page) and click unscreened Atlas squares to
@@ -242,7 +268,8 @@ HTML reports as cyan diamond markers.
 
 ### 4. Review GridSquares in the web app
 
-Use the annotated screenshot in the `Why use it` section as the reference for the main interactive workflow. This is where you inspect images, adjust MRC  contrast, rate each GridSquare, and add reviewer comments.
+Use the dashboard to inspect images, adjust preview contrast, rate each
+GridSquare, add comments, and select collection targets.
 
 ### 5. Export the detailed pages
 
@@ -252,14 +279,14 @@ matched FoilHole/Data imagery. In `Atlas/GridSquare only` mode, FoilHole
 sections are omitted entirely.
 
 ## Additional info
+
 - **Prefix PDF names** – provide a session/grid label once and reuse it for
   generated reports. Either set `SESSION_LABEL=MyRun` (or `GRID_LABEL` / `REPORT_PREFIX`)
   before launching, or pass `--grid-label MyRun` / `--session-label MyRun` to
   the wrapper/Windows launcher. The default file becomes
   `MyRun_Screening_report.pdf` (and `MyRun_Screening_details.pdf` if you use details-only export).
-- **Add one session-level summary sentence** – after the final GridSquare, the
-  completion page includes a text field for a single summary sentence that is
-  included in generated reports.
+- **Add collection instructions** – enter a session summary in the
+  **Export collection plan** dialog to include it in generated reports.
 - **Skip the UI and export everything** – add `--details-only`
   (alias: `--export-all-details`) to the command to render the detailed PDF for
   *every* GridSquare, then exit immediately. The Windows launcher exposes the
@@ -280,14 +307,12 @@ sections are omitted entirely.
 
 ### Troubleshooting (ports)
 
-- If the app fails to start with “Address already in use,” the port is occupied.
-  Either change the port (`./scripts/run_review_app.sh ... --port 8010`) or stop
-  the other instance.
-- On macOS/Linux run `lsof -i :8000` to find the owning process and terminate it
-  (e.g., `kill <PID>`). On Windows run `netstat -ano | find "8000"` or use Task
-  Manager to close the conflicting app.
-- The Windows launcher also exposes the port field, so you can bump it to an
-  unused value without leaving the GUI.
+- The launcher automatically selects a free port if the preferred port is busy,
+  leaving the existing application running. Use the dashboard it opens, not an
+  old browser tab: the new address may differ from `127.0.0.1:8000`.
+- For command-line launches, pass **`--auto-port`** for the same fallback, or
+  choose a specific port with `--port 8010`. A fixed-port collision fails before
+  session images are loaded.
 
 ## Container Workflow (VBC only)
 
@@ -304,15 +329,14 @@ Most users outside VBC can ignore this section.
   covers an Atlas image.
   Screened positions use their rating color as the marker fill and their
   collection status as a green suitable, red unsuitable, or gray unmarked
-  outline/badge. The report then shows screening data for exactly one included
-  GridSquare marked suitable for collection, choosing the highest rating and
-  then acquisition order when ratings tie. On **Reports & export**, explicitly
-  choose **All screened GridSquares and images** to instead create
+  outline/badge. In **Export collection plan**, choose one highest-rated suitable
+  square, all included collection targets, or **All screening images**. The
+  all-images scope creates
   `Screening_report_all_screened.pdf` with every screened GridSquare and all of
   its available FoilHole/Data pairs. This can be a very large file.
-- `Screening_report.html` – self-contained HTML version of the combined report.
-  All displayed images are embedded in the file, so it can be copied and opened
-  without the EPU Mapper server or its source data paths. The same report-scope
+- `Screening_report.html` – interactive, self-contained collection plan with
+  JPEG previews, clickable Atlas positions, and a searchable shortlist. It opens
+  without a server, original data, or specialized software. The same report-scope
   choice creates `Screening_report_all_screened.html` when all screened imagery
   is requested.
 - `Screening_details.pdf` – optional details-only export (e.g. via
@@ -323,8 +347,10 @@ Most users outside VBC can ignore this section.
   you can resume later.
 - `manual_collection_targets.json` – manually selected unscreened Atlas
   GridSquares to target during collection.
-- `review_summary.txt` – optional one-line session summary entered on the final
-  page before downloading reports.
+- `review_summary.txt` – collection instructions/session summary from the export dialog.
+- `EPUMapperSession.epumap` – manifest in the separately exported full-session
+  folder, alongside copied originals and annotations. No HTML is generated by
+  this export. Background report downloads may have a unique job-ID prefix.
 
 Use the web UI to download the combined report once you finish reviewing.
 

@@ -325,7 +325,7 @@ def _preview_files(directory: Path) -> list[Path]:
     return list(by_stem.values())
 
 
-def gather_foil_and_data(grid_dir: Path) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
+def gather_foil_and_data(grid_dir: Path, *, include_data: bool = True) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
     foil_dir = grid_dir / "FoilHoles"
     data_dir = grid_dir / "Data"
     foils: dict[str, list[Path]] = defaultdict(list)
@@ -337,7 +337,7 @@ def gather_foil_and_data(grid_dir: Path) -> tuple[dict[str, list[Path]], dict[st
             if len(parts) >= 2 and parts[0] == "FoilHole":
                 foil_id = parts[1]
                 foils[foil_id].append(f)
-    if data_dir.is_dir():
+    if include_data and data_dir.is_dir():
         for f in _preview_files(data_dir):
             parts = f.stem.split("_")
             if len(parts) >= 3 and parts[0] == "FoilHole" and parts[2] == "Data":

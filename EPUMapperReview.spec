@@ -1,15 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['review_app', 'build_collage', 'portable_session', 'collection_plan', 'dashboard_features', 'server_startup', 'image_adjustments', 'scripts.plot_foilhole_positions', 'matplotlib.backends.backend_tkagg']
+hiddenimports = ['review_app', 'build_collage', 'portable_session', 'collection_plan', 'dashboard_features', 'server_startup', 'image_adjustments', 'acquisition_store', 'acquisition_app', 'acquisition_ui', 'scripts.plot_foilhole_positions', 'matplotlib.backends.backend_tkagg']
 hiddenimports += collect_submodules('matplotlib')
+hiddenimports += ['cryosparc_density', 'cryosparc_density_app']
 
 
 a = Analysis(
     ['C:\\EPU_mapper\\EPU_mapper\\scripts\\windows_gui_launcher.py'],
     pathex=['C:\\EPU_mapper\\EPU_mapper\\src', 'C:\\EPU_mapper\\EPU_mapper'],
     binaries=[],
-    datas=[],
+    datas=[('src/cryosparc_density.js', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
