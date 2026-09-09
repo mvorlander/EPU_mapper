@@ -89,7 +89,7 @@ syncActiveHole('missing');assert.equal(svg.children.length,0);
 
     def test_page_syntax_and_control_wiring(self):
         script = PAGE.split('<script>')[1].split('</script>')[0].replace('__CONFIG__', '{}')
-        result = subprocess.run(['node', '--check'], input=script, text=True, capture_output=True)
+        result = subprocess.run(['node', '--check'], input=script, text=True, encoding='utf-8', capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("if(this.id==='grid')styleFoilCircle(c,m.selected,m)", script)
         self.assertIn("$('foilRadiusSlider').oninput", script)

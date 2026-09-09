@@ -90,7 +90,7 @@ class CollectionPlanTests(unittest.TestCase):
         plan = build_plan(self.base, None, self.responses)
         for document in (dashboard, plan):
             for script in re.findall(r'<script>(.*?)</script>', document, re.S):
-                check = subprocess.run([node, "--check"], input=script, text=True, capture_output=True)
+        check = subprocess.run([node, "--check"], input=script, text=True, encoding='utf-8', capture_output=True)
                 self.assertEqual(check.returncode, 0, check.stderr)
 
     def test_pdf_all_exposures_and_readable_font(self):
