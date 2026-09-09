@@ -562,7 +562,7 @@ class AcquisitionStore:
         for row in data:
             preceding=[f for f in foils if f['stamp'] and f['stamp']<=row['stamp']]
             foil=preceding[-1] if preceding else foils[0] if len(foils)==1 and not row['stamp'] else None
-            result.append(dict(id=row['id'],name=row['name'],stamp=row['stamp'],foil=foil['id'] if foil else '',foil_name=foil['name'] if foil else '',annotation=self.annotation('exposure:'+row['id']),metrics=self.metric(row['id'])))
+            result.append(dict(id=row['id'],hole=row['hole'],name=row['name'],stamp=row['stamp'],foil=foil['id'] if foil else '',foil_name=foil['name'] if foil else '',annotation=self.annotation('exposure:'+row['id']),metrics=self.metric(row['id'])))
         return dict(foil=foils[-1]['id'] if foils else '',foil_name=foils[-1]['name'] if foils else '',exposures=result,missing=[] if self.ignore_data else [r for r in self.meta('missing:'+gid,[]) if r['hole']==hole])
 
     def annotation(self,key):

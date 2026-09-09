@@ -16,7 +16,7 @@ def install_density(app, source, label=None, transform='identity'):
 
     @app.get('/',response_class=HTMLResponse)
     def home():
-        config=json.dumps(dict(mode='acquisition',label=label or Path(source).name)).replace('<','\\u003c')
+        config=json.dumps(dict(mode='acquisition',label=label or Path(source).name,transform=transform or 'identity')).replace('<','\\u003c')
         script=Path(__file__).with_name('cryosparc_density.js').read_text(encoding='utf-8')
         return PAGE.replace('__CONFIG__',config).replace('</html>','<script>'+script+'</script></html>')
 

@@ -3,6 +3,7 @@ const densityPanel=document.createElement('details');
 densityPanel.style.cssText='margin:12px 18px;padding:12px;background:white;border:2px solid #8069c8;border-radius:10px';
 densityPanel.innerHTML=`<summary style="cursor:pointer;font-weight:600">CryoSPARC particle density · optional</summary>
 <p class="muted">Import a selected particle .cs file and its matching passthrough if needed. No particle stacks or Data MRCs are read.</p>
+<p class="muted">Compare subsets in this session: choose another .cs pair and import again. This replaces density only; your EPU session and annotations stay unchanged.</p>
 <label>Particles <input type="file" id="densityMain" accept=".cs"></label>
 <label>Passthrough (optional) <input type="file" id="densityPass" accept=".cs"></label>
 <button id="densityImport">Import particle density</button>
@@ -108,16 +109,22 @@ $('densityImport').onclick=async()=>{
  const main=$('densityMain').files[0];if(!main){$('densityStatus').textContent='Choose a particle .cs file first.';return}
  const data=new FormData();data.append('particles',main);
  if($('densityPass').files[0])data.append('passthrough',$('densityPass').files[0]);
- $('densityImport').disabled=true;$('densityStatus').textContent='Importing particle coordinates…';
+ $('densityImport').disabled=true;$('densityClear').disabled=true;densityPanel.open=true;
+ $('densityStatus').textContent='Uploading particle tables…';
+ const activity=beginActivity('Uploading particle tables');
  try{
   const response=await fetch('/api/density/import',{method:'POST',body:data});
   if(!response.ok)throw Error(await response.text());
-  const result=await waitJob((await response.json()).job);
+  activity.update('Matching particle coordinates to EPU exposures');
+  $('densityStatus').textContent='Matching particle coordinates to EPU exposures…';
+  const job=(await response.json()).job;jobActivities.set(job,['Matching particle coordinates to EPU exposures','']);
+  activity.finish();
+  const result=await waitJob(job);
   updateDensityCounts(result);
   $('densityStatus').textContent=`${result.matched.toLocaleString()} / ${result.particles.toLocaleString()} particles matched; ${result.represented_holes} holes, ${result.represented_exposures} exposures. Unmatched: ${result.unmatched}; ambiguous: ${result.ambiguous}; invalid coordinates: ${result.invalid}. `+result.warning;
   await loadDensity();
  }catch(e){$('densityStatus').textContent='Import failed: '+e.message}
- finally{$('densityImport').disabled=false}
+ finally{activity.finish();$('densityImport').disabled=false;$('densityClear').disabled=!densityLoaded}
 };
 api('/api/density/summary').then(s=>{
  if(s.loaded){updateDensityCounts(s);$('densityStatus').textContent=`${s.matched.toLocaleString()} selected particles loaded across ${s.represented_holes} holes. `+s.warning;loadDensity()}

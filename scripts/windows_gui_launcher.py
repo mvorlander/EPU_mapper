@@ -326,6 +326,9 @@ def _run_frozen_smoke_test() -> int:
         import cryosparc_density_app
         if not Path(cryosparc_density_app.__file__).with_name('cryosparc_density.js').is_file():
             raise RuntimeError('Particle density dashboard resource is missing')
+        import position_corrections
+        if not Path(position_corrections.__file__).with_name('position_corrections.js').is_file():
+            raise RuntimeError('Observed-position tools resource is missing')
         from scripts.plot_foilhole_positions import compute_markers  # noqa: F401
 
         if tk is None or ttk is None:
@@ -333,6 +336,30 @@ def _run_frozen_smoke_test() -> int:
         if not all(callable(value) for value in (find_grid_image, portable_export, create_app, compute_markers,
                                                  reserve_socket, run_reserved_server, adjusted_preview)):
             raise RuntimeError("A packaged runtime entry point is not callable")
+        # Exercise the frozen runtime, not just imports: missing resources or
+        # dynamic FastAPI/Pydantic dependencies must fail before publishing.
+        import tempfile
+        import json
+        import numpy as np
+        root=tk.Tk();root.withdraw();root.update_idletasks();root.destroy()
+        with tempfile.TemporaryDirectory(prefix='epumapper-smoke-') as folder:
+            app=create_acquisition_app(folder,cache_root=Path(folder)/'cache')
+            store=app.state.acquisition_store
+            try:
+                home=next(r.endpoint for r in app.routes if getattr(r,'path',None)=='/')
+                assert 'CryoSPARC particle density' in home()
+                assert '/position_corrections.js' in home()
+                store.execute('INSERT INTO grids VALUES (?,?,?,?,?,?,?,?,?)',('g',folder,'GridSquare_1','image','','',1,json.dumps([{'hole':'1','x':.2,'y':.3}]),''))
+                store.add_media(Path(folder)/'FoilHole_1_Data_2_3_20260904_123456.jpg','data','g','1')
+                foil=store.add_media(Path(folder)/'FoilHole_1.jpg','foil','g','1')
+                particles=np.array([(1,b'FoilHole_1_Data_2_3_20260904_123456.jpg',.5,.5)],dtype=[('uid','u8'),('location/micrograph_path','S100'),('location/center_x_frac','f4'),('location/center_y_frac','f4')])
+                path=Path(folder)/'particles.cs'
+                with path.open('wb') as output:np.save(output,particles,allow_pickle=False)
+                assert app.state.density.import_files(path)['grid_counts']=={'g':1}
+                save=next(r.endpoint for r in app.routes if getattr(r,'path',None)=='/api/position-corrections/{gid}/{hole}')
+                assert save('g','1',{'foil':foil,'x':.4,'y':.5})['observed']==[.4,.5]
+            finally:
+                store.close()
     except Exception as exc:
         print(f"[launcher] Windows smoke test failed: {exc}", file=sys.stderr)
         return 2

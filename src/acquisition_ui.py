@@ -11,8 +11,56 @@ const config=__CONFIG__, $=id=>document.getElementById(id);let grids=[],grid=nul
 $('mode').textContent=config.mode==='foilhole'?'FoilHole only':'Acquisition';$('title').textContent=config.label;
 if(config.mode==='foilhole'){document.body.classList.add('foil-only');$('scope').querySelector('[value=exposure]').remove();$('legend').textContent='Data directories are not scanned in this mode. Selected hole = thicker group outline · suitable = green ring · unsuitable = red ring. Scroll to zoom · drag to pan.';}
 const fail=e=>{$('error').textContent=e.message||String(e);$('error').style.display='block'};
-async function api(path,data){const r=await fetch(path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok){let t=await r.text();try{t=JSON.parse(t).detail||t}catch{}throw Error(t)}return r.json()}
-async function waitJob(id,valid=()=>true){for(let n=0;n<1800&&valid();n++){const j=await api('/api/jobs/'+id);if(j.status==='done')return j.result;if(j.status==='error'||j.status==='cancelled')throw Error(j.message);await new Promise(r=>setTimeout(r,350))}if(valid())throw Error('Still waiting for the network. Retry when the share is available.');return null}
+// Activity is independent of viewer messages: loading never masquerades as
+// missing data, and concurrent operations cannot clear each other's indicator.
+const activityStyle=document.createElement('style');activityStyle.textContent=`
+.activity{display:flex;align-items:center;gap:8px;color:#164f69;background:#eaf6fc;border:1px solid #afd7e9;border-radius:7px;padding:8px 11px;font-size:12px}
+.activity::before{content:'';width:13px;height:13px;flex-shrink:0;border:2px solid #a9ccdc;border-top-color:#176986;border-radius:50%;animation:activity-spin .8s linear infinite}
+#activitySummary{margin:8px 18px}.viewer-activity{position:absolute;top:8px;left:8px;right:8px;z-index:3;pointer-events:none;background:#eaf6fcf2}
+@keyframes activity-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.activity::before{animation:none}}
+`;document.head.append(activityStyle);
+const activitySummary=document.createElement('div');activitySummary.id='activitySummary';activitySummary.className='activity';activitySummary.hidden=true;activitySummary.setAttribute('role','status');activitySummary.setAttribute('aria-live','polite');document.querySelector('header').after(activitySummary);
+const activities=new Map(),jobActivities=new Map();let activitySerial=0;
+function paintActivity(){
+ const current=[...activities.values()].filter(a=>a.valid());
+ const describe=a=>{const seconds=Math.floor((Date.now()-a.started)/1000);return a.label+(seconds>=2?' · '+seconds+'s':'')+(seconds>=12?' · still working; network reads may take longer':'')};
+ activitySummary.hidden=!current.length;
+ activitySummary.textContent=current.map(describe).join(' · ');
+ for(const viewport of document.querySelectorAll('.viewport')){
+  const id=viewport.parentElement.id,matching=current.filter(a=>a.viewer===id);
+  let badge=viewport.querySelector('.viewer-activity');
+  if(!badge){badge=document.createElement('div');badge.className='activity viewer-activity';badge.setAttribute('role','status');viewport.append(badge)}
+  badge.hidden=!matching.length;badge.textContent=matching.map(describe).join(' · ');viewport.setAttribute('aria-busy',matching.length?'true':'false');
+ }
+}
+function beginActivity(label,viewer='',valid=()=>true){
+ const id=++activitySerial;activities.set(id,{label,viewer,valid,started:Date.now()});paintActivity();
+ return {update(text){const a=activities.get(id);if(a){a.label=text;paintActivity()}},finish(){activities.delete(id);paintActivity()}};
+}
+setInterval(paintActivity,1000);
+function describeRequest(path,data){
+ if(path.startsWith('/api/prepare/'))return ['Preparing image from cache or source',data?.viewer||''];
+ if(path.startsWith('/api/geometry/'))return ['Mapping FoilHole positions','grid'];
+ if(path.startsWith('/api/areas/'))return ['Mapping planned acquisition areas','grid'];
+ if(path.startsWith('/api/density/grid/'))return ['Mapping particle density','grid'];
+ if(path.startsWith('/api/holes/'))return ['Loading FoilHole list','grid'];
+ if(path.startsWith('/api/exposures/'))return ['Finding matching Data previews','data'];
+ if(path==='/api/cache-previews')return ['Preparing local previews',''];
+ if(path==='/api/refresh')return ['Starting index refresh',''];
+ if(path.startsWith('/api/annotation/'))return [data?'Saving annotation':'Loading annotation',''];
+ return null;
+}
+async function api(path,data){
+ const description=describeRequest(path,data),activity=description?beginActivity(...description):null;
+ try{const r=await fetch(path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok){let t=await r.text();try{t=JSON.parse(t).detail||t}catch{}throw Error(t)}const result=await r.json();if(result.job&&description)jobActivities.set(result.job,description);return result}
+ finally{activity?.finish()}
+}
+async function waitJob(id,valid=()=>true){
+ const description=jobActivities.get(id)||['Processing data',''];jobActivities.delete(id);
+ const activity=beginActivity(description[0],description[1],valid);
+ try{for(let n=0;n<1800&&valid();n++){const j=await api('/api/jobs/'+id);if(j.status==='done')return j.result;if(j.status==='error'||j.status==='cancelled')throw Error(j.message);activity.update((j.status==='queued'?'Queued: ':'')+description[0]);await new Promise(r=>setTimeout(r,350))}if(valid())throw Error('Still waiting for the network. Retry when the share is available.');return null}
+ finally{activity.finish()}
+}
 function button(text,fn){const b=document.createElement('button');b.textContent=text;b.onclick=()=>Promise.resolve(fn()).catch(fail);return b}
 // Overlay radius is measured in image coordinates, so it follows zoom and pan.
 function normalizeOverlay(value={}){const radius=Number(value.radius);return {style:value.style==='filled'?'filled':'outline',radius:Number.isFinite(radius)?Math.max(.2,Math.min(4,radius)):1.2}}
@@ -22,7 +70,7 @@ function groupColor(anchor){if(!anchor)return '#9ba9bc';let h=0;for(const c of S
 function styleFoilCircle(circle,selected,marker={}){
  const color=marker.anchor?groupColor(marker.anchor):'#58cbb7';
  circle.setAttribute('r',foilOverlay.radius/100);
- circle.style.fill=foilOverlay.style==='outline'?'none':marker.anchor?color:selected?'#f2c450':'#248f84';
+ circle.style.fill=selected||foilOverlay.style==='outline'?'none':marker.anchor?color:'#248f84';
  circle.style.stroke=marker.anchor?color:selected?'#f2c450':color;
  circle.style.strokeDasharray=marker.role==='shifted'?'.006 .004':marker.role==='unknown'?'.002 .004':'';
  circle.style.filter=selected?'drop-shadow(0px 0px 2px white)':'none';
@@ -39,6 +87,26 @@ class Viewer{
  async load(key,name='',mrc='',isMrc=false,adjust=false){if(!key){this.clear('No matching '+this.id+' preview');return}const changed=key!==this.key,token=++this.token;this.key=key;this.name=name;this.mrcKey=mrc;this.isMrc=isMrc;if(isMrc)this.card.querySelector('details').open=true;if(!isMrc){this.previewKey=key;this.previewName=name;}this.img.hidden=true;this.message.hidden=false;this.message.textContent='Loading '+name+'…';this.card.querySelector('.filename').textContent=name;this.mrcButton.hidden=!mrc;try{const prepared=await api('/api/prepare/'+key,{viewer:this.id});if(prepared.job)await waitJob(prepared.job,()=>token===this.token);if(token!==this.token)return;const params=new URLSearchParams({adjust:adjust||isMrc?'true':'false',v:Date.now()});if(adjust){for(const n of ['low','high','gamma','sigma','routine'])params.set(n,this.card.querySelector('.'+n).value)}const image=new Image();image.src='/api/image/'+key+'?'+params;await image.decode();if(token!==this.token)return;this.img.src=image.src;this.img.hidden=false;this.message.hidden=true;if(changed)this.reset();else this.fit()}catch(e){if(token===this.token){this.message.textContent='Unavailable: '+e.message;this.img.hidden=true}}}
 }
 const views={atlas:new Viewer('atlas','Atlas'),grid:new Viewer('grid',config.mode==='acquisition'?'GridSquare · click a hole or Data area to select':'GridSquare · hover a hole to inspect'),foil:new Viewer('foil','FoilHole'),data:new Viewer('data','Data exposure')};
+const originalViewerLoad=Viewer.prototype.load;
+Viewer.prototype.load=async function(key,name='',mrc='',isMrc=false,adjust=false){
+ if(!key)return originalViewerLoad.call(this,key,name,mrc,isMrc,adjust);
+ const token=this.token+1,activity=beginActivity(adjust?'Applying contrast / low-pass':isMrc?'Loading MRC image':'Loading image',this.id,()=>this.token===token);
+ try{return await originalViewerLoad.call(this,key,name,mrc,isMrc,adjust)}finally{activity.finish()}
+};
+// Keep indexing visible throughout asynchronous scans, including cached Atlas loading.
+let indexActivity=null;
+const activityApi=api;
+api=async function(path,data){
+ const result=await activityApi(path,data);
+ if(path==='/api/status'){
+  const busy=['new','indexing'].includes(result.index.status);
+  if(busy&&!indexActivity)indexActivity=beginActivity(result.index.message||'Indexing session');
+  if(busy)indexActivity.update(result.index.message||'Indexing session');
+  else if(indexActivity){indexActivity.finish();indexActivity=null}
+  $('refresh').disabled=busy;
+ }
+ return result;
+};
 const atlasLegend=document.createElement('div');atlasLegend.className='controls';atlasLegend.id='atlasLegend';
 atlasLegend.innerHTML=(config.mode==='acquisition'?'<span><span style="color:#248f84">●</span> Data previews indexed</span><span><span style="color:#d8a731">●</span> No Data previews indexed</span>':'<span><span style="color:#248f84">●</span> Mapped GridSquare · Data ignored</span>')+'<span><span style="color:#36c792">◯</span> Suitable</span><span><span style="color:#ef5963">◯</span> Unsuitable</span><span>Thick outline = selected</span>';
 atlasLegend.title='Atlas fill describes indexed preview availability, not particle density or ice quality. Orange may mean missing previews, incomplete copying, or an index that needs Refresh.';
@@ -48,7 +116,7 @@ overlayMenu.className='contrast foil-overlay';
 overlayMenu.innerHTML='<summary>FoilHole overlay</summary><label>Circle style <select id="foilStyle"><option value="outline">Outline only</option><option value="filled">Filled</option></select></label><label>Radius <input id="foilRadiusSlider" aria-label="Circle radius slider" type="range" min="0.2" max="4" step="0.1" style="width:110px"><input id="foilRadius" aria-label="Circle radius (% of image width)" type="number" min="0.2" max="4" step="0.1"> % of image width</label>';
 views.grid.card.append(overlayMenu);
 const groupLegend=document.createElement('div');groupLegend.className='controls';
-groupLegend.textContent='Solid = centering hole · dashed = beam-shifted hole · same color = same centering group · thicker outline = selected';
+groupLegend.textContent='Solid = centering hole · dashed = beam-shifted hole · same color = same centering group · white outer ring = displayed hole';
 views.grid.card.append(groupLegend);
 const areaControl=document.createElement('label');areaControl.className='controls';
 areaControl.innerHTML='<input type="checkbox" id="showAreas"> Show planned Data acquisition areas';
@@ -110,8 +178,27 @@ function renderAtlas(){if(!atlas)return;const markers=[];for(const g of grids){c
 function renderGrids(){const q=$('search').value.toLowerCase();$('grids').replaceChildren();for(const g of grids.filter(g=>g.name.toLowerCase().includes(q))){const b=button(g.name,()=>selectGrid(g.id));b.classList.toggle('active',grid?.id===g.id);const s=document.createElement('small');s.textContent=g.holes+' holes'+(g.exposures===null?' · Data ignored':' · '+g.exposures+' previews')+(g.missing?' · '+g.missing+' missing':'');b.append(s);$('grids').append(b)}}
 async function loadHoles(){const id=grid.id;const r=await api('/api/holes/'+id+'?offset='+holeOffset);if(grid?.id!==id)return;holeRows=r.rows;holeTotal=r.total;$('holes').replaceChildren();for(const h of holeRows){const b=button(h.hole+(config.mode==='foilhole'?'':' · '+h.exposures+' exposures'),()=>selectHole(h.hole));b.dataset.hole=h.hole;$('holes').append(b)}$('page').textContent=holeTotal?(holeOffset+1)+'–'+Math.min(holeOffset+100,holeTotal)+' of '+holeTotal:'No FoilHole previews found';$('pagePrev').disabled=!holeOffset;$('pageNext').disabled=holeOffset+100>=holeTotal}
 async function selectGrid(id){const intent=++navigationIntent;if(!await saveIfDirty()||intent!==navigationIntent)return;const g=grids.find(g=>g.id===id);if(!g)return;$('error').style.display='none';areaToken++;grid=g;hole='';pairs=[];areaNote.hidden=true;invalidateAnnotation();const seq=++selection;holeOffset=0;views.grid.mark([],()=>{});views.foil.clear('Select a FoilHole');views.data.clear('Select a FoilHole');views.grid.load(g.image,g.name,g.mrc);renderGrids();renderAtlas();$('gridNav').textContent=(grids.indexOf(g)+1)+' / '+grids.length;$('holeNav').textContent='Loading holes…';if($('shotNav'))$('shotNav').textContent='';if($('strips'))$('strips').replaceChildren();await loadHoles();if(seq!==selection)return;if(holeRows.length)await selectHole(holeRows[0].hole);else{$('holeNav').textContent='No holes available';await loadAnnotation()}const j=await api('/api/geometry/'+id,{});const result=await waitJob(j.job,()=>grid?.id===id);if(grid?.id!==id||!result)return;g.markers=result.markers;drawHoles();if(pairs[shot]&&!pairs[shot].foil)showFoilForExposure(pairs[shot]);if($('showAreas').checked)loadAreas();if(result.note){views.grid.message.textContent=result.note;views.grid.message.hidden=false}}
-function drawHoles(){views.grid.mark((grid?.markers||[]).map(m=>({...m,selected:m.hole===hole})),m=>selectHole(m.hole));drawAreas()}
-async function selectHole(id){const intent=++navigationIntent;if(!await saveIfDirty()||intent!==navigationIntent)return;hole=id;invalidateAnnotation();const gid=grid.id,seq=++selection;drawHoles();for(const b of $('holes').children)b.classList.toggle('active',b.dataset.hole===hole);$('holeNav').textContent='FoilHole '+id;views.data.clear('Loading matching Data previews…');const r=await api('/api/exposures/'+gid+'/'+id);if(seq!==selection)return;pairs=r.exposures;shot=0;if(pairs.length)await showShot();else{views.foil.load(r.foil,r.foil_name);views.data.clear(config.mode==='foilhole'?'Data images are ignored':r.missing.length?'No Data JPEG/PNG: '+r.missing.length+' XML records have missing previews':'No matching Data preview');if($('strips'))$('strips').replaceChildren();if($('shotNav'))$('shotNav').textContent='No Data previews';await loadAnnotation()}}
+function drawActiveHoleOutline(){
+ const m=grid?.markers?.find(m=>String(m.hole)===String(hole));
+ if(!m)return;
+ // Keep selection visible at every zoom without obscuring the hole interior
+ // or replacing the acquisition-group color and dash pattern underneath.
+ for(const [color,width] of [['#101824','5px'],['#ffffff','2.5px']]){
+  const ring=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  ring.setAttribute('cx',m.x);ring.setAttribute('cy',m.y);ring.setAttribute('r',foilOverlay.radius/100+.004);
+  ring.setAttribute('vector-effect','non-scaling-stroke');ring.setAttribute('aria-hidden','true');
+  ring.style.fill='none';ring.style.stroke=color;ring.style.strokeWidth=width;ring.style.pointerEvents='none';
+  ring.setAttribute('class','active-hole-outline');views.grid.svg.append(ring);
+ }
+}
+function drawHoles(){views.grid.mark((grid?.markers||[]).map(m=>({...m,selected:String(m.hole)===String(hole)})),m=>selectHole(m.hole));drawAreas();drawActiveHoleOutline()}
+function syncActiveHole(id){
+ if(id!==undefined&&id!==null&&String(id)!=='')hole=String(id);
+ drawHoles();
+ for(const b of $('holes').children)b.classList.toggle('active',String(b.dataset.hole)===String(hole));
+ $('holeNav').textContent='FoilHole '+hole;
+}
+async function selectHole(id){const intent=++navigationIntent;if(!await saveIfDirty()||intent!==navigationIntent)return;hole=String(id);invalidateAnnotation();const gid=grid.id,seq=++selection;pairs=[];shot=0;syncActiveHole(hole);views.foil.clear('Loading selected FoilHole…');views.data.clear('Loading matching Data previews…');if($('strips'))$('strips').replaceChildren();const r=await api('/api/exposures/'+gid+'/'+id);if(seq!==selection)return;pairs=r.exposures;shot=0;if(pairs.length)await showShot();else{views.foil.load(r.foil,r.foil_name);views.data.clear(config.mode==='foilhole'?'Data images are ignored':r.missing.length?'No Data JPEG/PNG: '+r.missing.length+' XML records have missing previews':'No matching Data preview');if($('strips'))$('strips').replaceChildren();if($('shotNav'))$('shotNav').textContent='No Data previews';await loadAnnotation()}}
 function showFoilForExposure(p){
  if(p.foil){views.foil.load(p.foil,p.foil_name);return}
  const m=grid?.markers?.find(m=>m.hole===hole);
@@ -119,7 +206,7 @@ function showFoilForExposure(p){
   'Beam-shift collection: FoilHole '+hole+' was targeted from centering hole '+m.anchor+'. No separate FoilHole image is expected for this target. Its Data images are available in the Data viewer.':
   'Data images are available for FoilHole '+hole+', but no matching FoilHole preview is indexed. Its centering relationship is not confirmed; the preview may be unavailable.');
 }
-async function showShot(){const p=pairs[shot];if(!p)return;drawHoles();views.data.load(p.id,p.name);showFoilForExposure(p);$('shotNav').textContent='Exposure '+(shot+1)+' / '+pairs.length;const strip=$('strips');strip.replaceChildren();pairs.forEach((p,i)=>{const b=button(String(i+1),async()=>{if(!await saveIfDirty())return;shot=i;await showShot()});b.classList.toggle('active',i===shot);b.title=p.name;strip.append(b)});await loadAnnotation()}
+async function showShot(){const p=pairs[shot];if(!p)return;syncActiveHole(p.hole);views.data.load(p.id,p.name);showFoilForExposure(p);$('shotNav').textContent='Exposure '+(shot+1)+' / '+pairs.length;const strip=$('strips');strip.replaceChildren();pairs.forEach((p,i)=>{const b=button(String(i+1),async()=>{if(!await saveIfDirty())return;shot=i;await showShot()});b.classList.toggle('active',i===shot);b.title=p.name;strip.append(b)});await loadAnnotation()}
 async function stepGrid(delta){if(!grid)return;const i=grids.findIndex(g=>g.id===grid.id)+delta;if(i>=0&&i<grids.length)await selectGrid(grids[i].id)}
 async function stepHole(delta){let i=holeRows.findIndex(h=>h.hole===hole)+delta;if(i>=0&&i<holeRows.length)return selectHole(holeRows[i].hole);const offset=holeOffset+(delta>0?100:-100);if(offset<0||offset>=holeTotal)return;holeOffset=offset;await loadHoles();if(holeRows.length)await selectHole(holeRows[delta>0?0:holeRows.length-1].hole)}
 async function stepShot(delta){if(!await saveIfDirty())return;const i=shot+delta;if(i>=0&&i<pairs.length){shot=i;await showShot()}}
@@ -132,4 +219,4 @@ $('search').oninput=renderGrids;$('pagePrev').onclick=()=>{holeOffset=Math.max(0
 $('cache').onclick=async()=>{if(!confirm('Copy all indexed JPEG/PNG previews into the local cache? MRCs are excluded. This may take time and disk space; repeating resumes cached files.'))return;$('cache').disabled=true;try{const j=await api('/api/cache-previews',{});$('cacheStatus').textContent='Preparing previews in background…';const r=await waitJob(j.job);$('cacheStatus').textContent=r.missing.length?'Finished with '+r.missing.length+' missing files. Reconnect and retry.':'All '+r.total+' previews cached locally.'}catch(e){fail(e)}finally{$('cache').disabled=false}};
 async function poll(){try{const s=await api('/api/status');grids=s.grids;const total=grids.reduce((n,g)=>n+(g.exposures||0),0);$('status').textContent=s.index.message+' · '+grids.length+' squares · '+(config.mode==='foilhole'?'Data ignored':total.toLocaleString()+' Data previews')+' · '+s.cache.files+' cached files';if(s.index.status==='error')$('status').style.color='#a5223b';else $('status').style.color='';renderGrids();if(s.atlas&&(!atlas||atlas.id!==s.atlas.id)){atlas=s.atlas;views.atlas.load(atlas.id,atlas.name,atlas.mrc)}renderAtlas();if(pendingRefresh&&s.index.status==='ready'){pendingRefresh=false;atlas=s.atlas;if(atlas)views.atlas.load(atlas.id,atlas.name,atlas.mrc);if(grid)await selectGrid(grid.id)}if(s.index.status==='error')pendingRefresh=false;if(!grid&&grids.length&&s.index.status!=='indexing')await selectGrid(grids[0].id)}catch(e){fail(e)}setTimeout(poll,2000)}poll();
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){document.querySelectorAll('.enlarged').forEach(c=>{c.classList.remove('enlarged');c.querySelector('.heading button').textContent='Enlarge'});Object.values(views).forEach(v=>v.fit())}});
-</script></html>'''
+</script><script src="/position_corrections.js"></script></html>'''

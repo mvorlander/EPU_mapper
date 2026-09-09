@@ -4,7 +4,7 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 
 ## Recent changes
 
-### Unreleased — Acquisition browsing and particle density
+### v0.7.0 — Acquisition browsing, particle density and targeting checks
 
 - **Acquisition mode:** browse many JPEG/PNG exposures per FoilHole, with separate square, hole, and exposure navigation.
 - **FoilHole-only mode:** map and inspect holes without scanning Data directories.
@@ -14,6 +14,9 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 - **Network-friendly loading:** background indexing, local caching and annotations, explicit refresh, and optional Atlas/GridSquare MRC loading.
 - **Optional CryoSPARC density:** gradient fills independent of acquisition-group outlines, per-square particle counts, and a collapsible import panel with Clear.
 - **Clearer atlas handling:** availability/suitability legends and refreshed atlas metadata when reopening a cached session. Missing count fields are never displayed as zero.
+- **Visible processing:** dashboard and viewer activity indicators distinguish indexing, image loading, queued mapping, and particle import, with elapsed time for slow reads.
+- **Linked selection:** the displayed hole/exposure synchronizes to a white, outline-only GridSquare highlight; density colors remain independent and stale previews clear during navigation.
+- **Targeting checks:** mark observed FoilHole positions in a separate arrow layer, compare per-square shifts, and export the original/observed coordinates as JSON without modifying EPU metadata.
 
 ### [v0.6.0](https://github.com/mvorlander/EPU_mapper/releases/tag/v0.6.0) — Collection plans and image tools
 
@@ -47,6 +50,22 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
   matching, and more dependable **macOS and Windows launchers**.
 
 ## CryoSPARC particle density
+
+### Observed targeting shifts
+
+In Acquisition or FoilHole-only mode, select a hole with its own FoilHole preview.
+Open **Observed targeting shifts** under the GridSquare, click **Mark observed
+position**, then click the actual hole centre on the GridSquare. Scroll to zoom;
+Esc cancels. The separate toggleable layer draws **EPU → observed** arrows without
+moving the original markers, acquisition footprints, or particle densities.
+Mark again to replace the correction for that preview, or remove it with
+**Remove selected correction**. Observations save locally and are included in
+annotation JSON; **Export observed shifts** exports just these measurements.
+The per-square summary uses normalized image coordinates (right/down positive),
+not stage coordinates. It describes only manually marked cases, not an unbiased
+test of whether errors are random/systematic. Arrows are not yet in HTML/PDF reports.
+
+### Importing particle subsets
 
 In the normal launcher select **Acquisition (multiple exposures per hole)**, choose
 the session and atlas, then open **CryoSPARC particle density · optional** in the

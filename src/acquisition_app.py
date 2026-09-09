@@ -43,7 +43,7 @@ def create_acquisition_app(source, atlas=None, mode='acquisition', transform='id
 
     @app.get('/',response_class=HTMLResponse)
     def home():
-        config = json.dumps(dict(mode=mode,label=label or Path(source).name)).replace('<','\\u003c')
+        config = json.dumps(dict(mode=mode,label=label or Path(source).name,transform=transform or 'identity')).replace('<','\\u003c')
         return PAGE.replace('__CONFIG__',config)
 
     @app.get('/api/status')
@@ -164,6 +164,8 @@ def create_acquisition_app(source, atlas=None, mode='acquisition', transform='id
             raise HTTPException(409,'Wait for indexing to finish before preparing previews')
         return dict(job=store.submit('Preparing local previews (no MRCs)',run,priority=10))
 
+    from position_corrections import install_position_corrections
+    install_position_corrections(app,store,transform)
     if mode == 'acquisition':
         from cryosparc_density_app import install_density
         install_density(app,source,label,transform)
