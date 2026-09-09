@@ -45,12 +45,13 @@ function Test-PythonCommand {
 $python = $null
 $pythonArgs = @()
 
-if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Command "py" -Args @("-3"))) {
-    $python = "py"
-    $pythonArgs = @("-3")
-} elseif ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Command "python")) {
+if ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Command "python")) {
+    # Honor the activated environment (including setup-python on CI).
     $python = "python"
     $pythonArgs = @()
+} elseif ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonCommand -Command "py" -Args @("-3"))) {
+    $python = "py"
+    $pythonArgs = @("-3")
 } else {
     $pythonCandidates = Get-ChildItem -Path (Join-Path $env:LocalAppData "Programs\Python") -Directory -Filter "Python*" -ErrorAction SilentlyContinue |
         Sort-Object Name -Descending |
