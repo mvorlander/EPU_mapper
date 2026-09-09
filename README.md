@@ -4,6 +4,10 @@ The EPU Mapper web app speeds up review of Thermo Fisher EPU screening sessions 
 
 ## Recent changes
 
+### v0.7.1 — Consistent image adjustment presets
+
+- **Consistent image tools:** restore the screening viewer’s robust/strong auto-contrast, full-range, histogram-equalization and reset presets, plus gamma/low-pass sliders, in every Acquisition and FoilHole-only image viewer.
+
 ### v0.7.0 — Acquisition browsing, particle density and targeting checks
 
 - **Acquisition mode:** browse many JPEG/PNG exposures per FoilHole, with separate square, hole, and exposure navigation.

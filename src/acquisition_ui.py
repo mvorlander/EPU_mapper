@@ -87,8 +87,40 @@ class Viewer{
  async load(key,name='',mrc='',isMrc=false,adjust=false){if(!key){this.clear('No matching '+this.id+' preview');return}const changed=key!==this.key,token=++this.token;this.key=key;this.name=name;this.mrcKey=mrc;this.isMrc=isMrc;if(isMrc)this.card.querySelector('details').open=true;if(!isMrc){this.previewKey=key;this.previewName=name;}this.img.hidden=true;this.message.hidden=false;this.message.textContent='Loading '+name+'…';this.card.querySelector('.filename').textContent=name;this.mrcButton.hidden=!mrc;try{const prepared=await api('/api/prepare/'+key,{viewer:this.id});if(prepared.job)await waitJob(prepared.job,()=>token===this.token);if(token!==this.token)return;const params=new URLSearchParams({adjust:adjust||isMrc?'true':'false',v:Date.now()});if(adjust){for(const n of ['low','high','gamma','sigma','routine'])params.set(n,this.card.querySelector('.'+n).value)}const image=new Image();image.src='/api/image/'+key+'?'+params;await image.decode();if(token!==this.token)return;this.img.src=image.src;this.img.hidden=false;this.message.hidden=true;if(changed)this.reset();else this.fit()}catch(e){if(token===this.token){this.message.textContent='Unavailable: '+e.message;this.img.hidden=true}}}
 }
 const views={atlas:new Viewer('atlas','Atlas'),grid:new Viewer('grid',config.mode==='acquisition'?'GridSquare · click a hole or Data area to select':'GridSquare · hover a hole to inspect'),foil:new Viewer('foil','FoilHole'),data:new Viewer('data','Data exposure')};
+function adjustmentPreset(name){return {low:name==='strong'?2:name==='full'?0:1,high:name==='strong'?98:name==='full'?100:99,gamma:1,sigma:name==='reset'?0:null,routine:name==='equalize'?'equalize':'percentile',enabled:name!=='reset'}}
+function setupImageAdjustments(view){
+ const panel=view.card.querySelector('details.contrast');panel.classList.add('image-adjustments');
+ panel.innerHTML=`<summary>Adjust image <span class="adjustment-badge">Original preview</span></summary>
+ <div class="adjustment-presets"><button data-preset="robust">Auto · robust</button><button data-preset="strong">Auto · strong</button><button data-preset="full">Full range</button><button data-preset="equalize">Equalize histogram</button><button data-preset="reset">Reset image</button></div>
+ <div class="adjustment-fields"><label>Black percentile<input class="low" aria-label="Black percentile" type="number" min="0" max="99.9" step="0.1" value="1"></label><label>White percentile<input class="high" aria-label="White percentile" type="number" min="0.1" max="100" step="0.1" value="99"></label>
+ <label>Gamma <output class="gamma-value">1.00</output><input class="gamma" aria-label="Gamma" type="range" min="0.2" max="3" step="0.05" value="1"></label>
+ <label>Low-pass σ <output class="sigma-value">Off</output><input class="sigma" aria-label="Low-pass filter sigma" type="range" min="0" max="4" step="0.1" value="0"></label></div>
+ <select class="routine" hidden><option value="percentile">Percentile</option><option value="equalize">Equalize</option></select>
+ <p class="adjustment-note">Display only; original files and exports stay unchanged. Low-pass σ is in preview pixels (maximum 2048 px image). Filtering can conceal fine detail.</p>
+ <div class="adjustment-status" role="status"></div>`;
+ const field=name=>panel.querySelector('.'+name),status=field('adjustment-status');
+ view.updateAdjustmentLabels=()=>{field('gamma-value').textContent=Number(field('gamma').value).toFixed(2);field('sigma-value').textContent=Number(field('sigma').value)?Number(field('sigma').value).toFixed(1):'Off';field('adjustment-badge').textContent=view.adjustmentEnabled?`${field('low').value}–${field('high').value}% · γ ${Number(field('gamma').value).toFixed(2)}`:'Original preview'};
+ async function render(){
+  if(!view.key){status.textContent='Select an image first.';return}
+  const low=Number(field('low').value),high=Number(field('high').value);
+  if(!Number.isFinite(low)||!Number.isFinite(high)||low<0||high>100||low>=high){status.textContent='Black percentile must be below white percentile (0–100).';return}
+  status.textContent='Adjusting preview…';
+  await view.load(view.key,view.name,view.mrcKey,view.isMrc,!!view.adjustmentEnabled);
+  status.textContent=view.img.hidden?'Preview unavailable; try Reset image or check the connection.':view.adjustmentEnabled?'Preview adjusted; original unchanged.':'Original preview restored.';
+ }
+ for(const input of panel.querySelectorAll('input'))input.oninput=()=>{clearTimeout(view.adjustmentTimer);view.adjustmentEnabled=true;view.updateAdjustmentLabels();view.adjustmentTimer=setTimeout(render,200)};
+ for(const button of panel.querySelectorAll('[data-preset]'))button.onclick=()=>{
+  clearTimeout(view.adjustmentTimer);const preset=adjustmentPreset(button.dataset.preset);view.adjustmentEnabled=preset.enabled;
+  for(const name of ['low','high','gamma','sigma','routine'])if(preset[name]!==null)field(name).value=preset[name];
+  view.updateAdjustmentLabels();render();
+ };
+}
+const adjustmentStyle=document.createElement('style');adjustmentStyle.textContent=`
+.image-adjustments{background:#f7f9fc;border-top:1px solid #dbe3ed;padding:12px!important}.image-adjustments summary{font-weight:650;cursor:pointer}.adjustment-badge{font-weight:400;color:#64748b;margin-left:10px}.adjustment-presets{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.adjustment-presets button{font-size:12px;padding:6px 9px}.adjustment-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.image-adjustments .adjustment-fields label{display:block;margin:0}.image-adjustments .adjustment-fields input{display:block;width:100%;margin-top:5px}.adjustment-note,.adjustment-status{color:#64748b;font-size:11px;line-height:1.5;margin-top:10px}.adjustment-status{min-height:17px}`;
+document.head.append(adjustmentStyle);Object.values(views).forEach(setupImageAdjustments);
 const originalViewerLoad=Viewer.prototype.load;
 Viewer.prototype.load=async function(key,name='',mrc='',isMrc=false,adjust=false){
+ clearTimeout(this.adjustmentTimer);adjust=adjust||!!this.adjustmentEnabled;
  if(!key)return originalViewerLoad.call(this,key,name,mrc,isMrc,adjust);
  const token=this.token+1,activity=beginActivity(adjust?'Applying contrast / low-pass':isMrc?'Loading MRC image':'Loading image',this.id,()=>this.token===token);
  try{return await originalViewerLoad.call(this,key,name,mrc,isMrc,adjust)}finally{activity.finish()}
