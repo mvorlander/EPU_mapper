@@ -129,3 +129,8 @@ $('densityImport').onclick=async()=>{
 api('/api/density/summary').then(s=>{
  if(s.loaded){updateDensityCounts(s);$('densityStatus').textContent=`${s.matched.toLocaleString()} selected particles loaded across ${s.represented_holes} holes. `+s.warning;loadDensity()}
 }).catch(e=>{$('densityStatus').textContent='Density service unavailable: '+e.message});
+if(config.mode==='foilhole'){
+ $('densityImport').disabled=true;
+ $('densityMain').disabled=true;$('densityPass').disabled=true;
+ $('densityStatus').textContent='Data loading is off. Uncheck Ignore Data images in the launcher to match particle exposures; no Data MRCs are needed.';
+}

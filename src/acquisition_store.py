@@ -327,6 +327,38 @@ class AcquisitionStore:
                     pass  # keep the known cached version for disconnected shares
             self.execute("UPDATE grids SET markers='[]',note=''")
         self.scan_state['grids_done']=len(grids)
+        self.import_screening_reviews()
+
+    def import_screening_reviews(self):
+        """Copy legacy square reviews into local storage without overwriting newer edits."""
+        if self.meta('user-annotations-cleared',False):
+            return
+        groups={}
+        for grid in self.execute('SELECT id,path,name FROM grids'):
+            groups.setdefault(Path(grid['path']).parent,[]).append(grid)
+        for parent,grids in groups.items():
+            path=parent/'review_responses.json'
+            try:
+                entries=json.loads(path.read_text(encoding='utf-8'))
+            except (OSError,ValueError):
+                continue
+            if not isinstance(entries,dict):
+                continue
+            for grid in grids:
+                key='grid:'+grid['id'];entry=entries.get(grid['name'])
+                if not isinstance(entry,dict) or self.annotation(key):
+                    continue
+                try:
+                    with self.lock:
+                        if self.meta('user-annotations-cleared',False):
+                            return
+                        self.annotate(key,dict(comment=entry.get('comment',''),rating=entry.get('rating',0),
+                            status=entry.get('collection_status') or ('suitable' if entry.get('collect') else ''),
+                            priority=entry.get('priority','primary')),overwrite=False)
+                        self.set_meta('legacy-review:'+grid['id'],entry)
+                except (ValueError,TypeError):
+                    continue
+                # Preserve fields that the unified review form does not yet edit.
 
     def _index_atlas(self, refresh=False):
         if self.atlas.suffix.lower() in ('.jpg','.jpeg','.png'):
@@ -353,15 +385,44 @@ class AcquisitionStore:
         nodes = _parse_atlas_dm_nodes(metadata['.dm']) if '.dm' in metadata else {}
         dimensions = parse_grid_info(metadata['.xml']) if '.xml' in metadata else {}
         width, height = dimensions.get('readout_width'), dimensions.get('readout_height')
+        # DM square centers belong to the assembled atlas, not a camera tile.
+        # Read only the matching MRC header, even while displaying its JPEG.
+        names = {name for name,_ in self.list_names(selected.parent)}
+        mrc_path = next((selected.with_suffix(ext) for ext in ('.mrc','.mrcs') if selected.with_suffix(ext).name in names),None)
+        mrc = self.add_media(mrc_path,'atlas_mrc') if mrc_path else ''
+        frame_source='xml-readout'
+        if mrc_path:
+            import mrcfile
+            width=height=None
+            try:
+                with mrcfile.open(mrc_path,header_only=True,permissive=True) as header:
+                    w,h=int(header.header.nx),int(header.header.ny)
+                if w>0 and h>0:
+                    width,height=w,h
+                    frame_source='mrc-header'
+            except (OSError,ValueError):
+                pass  # Incomplete or unavailable MRC: never substitute tile dimensions.
+        elif '.xml' in metadata:
+            root=ET.parse(metadata['.xml']).getroot()
+            for entry in root.iter():
+                fields={child.tag.rsplit('}',1)[-1].lower():child.text for child in entry}
+                if fields.get('key') in ('NumberOfTilesAcquired','NumberOfTilesPlanned'):
+                    try:
+                        if float(fields.get('value') or 0)>1:
+                            width=height=None
+                    except ValueError:
+                        pass
+            # Out-of-frame centers also rule out the camera readout as a valid frame.
+            if width and height and any(n.get('center') and (n['center'][0]>width or n['center'][1]>height) for n in nodes.values()):
+                width=height=None
         # Never guess the detector frame from the furthest screened position.
         # Without its reference dimensions, display the atlas without markers.
         if not width or not height:
             nodes = {}
         # Persist mapping locally; all subsequent requests avoid the network.
-        names = {name for name,_ in self.list_names(selected.parent)}
-        mrc_path = next((selected.with_suffix(ext) for ext in ('.mrc','.mrcs') if selected.with_suffix(ext).name in names),None)
-        mrc = self.add_media(mrc_path,'atlas_mrc') if mrc_path else ''
-        self.set_meta('atlas',dict(id=aid,mrc=mrc,name=selected.name,nodes=nodes,width=width,height=height))
+        self.set_meta('atlas',dict(id=aid,mrc=mrc,name=selected.name,nodes=nodes,width=width,height=height,
+            frame_source=frame_source if width and height else None,
+            note='' if width and height else 'Atlas overlays unavailable: assembled image dimensions could not be established. Supply the matching Atlas MRC (only its header is read).'))
 
     def geometry(self, gid, transform='identity'):
         """Read positional metadata only for the selected square, then cache it locally."""
@@ -569,11 +630,12 @@ class AcquisitionStore:
         rows=self.execute('SELECT value FROM annotations WHERE key=?',(key,))
         return json.loads(rows[0]['value']) if rows else {}
 
-    def annotate(self,key,value):
+    def annotate(self,key,value,overwrite=True):
         clean=dict(comment=str(value.get('comment',''))[:10000],flag=bool(value.get('flag')),rating=max(0,min(5,int(value.get('rating',0)))),status=value.get('status',''),priority=value.get('priority','primary'))
         if clean['status'] not in ('','suitable','unsuitable') or clean['priority'] not in ('primary','backup','needs_screening'):
             raise ValueError('Invalid annotation')
-        self.execute('INSERT OR REPLACE INTO annotations VALUES (?,?)',(key,json.dumps(clean)))
+        action='REPLACE' if overwrite else 'IGNORE'
+        self.execute('INSERT OR '+action+' INTO annotations VALUES (?,?)',(key,json.dumps(clean)))
         return clean
 
     def metric(self,key):
@@ -582,6 +644,22 @@ class AcquisitionStore:
 
     def annotation_snapshot(self):
         return {r['key']:json.loads(r['value']) for r in self.execute('SELECT * FROM annotations')}
+
+    def clear_user_annotations(self):
+        """Back up and clear only this local session's review annotations."""
+        with self.lock:
+            snapshot=self.annotation_snapshot()
+            folder=self.root/'annotation-backups'
+            folder.mkdir(exist_ok=True)
+            key=uuid.uuid4().hex
+            path=folder/(key+'.json')
+            # A failed backup must leave all annotations intact.
+            path.write_text(json.dumps(dict(source=str(self.source),annotations=snapshot),indent=2),encoding='utf-8')
+            with self.db:
+                self.db.execute('DELETE FROM annotations')
+                self.db.execute("DELETE FROM meta WHERE key LIKE 'legacy-review:%'")
+                self.db.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',('user-annotations-cleared','true'))
+            return dict(deleted=len(snapshot),backup=key)
 
     def cache_status(self):
         rows=self.execute('SELECT COUNT(*) AS files,COALESCE(SUM(size),0) AS bytes FROM cached')[0]

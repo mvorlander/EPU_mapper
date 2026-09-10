@@ -17,6 +17,7 @@ def create_acquisition_app(source, atlas=None, mode='acquisition', transform='id
     @asynccontextmanager
     async def lifespan(app):
         store.set_meta('atlas',None)
+        store.submit('Loading saved screening reviews',store.import_screening_reviews)
         if not store.meta('indexed:'+mode):
             store.start_scan()
         elif store.atlas:
@@ -166,7 +167,8 @@ def create_acquisition_app(source, atlas=None, mode='acquisition', transform='id
 
     from position_corrections import install_position_corrections
     install_position_corrections(app,store,transform)
-    if mode == 'acquisition':
-        from cryosparc_density_app import install_density
-        install_density(app,source,label,transform)
+    from cryosparc_density_app import install_density
+    install_density(app,source,label,transform)
+    from unified_review import install_review_tools
+    install_review_tools(app,store,label,transform)
     return app

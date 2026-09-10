@@ -2,19 +2,23 @@
 
 ## Launching acquisition review
 
-Open `EPU Mapper.app`, select the input session and matching Atlas folder, then choose **Acquisition (multiple exposures per hole)** or **FoilHole only (ignore Data)** in **Review mode** and click the launch button. The selected mode is remembered.
+Open `EPU Mapper.app`, select the session and matching Atlas folder, and start **Unified review**. Optionally check **Ignore Data images** to avoid scanning Data folders. This loading preference is remembered; there is no review-mode selector.
 
-The dashboard opens while indexing continues in the background. Click a GridSquare to load its first FoilHole/Data pair. Hover or click hole overlays, or use **Previous/Next hole**; use **Previous/Next exposure** for the individual images from one hole. FoilHole-only mode has automatic overlays, no Data viewer, and does not scan Data directories. Positions come from `Metadata/GridSquare_*.dm` pixel centers, with an automatic fallback to the GridSquare and FoilHole XML stage coordinates. GridSquare XML reference dimensions are required. Missing metadata for one hole does not hide the others: **Refresh index** as copying progresses to add newly available holes. Coordinates are not guessed or clamped into the image.
+The dashboard opens while indexing continues in the background. Click a GridSquare to load its first FoilHole/Data pair. **Click** hole overlays or use **Previous/Next hole**; use **Previous/Next exposure** for individual images from one hole. Ignoring Data preserves all four panels, showing a clear Data-loading-off message, and retains automatic FoilHole overlays. Positions come from `Metadata/GridSquare_*.dm` pixel centers, with an automatic fallback to GridSquare and FoilHole XML stage coordinates. GridSquare XML reference dimensions are required. Missing metadata for one hole does not hide the others: **Refresh index** as copying progresses to add newly available holes. Coordinates are not guessed or clamped into the image.
 
 JPEG/PNG previews load on demand into a local cache. Only Atlas and GridSquare viewers offer **Load MRC**. All viewers support scroll zoom, drag pan, enlargement, contrast routines, gamma and preview-scale Gaussian low-pass filtering. Adjustments do not change original images.
 
-**Refresh index** explicitly checks for changed source data. **Prepare local previews** copies indexed JPEG/PNG previews, not MRCs, to the local cache; repeating resumes already cached files. It does not create a portable session bundle. Cached images and annotations can be reopened with the share disconnected; uncached images still need the share. Annotations are stored locally and can be downloaded as JSON. The established HTML/PDF report and portable-session workflow remains available in **Screening** mode; the acquisition dashboard currently exports annotations rather than image reports.
+**Refresh index** explicitly checks for changed source data. **Prepare local previews** copies indexed JPEG/PNG previews, not MRCs, to the local cache; repeating resumes already cached files. It does not create a portable session bundle. Cached images and annotations can be reopened with the share disconnected; uncached images still need the share. Annotations are stored locally and can be downloaded as JSON. Legacy GridSquare ratings, comments and suitability are copied into the local unified index without altering source files or overwriting newer local annotations.
+
+**Atlas annotations** switches between live suitability, rating, EPU categories and raw imagery. **Add target / area** places a point or a two-corner rectangle for manual collection planning, without changing microscope metadata. Overlay opacity is independent of image contrast.
+
+**Export HTML screening report** embeds current annotations and JPEG images into an offline browser report. Choose one suitable square, all suitable squares, or explicitly all screened images. The optional high-resolution Atlas reads its MRC when available and embeds a JPEG up to 4096 pixels; MRC files are never embedded. Exported Atlas layers have their own opacity control. Export runs independently of the launcher's full-session bundle export. Detailed PDF export and the legacy report editor retain their separate legacy review data; unified edits are not mirrored back into that editor.
 
 CLI equivalents:
 
 ```bash
-python src/review_app.py /path/to/session --atlas /path/to/Atlas --mode acquisition --auto-port --open
-python src/review_app.py /path/to/session --atlas /path/to/Atlas --mode foilhole --auto-port --open
+python src/review_app.py /path/to/session --atlas /path/to/Atlas --auto-port --open
+python src/review_app.py /path/to/session --atlas /path/to/Atlas --ignore-data --auto-port --open
 ```
 
 ## What to request

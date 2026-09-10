@@ -55,7 +55,7 @@ class AcquisitionAppTests(unittest.TestCase):
 
     def test_acquisition_images_geometry_mrc_and_annotations(self):
         with TestClient(self.app()) as client:
-            self.assertIn('Acquisition',client.get('/').text)
+            self.assertIn('Unified review',client.get('/').text)
             status=self.ready(client);grid=status['grids'][0]
             self.assertEqual(grid['exposures'],9)
             self.assertIsInstance(grid['markers'],list)
@@ -99,6 +99,41 @@ class AcquisitionAppTests(unittest.TestCase):
         for mode in ('screening','acquisition','foilhole'):
             command=_review_command(str(self.source),'127.0.0.1','8000',str(self.atlas),True,True,False,'identity',review_mode=mode)
             self.assertEqual(command[command.index('--mode')+1],mode)
+
+    def test_unified_default_and_loading_preferences(self):
+        from scripts.windows_gui_launcher import _ignore_data_setting
+        self.assertFalse(_ignore_data_setting({'review_mode':'screening'}))
+        self.assertTrue(_ignore_data_setting({'review_mode':'foilhole'}))
+        self.assertTrue(_ignore_data_setting({'review_mode':'gridsquare'}))
+        self.assertFalse(_ignore_data_setting({'review_mode':'foilhole','ignore_data':False}))
+        command=_review_command(str(self.source),'127.0.0.1','8000',str(self.atlas),True,True,False,'identity',ignore_data=True)
+        self.assertEqual(command[command.index('--mode')+1],'unified')
+        self.assertIn('--ignore-data',command)
+        import review_app
+        with patch('acquisition_app.create_acquisition_app',return_value='unified') as factory:
+            for mode in ('unified','screening','acquisition'):
+                self.assertEqual(review_app.create_app(self.source,review_mode=mode),'unified')
+                self.assertEqual(factory.call_args.args[2],'acquisition')
+            review_app.create_app(self.source,ignore_data=True)
+            self.assertEqual(factory.call_args.args[2],'foilhole')
+
+    def test_legacy_reviews_migrate_without_overwriting_local_edits(self):
+        import json
+        grid_path=next(self.source.rglob('GridSquare_*'))
+        # The generator's GridSquare directory is the first matching entry.
+        self.assertTrue(grid_path.is_dir())
+        review_file=grid_path.parent/'review_responses.json'
+        old={grid_path.name:dict(rating=4,comment='Old screening review',collect=True,include=False)}
+        review_file.write_text(json.dumps(old))
+        with TestClient(self.app()) as client:
+            g=self.ready(client)['grids'][0];store=client.app.state.acquisition_store
+            key='grid:'+g['id']
+            self.assertEqual(store.annotation(key)['rating'],4)
+            self.assertEqual(store.annotation(key)['status'],'suitable')
+            store.annotate(key,dict(rating=2,comment='New unified review'))
+            store.import_screening_reviews()
+            self.assertEqual(store.annotation(key)['comment'],'New unified review')
+            self.assertEqual(json.loads(review_file.read_text()),old)
 
     def test_stale_annotation_save_cannot_enable_new_form(self):
         from acquisition_ui import PAGE

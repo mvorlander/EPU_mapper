@@ -1,6 +1,6 @@
 """Self-contained UI for bounded, on-demand acquisition browsing."""
 PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EPU Mapper · Acquisition review</title><style>
+<title>EPU Mapper · Unified review</title><style>
 [hidden]{display:none!important}:root{font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#203047;background:#f3f6fa}*{box-sizing:border-box}body{margin:0}button,select,input,textarea{font:inherit;border:1px solid #ccd7e4;border-radius:7px;background:white;color:inherit;padding:7px}button{cursor:pointer}button:hover,button.active{background:#e2f3f0;border-color:#309b90}button:disabled{opacity:.4;cursor:default}header{display:flex;justify-content:space-between;gap:15px;padding:18px 22px;background:white;border-bottom:1px solid #dbe3ed;align-items:center}h1{font-size:21px;margin:0}h2{font-size:14px;margin:0}small,.muted{color:#6a7a90;font-size:12px}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}#status{padding:12px 22px;min-height:45px}#error{color:#a5223b;background:#fff0f2;padding:12px;display:none;white-space:pre-wrap}.layout{display:grid;grid-template-columns:190px minmax(0,1fr) 220px;gap:12px;padding:0 18px 18px}aside,.card{background:#fff;border:1px solid #dbe3ed;border-radius:12px;min-width:0}aside{padding:12px;align-self:start;position:sticky;top:12px;max-height:92vh;overflow:auto}aside h2{margin:7px 0 10px}.list{max-height:32vh;overflow:auto;display:grid;gap:5px;margin:8px 0}.list button{text-align:left;font-size:12px;overflow-wrap:anywhere}.list small{display:block}.images{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}.card{overflow:hidden}.heading{height:62px;padding:12px;display:flex;justify-content:space-between;align-items:center;gap:8px}.heading small{display:block;max-width:30vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.viewport{height:clamp(250px,32vw,480px);position:relative;overflow:hidden;background:#101824;touch-action:none;cursor:grab}.scene{position:absolute;transform-origin:center}.scene img{width:100%;height:100%;display:block}.scene svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}.scene circle{cursor:pointer;stroke:white;stroke-width:.003;fill:#248f84;fill-opacity:.7}.scene circle.selected{fill:#f2c450;stroke:#f2c450;stroke-width:.007}.message{position:absolute;bottom:8px;left:8px;right:8px;background:#101824dc;padding:7px;color:#dde6ef;font-size:12px;pointer-events:none;border-radius:5px}.controls{padding:9px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;font-size:11px;min-height:45px}.controls button{font-size:11px;padding:5px 8px}.nav{padding:8px;display:flex;align-items:center;justify-content:space-between;gap:5px;min-height:46px;border-top:1px solid #e8edf3}.nav small{text-align:center}.contrast{padding:9px;font-size:12px}.contrast label{display:inline-flex;align-items:center;gap:4px;margin:4px}.contrast input{width:62px;padding:4px}.contrast select{font-size:12px}textarea{width:100%;height:120px;resize:vertical}aside label{display:block;margin:10px 0 5px}aside select{width:100%}#strips{display:flex;gap:5px;overflow:auto;padding:8px}#strips button{font-size:11px;min-width:48px}#strips img{width:60px;height:50px;object-fit:contain;display:block}#legend{font-size:11px;color:#6a7a90;padding:0 18px 10px}.enlarged{position:fixed;inset:12px;z-index:20;display:flex;flex-direction:column;box-shadow:0 0 0 30px #0009}.enlarged .viewport{height:auto;flex:1;min-height:0}.enlarged .heading small{max-width:75vw}.foil-only #data{display:none}.foil-only #foil{grid-column:1/-1}.foil-only #foil .viewport{height:420px}a{color:#147d76}.badge{font-size:11px;border-radius:12px;background:#dff3ee;color:#237867;padding:5px 9px}#cacheStatus{font-size:12px;white-space:pre-wrap;margin-top:8px}@media(max-width:1050px){.layout{grid-template-columns:155px minmax(0,1fr)}aside.review{grid-column:1/-1;position:static;max-height:none}.review textarea{height:70px}.viewport{height:300px}}@media(max-width:700px){header{display:block}.layout{display:block}aside{position:static;max-height:none;margin-bottom:10px}.images{grid-template-columns:1fr}.heading small{max-width:70vw}.viewport{height:350px}}
 </style><header><div><h1>EPU Mapper <span id="mode" class="badge"></span></h1><small id="title"></small></div><div class="actions"><button id="refresh">Refresh index</button><button id="cache">Prepare local previews</button><a href="/api/annotations.json" download>Export annotations</a></div></header>
 <div id="status" role="status">Opening local index…</div><div id="error" role="alert"></div><div id="legend">Atlas: green = available · amber = no Data preview · suitable = green ring · unsuitable = red ring · selected hole = thicker group outline. Scroll to zoom · drag to pan.</div>
@@ -8,8 +8,8 @@ PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="view
 <section class="images" id="images"></section><aside class="review"><h2>Review annotation</h2><label for="scope">Annotate</label><select id="scope"><option value="grid">GridSquare</option><option value="hole">FoilHole</option><option value="exposure">Exposure</option></select><small id="target"></small><label for="rating">Rating</label><select id="rating"><option value="0">Unrated</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select><label for="suitability">Collection suitability</label><select id="suitability"><option value="">Unmarked</option><option value="suitable">Suitable</option><option value="unsuitable">Not suitable</option></select><label><input type="checkbox" id="flag"> Flag for follow-up</label><label for="comment">Comment</label><textarea id="comment" placeholder="Notes for this selection"></textarea><button id="save">Save annotation</button><p class="muted" id="saved">Saved locally, not written to the network share. Cmd/Ctrl+Enter saves and advances a square.</p><div id="cacheStatus"></div></aside></main>
 <script>
 const config=__CONFIG__, $=id=>document.getElementById(id);let grids=[],grid=null,hole='',holeRows=[],holeOffset=0,holeTotal=0,pairs=[],shot=0,selection=0,atlas=null,annotationKey='',annotationToken=0,pendingRefresh=false,navigationIntent=0;
-$('mode').textContent=config.mode==='foilhole'?'FoilHole only':'Acquisition';$('title').textContent=config.label;
-if(config.mode==='foilhole'){document.body.classList.add('foil-only');$('scope').querySelector('[value=exposure]').remove();$('legend').textContent='Data directories are not scanned in this mode. Selected hole = thicker group outline · suitable = green ring · unsuitable = red ring. Scroll to zoom · drag to pan.';}
+$('mode').textContent='Unified review';$('title').textContent=config.label;
+if(config.mode==='foilhole'){$('scope').querySelector('[value=exposure]').disabled=true;$('legend').textContent='Data loading is off (change Ignore Data images in the launcher). FoilHole overlays remain available. Scroll to zoom · drag to pan · click to select.';}
 const fail=e=>{$('error').textContent=e.message||String(e);$('error').style.display='block'};
 // Activity is independent of viewer messages: loading never masquerades as
 // missing data, and concurrent operations cannot clear each other's indicator.
@@ -82,11 +82,37 @@ class Viewer{
  }
  reset(){this.zoom=1;this.x=this.y=0;this.fit()}
  fit(){if(!this.img.naturalWidth)return;const r=this.viewport.getBoundingClientRect(),s=Math.min(r.width/this.img.naturalWidth,r.height/this.img.naturalHeight),w=this.img.naturalWidth*s,h=this.img.naturalHeight*s;Object.assign(this.scene.style,{width:w+'px',height:h+'px',left:(r.width-w)/2+'px',top:(r.height-h)/2+'px',transform:`translate(${this.x}px,${this.y}px) scale(${this.zoom})`})}
- mark(markers,click){this.markers=markers;this.svg.replaceChildren();for(const m of markers){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',m.x);c.setAttribute('cy',m.y);c.setAttribute('r',this.id==='atlas'?.018:.012);if(m.selected)c.classList.add('selected');if(m.color)c.style.fill=m.color;if(m.stroke)c.style.stroke=m.stroke;if(this.id==='grid')styleFoilCircle(c,m.selected,m);const t=document.createElementNS(c.namespaceURI,'title');t.textContent=m.label||('FoilHole '+m.hole+(m.anchor?' · '+(m.role==='anchor'?'centering hole':'beam-shifted from '+m.anchor):' · centering group unknown'));c.append(t);c.onclick=()=>Promise.resolve(click(m)).catch(fail);if(this.id==='grid'&&config.mode==='foilhole')c.onpointerenter=()=>{if(m.hole!==hole)Promise.resolve(click(m)).catch(fail)};this.svg.append(c)}}
- clear(message='No matching image'){this.token++;this.key='';this.img.hidden=true;this.img.removeAttribute('src');this.svg.replaceChildren();this.message.textContent=message;this.message.hidden=false;this.card.querySelector('.filename').textContent='';this.mrcButton.hidden=true}
+ mark(markers,click){this.markers=markers;this.svg.replaceChildren();for(const m of markers){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',m.x);c.setAttribute('cy',m.y);c.setAttribute('r',this.id==='atlas'?.018:.012);if(m.selected)c.classList.add('selected');if(m.color)c.style.fill=m.color;if(m.stroke)c.style.stroke=m.stroke;if(this.id==='grid')styleFoilCircle(c,m.selected,m);const t=document.createElementNS(c.namespaceURI,'title');t.textContent=m.label||('FoilHole '+m.hole+(m.anchor?' · '+(m.role==='anchor'?'centering hole':'beam-shifted from '+m.anchor):' · centering group unknown'));c.append(t);c.onclick=()=>Promise.resolve(click(m)).catch(fail);this.svg.append(c)}}
+ clear(message='No matching image'){if(this.id==='data'&&config.mode==='foilhole')message='Data loading is off. Uncheck Ignore Data images in the launcher to include exposures.';this.token++;this.key='';this.img.hidden=true;this.img.removeAttribute('src');this.svg.replaceChildren();this.message.textContent=message;this.message.hidden=false;this.card.querySelector('.filename').textContent='';this.mrcButton.hidden=true}
  async load(key,name='',mrc='',isMrc=false,adjust=false){if(!key){this.clear('No matching '+this.id+' preview');return}const changed=key!==this.key,token=++this.token;this.key=key;this.name=name;this.mrcKey=mrc;this.isMrc=isMrc;if(isMrc)this.card.querySelector('details').open=true;if(!isMrc){this.previewKey=key;this.previewName=name;}this.img.hidden=true;this.message.hidden=false;this.message.textContent='Loading '+name+'…';this.card.querySelector('.filename').textContent=name;this.mrcButton.hidden=!mrc;try{const prepared=await api('/api/prepare/'+key,{viewer:this.id});if(prepared.job)await waitJob(prepared.job,()=>token===this.token);if(token!==this.token)return;const params=new URLSearchParams({adjust:adjust||isMrc?'true':'false',v:Date.now()});if(adjust){for(const n of ['low','high','gamma','sigma','routine'])params.set(n,this.card.querySelector('.'+n).value)}const image=new Image();image.src='/api/image/'+key+'?'+params;await image.decode();if(token!==this.token)return;this.img.src=image.src;this.img.hidden=false;this.message.hidden=true;if(changed)this.reset();else this.fit()}catch(e){if(token===this.token){this.message.textContent='Unavailable: '+e.message;this.img.hidden=true}}}
 }
-const views={atlas:new Viewer('atlas','Atlas'),grid:new Viewer('grid',config.mode==='acquisition'?'GridSquare · click a hole or Data area to select':'GridSquare · hover a hole to inspect'),foil:new Viewer('foil','FoilHole'),data:new Viewer('data','Data exposure')};
+// Keep annotation context above the images, without a competing right sidebar.
+const reviewBar=document.querySelector('aside.review');
+for(const id of ['scope','rating','suitability','comment']){
+ const field=document.getElementById(id),label=reviewBar.querySelector(`label[for="${id}"]`);
+ const group=document.createElement('div');group.className='review-field review-'+id;
+ label.before(group);group.append(label,field);
+ if(id==='scope')group.append($('target'));
+}
+reviewBar.parentElement.insertBefore(reviewBar,document.getElementById('images'));
+const compactStyle=document.createElement('style');compactStyle.textContent=`
+.layout{grid-template-columns:170px minmax(0,1fr);gap:10px}
+.layout>aside:not(.review){grid-column:1;grid-row:1 / span 2}
+.layout>aside.review{grid-column:2;grid-row:1;position:static;max-height:none;overflow:visible;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:10px 12px}
+.review h2{font-size:12px;margin:0}.review-field{min-width:95px}.review-field label{font-size:11px;margin:0 0 4px}.review-scope{max-width:230px}.review #target{display:block;overflow-wrap:anywhere;font-size:10px;margin-top:3px}.review-comment{flex:1;min-width:180px}.review textarea{height:42px;min-height:42px}.review>label{font-size:11px;margin:0}.review #saved{flex-basis:100%;font-size:10px;margin:0}.review #cacheStatus:empty{display:none}
+.images{grid-column:2;grid-row:2;gap:8px;align-items:start;min-width:0}
+.images>.card:not(.enlarged){display:grid;grid-template-columns:minmax(0,1fr) 88px;align-content:start}
+.images>.card:not(.enlarged)>*{grid-column:1/-1}
+.images>.card:not(.enlarged)>.viewport{grid-column:1;grid-row:2;height:clamp(230px,29vh,420px)}
+.images>.card:not(.enlarged)>.viewer-tools{grid-column:2;grid-row:2;display:flex;flex-direction:column;align-items:stretch;justify-content:center;flex-wrap:nowrap;padding:6px;gap:6px;background:#f7f9fc;overflow:auto}
+.viewer-tools button{white-space:normal;line-height:1.25}.heading{height:50px;padding:8px}.heading>div{min-width:0}.heading small{max-width:100%}.heading h2{font-size:12px}.nav{min-height:38px;padding:5px}.controls{padding:6px;min-height:32px}.controls:empty{display:none}
+.viewer-options{display:flex;flex-wrap:wrap;align-items:start;background:#f7f9fc}.viewer-options>details{flex:1;min-width:120px;padding:8px!important;border-top:0;font-size:11px}.viewer-options>details[open]{flex-basis:100%;order:1}.viewer-options .adjustment-badge{display:none}
+@media(min-width:1800px){.layout{grid-template-columns:195px minmax(0,1fr)}.images>.card:not(.enlarged)>.viewport{height:clamp(300px,34vh,560px)}}
+@media(max-width:1150px){.layout{grid-template-columns:145px minmax(0,1fr);padding:0 10px 10px}.review h2{display:none}.images>.card:not(.enlarged){grid-template-columns:minmax(0,1fr)}.images>.card:not(.enlarged)>.viewport{grid-column:1;grid-row:2}.images>.card:not(.enlarged)>.viewer-tools{grid-column:1;grid-row:3;flex-direction:row;flex-wrap:wrap;justify-content:flex-start;overflow:visible}.heading button{font-size:11px;padding:5px}.review #target{max-width:160px}}
+@media(max-width:800px){.layout{display:grid;grid-template-columns:120px minmax(0,1fr)}.images{grid-template-columns:1fr 1fr}.layout>aside:not(.review){position:static}.review-field{min-width:80px}.heading{height:58px}}
+`;document.head.append(compactStyle);
+const views={atlas:new Viewer('atlas','Atlas'),grid:new Viewer('grid','GridSquare · click a hole to select'),foil:new Viewer('foil','FoilHole'),data:new Viewer('data','Data exposure')};
+Object.values(views).forEach(v=>v.card.querySelector('.controls').classList.add('viewer-tools'));
 function adjustmentPreset(name){return {low:name==='strong'?2:name==='full'?0:1,high:name==='strong'?98:name==='full'?100:99,gamma:1,sigma:name==='reset'?0:null,routine:name==='equalize'?'equalize':'percentile',enabled:name!=='reset'}}
 function setupImageAdjustments(view){
  const panel=view.card.querySelector('details.contrast');panel.classList.add('image-adjustments');
@@ -118,6 +144,7 @@ function setupImageAdjustments(view){
 const adjustmentStyle=document.createElement('style');adjustmentStyle.textContent=`
 .image-adjustments{background:#f7f9fc;border-top:1px solid #dbe3ed;padding:12px!important}.image-adjustments summary{font-weight:650;cursor:pointer}.adjustment-badge{font-weight:400;color:#64748b;margin-left:10px}.adjustment-presets{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.adjustment-presets button{font-size:12px;padding:6px 9px}.adjustment-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.image-adjustments .adjustment-fields label{display:block;margin:0}.image-adjustments .adjustment-fields input{display:block;width:100%;margin-top:5px}.adjustment-note,.adjustment-status{color:#64748b;font-size:11px;line-height:1.5;margin-top:10px}.adjustment-status{min-height:17px}`;
 document.head.append(adjustmentStyle);Object.values(views).forEach(setupImageAdjustments);
+Object.values(views).forEach(v=>{const options=document.createElement('div');options.className='viewer-options';const adjustments=v.card.querySelector('details.contrast');adjustments.before(options);options.append(adjustments)});
 const originalViewerLoad=Viewer.prototype.load;
 Viewer.prototype.load=async function(key,name='',mrc='',isMrc=false,adjust=false){
  clearTimeout(this.adjustmentTimer);adjust=adjust||!!this.adjustmentEnabled;
@@ -140,26 +167,41 @@ api=async function(path,data){
  return result;
 };
 const atlasLegend=document.createElement('div');atlasLegend.className='controls';atlasLegend.id='atlasLegend';
-atlasLegend.innerHTML=(config.mode==='acquisition'?'<span><span style="color:#248f84">●</span> Data previews indexed</span><span><span style="color:#d8a731">●</span> No Data previews indexed</span>':'<span><span style="color:#248f84">●</span> Mapped GridSquare · Data ignored</span>')+'<span><span style="color:#36c792">◯</span> Suitable</span><span><span style="color:#ef5963">◯</span> Unsuitable</span><span>Thick outline = selected</span>';
+atlasLegend.innerHTML=(config.mode==='acquisition'?'<span><span style="color:#248f84">●</span> Data previews indexed</span><span><span style="color:#d8a731">●</span> No Data previews indexed</span>':'<span><span style="color:#248f84">●</span> Mapped GridSquare · Data ignored</span>')+'<span><span style="color:#36c792">◯</span> Suitable</span><span><span style="color:#ef5963">◯</span> Unsuitable</span><span>White outer ring = displayed GridSquare</span>';
 atlasLegend.title='Atlas fill describes indexed preview availability, not particle density or ice quality. Orange may mean missing previews, incomplete copying, or an index that needs Refresh.';
 views.atlas.card.append(atlasLegend);
+const atlasFrameNotice=document.createElement('small');atlasFrameNotice.className='controls';atlasFrameNotice.setAttribute('role','status');views.atlas.card.append(atlasFrameNotice);
+const atlasOverlayControl=document.createElement('label');atlasOverlayControl.className='controls';
+atlasOverlayControl.innerHTML='Overlay opacity <input type="range" aria-label="Atlas overlay opacity" min="0" max="100" step="1" value="100" style="width:110px"><output>100%</output>';
+views.atlas.card.append(atlasOverlayControl);
+function setAtlasOverlayOpacity(value){
+ const parsed=Number(value),opacity=Number.isFinite(parsed)?Math.max(0,Math.min(100,parsed)):100;
+ views.atlas.svg.style.opacity=String(opacity/100);
+ views.atlas.svg.style.pointerEvents=opacity===0?'none':'';
+ atlasOverlayControl.querySelector('input').value=opacity;
+ atlasOverlayControl.querySelector('output').textContent=opacity+'%';
+ try{localStorage.setItem('epu-atlas-overlay-opacity',String(opacity))}catch{}
+}
+try{setAtlasOverlayOpacity(localStorage.getItem('epu-atlas-overlay-opacity')??100)}catch{setAtlasOverlayOpacity(100)}
+atlasOverlayControl.querySelector('input').oninput=e=>setAtlasOverlayOpacity(e.target.value);
 const overlayMenu=document.createElement('details');
 overlayMenu.className='contrast foil-overlay';
 overlayMenu.innerHTML='<summary>FoilHole overlay</summary><label>Circle style <select id="foilStyle"><option value="outline">Outline only</option><option value="filled">Filled</option></select></label><label>Radius <input id="foilRadiusSlider" aria-label="Circle radius slider" type="range" min="0.2" max="4" step="0.1" style="width:110px"><input id="foilRadius" aria-label="Circle radius (% of image width)" type="number" min="0.2" max="4" step="0.1"> % of image width</label>';
-views.grid.card.append(overlayMenu);
+views.grid.card.querySelector('.viewer-options').append(overlayMenu);
 const groupLegend=document.createElement('div');groupLegend.className='controls';
 groupLegend.textContent='Solid = centering hole · dashed = beam-shifted hole · same color = same centering group · white outer ring = displayed hole';
-views.grid.card.append(groupLegend);
+overlayMenu.append(groupLegend);
 const areaControl=document.createElement('label');areaControl.className='controls';
 areaControl.innerHTML='<input type="checkbox" id="showAreas"> Show planned Data acquisition areas';
-areaControl.hidden=config.mode==='foilhole';views.grid.card.append(areaControl);
+overlayMenu.append(areaControl);
 const focusHole=button('Zoom to selected hole',()=>{
- const m=grid?.markers?.find(m=>m.hole===hole),v=views.grid;
+ const m=grid?.markers?.find(m=>String(m.hole)===String(hole)),v=views.grid;
  if(!m||!v.img.naturalWidth)return;
  const r=v.viewport.getBoundingClientRect(),s=Math.min(r.width/v.img.naturalWidth,r.height/v.img.naturalHeight);
  v.zoom=6;v.x=(.5-m.x)*v.img.naturalWidth*s*v.zoom;v.y=(.5-m.y)*v.img.naturalHeight*s*v.zoom;v.fit();
 });
-focusHole.hidden=config.mode==='foilhole';views.grid.card.querySelector('.controls').append(focusHole);
+focusHole.title='Center and magnify the selected hole on the GridSquare. Reset restores the full square.';
+views.grid.card.querySelector('.controls').append(focusHole);
 const areaNote=document.createElement('small');areaNote.id='areaNote';areaNote.className='controls';areaNote.hidden=true;views.grid.card.append(areaNote);
 let areaToken=0;
 async function loadAreas(){
@@ -205,8 +247,27 @@ $('foilRadiusSlider').oninput=()=>changeOverlay($('foilRadiusSlider').value);
 $('foilRadius').oninput=()=>{const r=Number($('foilRadius').value);if(r>=.2&&r<=4)changeOverlay(r,false)};
 $('foilRadius').onchange=()=>changeOverlay($('foilRadius').value);
 function nav(view,prev,next,label){const n=document.createElement('div');n.className='nav';const l=document.createElement('small');l.id=label;const subject=label==='gridNav'?'square':label==='holeNav'?'hole':'exposure';n.append(button('← Previous '+subject,prev),l,button('Next '+subject+' →',next));view.card.append(n)}
-nav(views.grid,()=>stepGrid(-1),()=>stepGrid(1),'gridNav');nav(config.mode==='foilhole'?views.foil:views.data,()=>stepHole(-1),()=>stepHole(1),'holeNav');if(config.mode!=='foilhole'){nav(views.data,()=>stepShot(-1),()=>stepShot(1),'shotNav');const strip=document.createElement('div');strip.id='strips';views.data.card.append(strip)}
-function renderAtlas(){if(!atlas)return;const markers=[];for(const g of grids){const p=atlas.nodes[g.name.replace('GridSquare_','')]?.center;if(!p||!atlas.width||!atlas.height)continue;markers.push({x:p[0]/atlas.width,y:p[1]/atlas.height,id:g.id,label:g.name,selected:grid?.id===g.id,color:config.mode!=='foilhole'&&!g.exposures?'#d8a731':'#248f84',stroke:g.annotation.status==='suitable'?'#36c792':g.annotation.status==='unsuitable'?'#ef5963':null})}views.atlas.mark(markers,m=>selectGrid(m.id))}
+nav(views.grid,()=>stepGrid(-1),()=>stepGrid(1),'gridNav');nav(views.data,()=>stepHole(-1),()=>stepHole(1),'holeNav');nav(views.data,()=>stepShot(-1),()=>stepShot(1),'shotNav');const strip=document.createElement('div');strip.id='strips';views.data.card.append(strip);
+if(config.mode==='foilhole'){
+ views.data.card.querySelectorAll('.viewer-tools button').forEach(b=>b.disabled=true);
+ $('shotNav').parentElement.querySelectorAll('button').forEach(b=>b.disabled=true);
+ views.data.clear();
+}
+function drawActiveGridOutline(){
+ const m=views.atlas.markers.find(m=>m.selected);
+ if(!m)return;
+ // Two non-scaling strokes keep the active square visible on bright/dark ice.
+ // Leave availability and suitability colors intact, and never obscure the interior.
+ for(const [color,width] of [['#101824','5px'],['#ffffff','2.5px']]){
+  const ring=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  ring.setAttribute('cx',m.x);ring.setAttribute('cy',m.y);ring.setAttribute('r',.022);
+  ring.setAttribute('vector-effect','non-scaling-stroke');ring.setAttribute('aria-hidden','true');
+  ring.setAttribute('class','active-grid-outline');
+  ring.style.fill='none';ring.style.stroke=color;ring.style.strokeWidth=width;ring.style.pointerEvents='none';
+  views.atlas.svg.append(ring);
+ }
+}
+function renderAtlas(){if(!atlas)return;atlasFrameNotice.textContent=atlas.note||'';const markers=[];for(const g of grids){const p=atlas.nodes[g.name.replace('GridSquare_','')]?.center;if(!p||!atlas.width||!atlas.height)continue;markers.push({x:p[0]/atlas.width,y:p[1]/atlas.height,id:g.id,label:g.name,selected:grid?.id===g.id,color:config.mode!=='foilhole'&&!g.exposures?'#d8a731':'#248f84',stroke:g.annotation.status==='suitable'?'#36c792':g.annotation.status==='unsuitable'?'#ef5963':null})}views.atlas.mark(markers,m=>selectGrid(m.id));drawActiveGridOutline()}
 function renderGrids(){const q=$('search').value.toLowerCase();$('grids').replaceChildren();for(const g of grids.filter(g=>g.name.toLowerCase().includes(q))){const b=button(g.name,()=>selectGrid(g.id));b.classList.toggle('active',grid?.id===g.id);const s=document.createElement('small');s.textContent=g.holes+' holes'+(g.exposures===null?' · Data ignored':' · '+g.exposures+' previews')+(g.missing?' · '+g.missing+' missing':'');b.append(s);$('grids').append(b)}}
 async function loadHoles(){const id=grid.id;const r=await api('/api/holes/'+id+'?offset='+holeOffset);if(grid?.id!==id)return;holeRows=r.rows;holeTotal=r.total;$('holes').replaceChildren();for(const h of holeRows){const b=button(h.hole+(config.mode==='foilhole'?'':' · '+h.exposures+' exposures'),()=>selectHole(h.hole));b.dataset.hole=h.hole;$('holes').append(b)}$('page').textContent=holeTotal?(holeOffset+1)+'–'+Math.min(holeOffset+100,holeTotal)+' of '+holeTotal:'No FoilHole previews found';$('pagePrev').disabled=!holeOffset;$('pageNext').disabled=holeOffset+100>=holeTotal}
 async function selectGrid(id){const intent=++navigationIntent;if(!await saveIfDirty()||intent!==navigationIntent)return;const g=grids.find(g=>g.id===id);if(!g)return;$('error').style.display='none';areaToken++;grid=g;hole='';pairs=[];areaNote.hidden=true;invalidateAnnotation();const seq=++selection;holeOffset=0;views.grid.mark([],()=>{});views.foil.clear('Select a FoilHole');views.data.clear('Select a FoilHole');views.grid.load(g.image,g.name,g.mrc);renderGrids();renderAtlas();$('gridNav').textContent=(grids.indexOf(g)+1)+' / '+grids.length;$('holeNav').textContent='Loading holes…';if($('shotNav'))$('shotNav').textContent='';if($('strips'))$('strips').replaceChildren();await loadHoles();if(seq!==selection)return;if(holeRows.length)await selectHole(holeRows[0].hole);else{$('holeNav').textContent='No holes available';await loadAnnotation()}const j=await api('/api/geometry/'+id,{});const result=await waitJob(j.job,()=>grid?.id===id);if(grid?.id!==id||!result)return;g.markers=result.markers;drawHoles();if(pairs[shot]&&!pairs[shot].foil)showFoilForExposure(pairs[shot]);if($('showAreas').checked)loadAreas();if(result.note){views.grid.message.textContent=result.note;views.grid.message.hidden=false}}
@@ -251,4 +312,4 @@ $('search').oninput=renderGrids;$('pagePrev').onclick=()=>{holeOffset=Math.max(0
 $('cache').onclick=async()=>{if(!confirm('Copy all indexed JPEG/PNG previews into the local cache? MRCs are excluded. This may take time and disk space; repeating resumes cached files.'))return;$('cache').disabled=true;try{const j=await api('/api/cache-previews',{});$('cacheStatus').textContent='Preparing previews in background…';const r=await waitJob(j.job);$('cacheStatus').textContent=r.missing.length?'Finished with '+r.missing.length+' missing files. Reconnect and retry.':'All '+r.total+' previews cached locally.'}catch(e){fail(e)}finally{$('cache').disabled=false}};
 async function poll(){try{const s=await api('/api/status');grids=s.grids;const total=grids.reduce((n,g)=>n+(g.exposures||0),0);$('status').textContent=s.index.message+' · '+grids.length+' squares · '+(config.mode==='foilhole'?'Data ignored':total.toLocaleString()+' Data previews')+' · '+s.cache.files+' cached files';if(s.index.status==='error')$('status').style.color='#a5223b';else $('status').style.color='';renderGrids();if(s.atlas&&(!atlas||atlas.id!==s.atlas.id)){atlas=s.atlas;views.atlas.load(atlas.id,atlas.name,atlas.mrc)}renderAtlas();if(pendingRefresh&&s.index.status==='ready'){pendingRefresh=false;atlas=s.atlas;if(atlas)views.atlas.load(atlas.id,atlas.name,atlas.mrc);if(grid)await selectGrid(grid.id)}if(s.index.status==='error')pendingRefresh=false;if(!grid&&grids.length&&s.index.status!=='indexing')await selectGrid(grids[0].id)}catch(e){fail(e)}setTimeout(poll,2000)}poll();
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){document.querySelectorAll('.enlarged').forEach(c=>{c.classList.remove('enlarged');c.querySelector('.heading button').textContent='Enlarge'});Object.values(views).forEach(v=>v.fit())}});
-</script><script src="/position_corrections.js"></script></html>'''
+</script><script src="/position_corrections.js"></script><script src="/review-tools.js"></script></html>'''

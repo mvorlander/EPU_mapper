@@ -8,7 +8,7 @@ positionTools.innerHTML=`<summary>Observed targeting shifts</summary>
 <input id="positionNote" style="width:100%;max-width:400px" placeholder="Optional note for this observation" aria-label="Targeting shift note">
 <p id="positionStatus" role="status">Select a hole with its own FoilHole preview, then mark its observed position on the GridSquare.</p>
 <p id="positionStats"></p><a href="/api/position-corrections.json" download>Export observed shifts (JSON)</a>`;
-views.grid.card.append(positionTools);
+(views.grid.card.querySelector('.viewer-options')||views.grid.card).append(positionTools);
 let positionRows=[],positionGrid='',positionToken=0,positionArmed=null,positionSaving=false,positionSuppressClick=false;
 function selectedPosition(){return positionRows.find(r=>r.hole===String(hole)&&r.foil===views.foil.key)}
 function cancelPosition(){positionArmed=null;$('positionCancel').hidden=true;views.grid.viewport.style.cursor='';}

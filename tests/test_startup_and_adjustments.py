@@ -171,7 +171,7 @@ class AdjustmentTests(unittest.TestCase):
             before = [path.read_bytes() for path in (png, mrc)]
             for path in (png, mrc):
                 self.assertEqual(adjusted_preview(path, sigma=1).size, (30, 20))
-            with TestClient(review_app.create_app(root, None, None, False, None, "test", False, False)) as client:
+            with TestClient(review_app.create_app(root, None, None, False, None, "test", False, False, review_mode='legacy-screening')) as client:
                 for mrc_mode in (False, True):
                     response = client.get('/adjusted_preview', params=dict(idx=0, kind='grid', mrc=mrc_mode, sigma=1, gamma=1.5))
                     self.assertEqual(response.status_code, 200, response.text if response.status_code != 200 else '')

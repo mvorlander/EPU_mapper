@@ -16,12 +16,14 @@ def install_density(app, source, label=None, transform='identity'):
 
     @app.get('/',response_class=HTMLResponse)
     def home():
-        config=json.dumps(dict(mode='acquisition',label=label or Path(source).name,transform=transform or 'identity')).replace('<','\\u003c')
+        config=json.dumps(dict(mode=store.mode,label=label or Path(source).name,transform=transform or 'identity')).replace('<','\\u003c')
         script=Path(__file__).with_name('cryosparc_density.js').read_text(encoding='utf-8')
         return PAGE.replace('__CONFIG__',config).replace('</html>','<script>'+script+'</script></html>')
 
     @app.post('/api/density/import')
     async def import_density(particles: UploadFile=File(...), passthrough: UploadFile|None=File(None)):
+        if store.ignore_data:
+            raise HTTPException(409,'Enable Data loading in the launcher to match particle exposures. Data MRCs are not needed.')
         if store.scan_state['status'] in ('new','indexing'):
             raise HTTPException(409,'Wait for the EPU index to finish before importing particles.')
         folder=Path(tempfile.mkdtemp(prefix='particle-import-',dir=store.root))

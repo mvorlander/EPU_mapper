@@ -50,7 +50,7 @@ class CollectionPlanTests(unittest.TestCase):
         Image.new("RGB", (120, 80), "#658ca8").save(path)
 
     def client(self):
-        return TestClient(review_app.create_app(self.base, None, None, False, None, "test", False, False))
+        return TestClient(review_app.create_app(self.base, None, None, False, None, "test", False, False, review_mode='legacy-screening'))
 
     def test_mrc_never_substitutes_different_acquisition(self):
         grid = self.grids[0]

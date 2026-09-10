@@ -114,6 +114,7 @@ $pyiArgs = @(
     "--hidden-import", "image_adjustments",
     "--hidden-import", "acquisition_store",
     "--hidden-import", "acquisition_app",
+    "--hidden-import", "unified_review",
     "--hidden-import", "acquisition_ui",
     "--hidden-import", "cryosparc_density",
     "--hidden-import", "cryosparc_density_app",

@@ -811,12 +811,13 @@ def create_app(
     session_label: str | None = None,
     atlas_overlay: bool = True,
     skip_foil_processing: bool = False,
-    review_mode: str = 'screening',
+    review_mode: str = 'unified',
+    ignore_data: bool = False,
 ) -> FastAPI:
-    if review_mode in ('acquisition','foilhole'):
+    if review_mode in ('unified','screening','acquisition','foilhole'):
         from acquisition_app import create_acquisition_app
-        return create_acquisition_app(base_dir,atlas_name,review_mode,overlay_transform,session_label)
-    if review_mode != 'screening':
+        return create_acquisition_app(base_dir,atlas_name,'foilhole' if ignore_data or review_mode=='foilhole' else 'acquisition',overlay_transform,session_label)
+    if review_mode != 'legacy-screening':
         raise ValueError('Unknown review mode')
     _OVERLAY_EVENTS.clear()
     _configure_overlay_transform(overlay_transform)
@@ -2431,7 +2432,7 @@ function setAtlasScale(value,clientX=null,clientY=null){const next=Math.max(1,Ma
 function resetAtlas(){atlasScale=1;atlasX=0;atlasY=0;applyAtlas()}
 function loadAtlasMrc(){const img=document.getElementById('atlas-image');if(!img||atlasMode!=='mrc')return;if(img._applyAdjustments?.())return;img.src='/atlas_overview_mrc?low='+encodeURIComponent(atlasLow)+'&high='+encodeURIComponent(atlasHigh)+'&session='+encodeURIComponent(CACHE_KEY)+'&t='+Date.now()}
 function installAtlasMrcControls(){if(!atlasViewport)return;const panel=document.createElement('div');panel.className='atlas-mrc-contrast';panel.innerHTML='<label>Low <span class="atlas-low-value">1</span>% <input class="atlas-low" type="range" min="0" max="99" value="1"></label><label>High <span class="atlas-high-value">99</span>% <input class="atlas-high" type="range" min="1" max="100" value="99"></label>';atlasViewport.appendChild(panel);const low=panel.querySelector('.atlas-low'),high=panel.querySelector('.atlas-high'),lowValue=panel.querySelector('.atlas-low-value'),highValue=panel.querySelector('.atlas-high-value');function queue(changed){if(Number(low.value)>=Number(high.value)){if(changed===low)high.value=Math.min(100,Number(low.value)+1);else low.value=Math.max(0,Number(high.value)-1)}atlasLow=Number(low.value);atlasHigh=Number(high.value);lowValue.textContent=low.value;highValue.textContent=high.value;if(atlasMrcTimer)clearTimeout(atlasMrcTimer);atlasMrcTimer=setTimeout(loadAtlasMrc,300)}low.oninput=()=>queue(low);high.oninput=()=>queue(high);return panel}
-if(HAS_ATLAS){const atlasContrast=installAtlasMrcControls();renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.manual-target-marker,.atlas-tools,.atlas-mrc-contrast,.viewer-shrink'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker,.manual-target-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;atlasMode=b.dataset.mode;atlasContrast.classList.toggle('visible',atlasMode==='mrc');if(atlasMode==='mrc')loadAtlasMrc();else img.src=(atlasMode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=atlasMode==='screened'?'block':'none';resetAtlas()})}
+if(HAS_ATLAS){const atlasContrast=installAtlasMrcControls();renderMarkers();atlasViewport.addEventListener('wheel',e=>{e.preventDefault();setAtlasScale(atlasScale*Math.exp(-e.deltaY*.0015),e.clientX,e.clientY)},{passive:false});atlasViewport.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.grid-marker,.manual-target-marker,.atlas-tools,.atlas-mrc-contrast,.viewer-shrink'))return;atlasDragging=true;atlasStartX=e.clientX-atlasX;atlasStartY=e.clientY-atlasY;atlasViewport.classList.add('dragging');atlasViewport.setPointerCapture(e.pointerId)});atlasViewport.addEventListener('pointermove',e=>{if(!atlasDragging)return;atlasX=e.clientX-atlasStartX;atlasY=e.clientY-atlasStartY;applyAtlas()});atlasViewport.addEventListener('pointerup',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('pointercancel',()=>{atlasDragging=false;atlasViewport.classList.remove('dragging')});atlasViewport.addEventListener('dblclick',e=>{if(!e.target.closest('.grid-marker,.manual-target-marker'))resetAtlas()});document.getElementById('atlas-plus').onclick=()=>setAtlasScale(atlasScale*1.3);document.getElementById('atlas-minus').onclick=()=>setAtlasScale(atlasScale/1.3);document.getElementById('atlas-reset').onclick=resetAtlas;document.querySelectorAll('.atlas-mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.atlas-mode').forEach(x=>x.classList.toggle('active',x===b));const img=document.getElementById('atlas-image');if(!img)return;atlasMode=b.dataset.mode;atlasContrast.classList.toggle('visible',atlasMode==='mrc');if(atlasMode==='mrc')loadAtlasMrc();else img.src=(atlasMode==='categories'?'/atlas_overview_categories':'/atlas_overview_raw')+'?session='+encodeURIComponent(CACHE_KEY);if(markerLayer)markerLayer.style.display=(atlasMode==='screened'||atlasMode==='mrc')?'block':'none';resetAtlas()})}
 const manualTargetToggle=document.getElementById('manual-target-toggle');if(manualTargetToggle)manualTargetToggle.onclick=()=>{targetMode=!targetMode;if(targetMode&&atlasMode!=='screened')document.querySelector('.atlas-mode[data-mode="screened"]').click();renderMarkers()};
 arrangeSelectedWorkspace();
 renderGridList();
@@ -3573,7 +3574,8 @@ def generate_details_report(
 
 def main():
     parser = argparse.ArgumentParser(description="Web review app for GridSquare folders")
-    parser.add_argument('--mode',choices=('screening','acquisition','foilhole'),default='screening',help='Acquisition indexes multiple JPEG/PNG exposures per hole; foilhole skips Data directories entirely')
+    parser.add_argument('--mode',choices=('unified','screening','acquisition','foilhole','legacy-screening'),default='unified',help=argparse.SUPPRESS)
+    parser.add_argument('--ignore-data',action='store_true',help='Skip Data directories; keep the same unified dashboard and FoilHole overlays')
     parser.add_argument("grid_dir", type=Path, help="path to a GridSquare directory, Images-Disc*, or session root")
     parser.add_argument(
         "--atlas",
@@ -3647,14 +3649,12 @@ def main():
     args = parser.parse_args()
     preferred_disc = args.images_subdir or os.environ.get("IMAGES_SUBDIR")
     try:
-        grid_root = _resolve_grid_root(args.grid_dir, preferred_disc) if args.mode=='screening' else args.grid_dir.expanduser().absolute()
+        grid_root = _resolve_grid_root(args.grid_dir, preferred_disc) if args.mode=='legacy-screening' or args.details_only else args.grid_dir.expanduser().absolute()
     except RuntimeError as exc:
         print(f"[review_app] {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     overlay_transform = args.overlay_transform if args.overlay else None
     if args.details_only:
-        if args.mode != 'screening':
-            parser.error('Detailed PDF export is available in Screening mode; it is not run automatically on acquisition collections')
         try:
             details_path = generate_details_report(
                 grid_root,
@@ -3688,6 +3688,7 @@ def main():
             session_label=args.session_label, atlas_overlay=args.atlas_overlay,
             skip_foil_processing=args.skip_foil_processing,
             review_mode=args.mode,
+            ignore_data=args.ignore_data,
         )
         run_reserved_server(app, listener, address, open_browser=args.open)
 

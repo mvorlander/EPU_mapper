@@ -40,7 +40,9 @@ from server_startup import ADDRESS_PREFIX, READY_PREFIX, browser_url
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8000"
-REVIEW_MODES = {'Screening': 'screening', 'Acquisition (multiple exposures per hole)': 'acquisition', 'FoilHole only (ignore Data)': 'foilhole', 'Atlas / GridSquare only': 'gridsquare'}
+def _ignore_data_setting(options):
+    """Migrate old mode preferences into the unified dashboard's loading scope."""
+    return bool(options.get('ignore_data', options.get('review_mode') in ('foilhole','gridsquare') or options.get('skip_foil_processing',False)))
 DEFAULT_LABEL = os.environ.get("SESSION_LABEL") or os.environ.get("GRID_LABEL") or os.environ.get("REPORT_PREFIX") or ""
 ATLAS_MODE_EPU = "epu"
 ATLAS_MODE_STATIC = "static"
@@ -255,9 +257,10 @@ def _review_command(
     details_output: str | None = None,
     open_browser: bool = True,
     auto_port: bool = False,
-    review_mode: str = 'screening',
+    review_mode: str = 'unified',
+    ignore_data: bool = False,
 ) -> list[str]:
-    if review_mode not in ('screening','acquisition','foilhole'):
+    if review_mode not in ('unified','screening','acquisition','foilhole','legacy-screening'):
         raise ValueError('Unknown review mode')
     if _is_frozen():
         cmd = [sys.executable, "--run-review", session_path]
@@ -265,6 +268,8 @@ def _review_command(
         cmd = [_default_python(), str(SCRIPT_PATH), "--run-review", session_path]
     cmd.extend(["--host", host, "--port", port, "--overlay-transform", transform])
     cmd.extend(['--mode',review_mode])
+    if ignore_data:
+        cmd.append('--ignore-data')
     if auto_port and not details_only:
         cmd.append("--auto-port")
     if atlas_path:
@@ -462,12 +467,9 @@ class ReviewLauncher:
         self.skip_foil_processing_var = tk.BooleanVar(value=self.preferences.get("skip_foil_processing", False))
         mode_row = ttk.Frame(frm)
         mode_row.grid(row=11,column=0,columnspan=2,sticky='we',pady=(8,0))
-        ttk.Label(mode_row,text='Review mode:').pack(side='left',padx=(0,8))
-        saved_mode = self.preferences.get('review_mode','gridsquare' if self.skip_foil_processing_var.get() else 'screening')
-        self.review_mode_var = tk.StringVar(value=next((label for label,value in REVIEW_MODES.items() if value==saved_mode),'Screening'))
-        mode_box = ttk.Combobox(mode_row,textvariable=self.review_mode_var,values=list(REVIEW_MODES),state='readonly',width=40)
-        mode_box.pack(side='left',fill='x',expand=True)
-        mode_box.bind('<<ComboboxSelected>>',lambda event:self._sync_foil_controls())
+        ttk.Label(mode_row,text='Unified review').pack(side='left',padx=(0,8))
+        self.ignore_data_var = tk.BooleanVar(value=_ignore_data_setting(self.preferences))
+        ttk.Checkbutton(mode_row,text='Ignore Data images (faster on network drives)',variable=self.ignore_data_var,command=self._sync_foil_controls).pack(side='left',fill='x',expand=True)
         self.mode_hint = ttk.Label(mode_row,text='',wraplength=380)
         self.mode_hint.pack(side='bottom',anchor='w')
 
@@ -577,8 +579,7 @@ class ReviewLauncher:
         options = loaded.get("options", {})
         self.overlay_var.set(bool(options.get("overlay", True)))
         self.skip_foil_processing_var.set(bool(options.get("skip_foil_processing", False)))
-        saved_mode=options.get('review_mode','gridsquare' if self.skip_foil_processing_var.get() else 'screening')
-        self.review_mode_var.set(next((label for label,value in REVIEW_MODES.items() if value==saved_mode),'Screening'))
+        self.ignore_data_var.set(_ignore_data_setting(options))
         self.transform_var.set(self._transform_label(str(options.get("transform", "identity"))))
         self._sync_foil_controls()
         self.last_portable_manifest = str(Path(path).resolve())
@@ -634,7 +635,8 @@ class ReviewLauncher:
         ):
             return
         options = {
-            'review_mode': REVIEW_MODES.get(self.review_mode_var.get(),'screening'),
+            'review_mode': 'unified',
+            'ignore_data': bool(self.ignore_data_var.get()),
             "overlay": bool(self.overlay_var.get()),
             "skip_foil_processing": bool(self.skip_foil_processing_var.get()),
             "transform": self._transform_value(self.transform_var.get()),
@@ -745,23 +747,15 @@ class ReviewLauncher:
             self.advanced_frame.grid_remove()
 
     def _sync_foil_controls(self) -> None:
-        mode=REVIEW_MODES.get(self.review_mode_var.get(),'screening')
-        self.mode_hint.configure(text='Optional CryoSPARC .cs density import is available in the dashboard.' if mode=='acquisition' else '')
-        self.skip_foil_processing_var.set(mode=='gridsquare')
-        state = "normal" if mode=='screening' else "disabled"
-        self.overlay_check.configure(state=state)
-        if mode in ('acquisition','foilhole'):
-            self.overlay_check.grid_remove()
-            self.overlay_auto_label.grid(row=0,column=4)
-        else:
-            self.overlay_auto_label.grid_remove()
-            self.overlay_check.grid()
+        self.mode_hint.configure(text='Same dashboard for screening and collection. Data MRCs are never scanned; Atlas/GridSquare MRCs load on request.')
+        self.skip_foil_processing_var.set(False)
+        self.overlay_check.grid_remove()
+        self.overlay_auto_label.grid(row=0,column=4)
         if hasattr(self,'details_btn'):
-            self.details_btn.configure(state='disabled' if mode in ('acquisition','foilhole') else 'normal')
+            self.details_btn.configure(state='normal')
 
     def _review_mode(self):
-        mode=REVIEW_MODES.get(self.review_mode_var.get(),'screening')
-        return 'screening' if mode=='gridsquare' else mode
+        return 'unified'
 
     def browse_atlas(self) -> None:
         current = self.atlas_var.get().strip()
@@ -833,6 +827,7 @@ class ReviewLauncher:
             open_browser=False,
             auto_port=True,
             review_mode=self._review_mode(),
+            ignore_data=bool(self.ignore_data_var.get()),
         )
 
         env = self._build_env()
@@ -872,9 +867,6 @@ class ReviewLauncher:
             self._log(f"Could not open the browser waiting page: {exc}\n")
 
     def export_details(self) -> None:
-        if self._review_mode() != 'screening':
-            messagebox.showinfo('Screening export','Detailed PDF export is available in Screening mode. Acquisition annotations can be exported from its dashboard.')
-            return
         if self._details_running:
             messagebox.showinfo("Please wait", "Detailed export already in progress.")
             return
@@ -917,6 +909,7 @@ class ReviewLauncher:
             transform,
             session_label=label or None,
             details_only=True,
+            review_mode='legacy-screening',
             open_browser=False,
         )
         self._set_details_running(True)
@@ -1020,7 +1013,8 @@ class ReviewLauncher:
     def _persist_preferences(self, transform: str) -> None:
         self._store_atlas_input()
         prefs = {
-            'review_mode': REVIEW_MODES.get(self.review_mode_var.get(),'screening'),
+            'review_mode': 'unified',
+            'ignore_data': bool(self.ignore_data_var.get()),
             "sessions": self.session_history,
             "host": self.host_var.get().strip() or DEFAULT_HOST,
             "port": self.port_var.get().strip() or DEFAULT_PORT,
@@ -1149,7 +1143,7 @@ class ReviewLauncher:
     def _set_details_running(self, running: bool) -> None:
         self._details_running = running
         def toggle() -> None:
-            state = "disabled" if running or self._review_mode()!='screening' else "normal"
+            state = "disabled" if running else "normal"
             self.details_btn.configure(state=state)
         self.root.after(0, toggle)
 

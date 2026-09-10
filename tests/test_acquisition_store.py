@@ -85,6 +85,38 @@ class AcquisitionStoreTests(unittest.TestCase):
         self.assertEqual((atlas['width'], atlas['height']), (1024, 1024))
         self.assertIn('900000', atlas['nodes'])
 
+    def test_stitched_atlas_uses_mrc_header_without_reading_image_data(self):
+        import mrcfile
+        for extension in ('.mrc','.mrcs'):
+            with self.subTest(extension=extension):
+                path=self.atlas/('Atlas_SIMULATED'+extension)
+                with mrcfile.new(path) as m:
+                    m.header.nx=4005;m.header.ny=4005;m.header.nz=1
+                # Deliberately header-only: reading the pixel payload would fail.
+                self.assertEqual(path.stat().st_size,1024)
+                store=self.store()
+                with patch('mrcfile.open',wraps=mrcfile.open) as opened:
+                    store._index_atlas()
+                self.assertTrue(opened.call_args.kwargs['header_only'])
+                atlas=store.meta('atlas')
+                self.assertEqual((atlas['width'],atlas['height']),(4005,4005))
+                self.assertEqual(atlas['frame_source'],'mrc-header')
+                self.assertIn('900000',atlas['nodes'])
+                self.assertFalse(store.local_file(atlas['mrc']))
+                path.unlink()
+
+    def test_stitched_atlas_without_mrc_does_not_use_camera_tile(self):
+        path=self.atlas/'Atlas_SIMULATED.xml'
+        xml=path.read_text()
+        xml=xml.replace('</MicroscopeImage>','<CustomData><Entry><Key>NumberOfTilesAcquired</Key><Value>16</Value></Entry></CustomData></MicroscopeImage>')
+        self.assertIn('NumberOfTilesAcquired',xml)
+        path.write_text(xml)
+        store=self.store();store._index_atlas()
+        atlas=store.meta('atlas')
+        self.assertEqual(atlas['nodes'],{})
+        self.assertIsNone(atlas['width'])
+        self.assertIn('assembled image dimensions',atlas['note'])
+
     def test_xml_overlays_without_metadata_or_data_reads(self):
         (self.session/'Metadata').rename(self.session/'Metadata-not-copied')
         store=self.store('foilhole')

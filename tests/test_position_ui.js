@@ -2,6 +2,7 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 class Element{
  constructor(){this.style={};this.children=[];this.checked=true;this.hidden=false;this.value='';this.handlers={}}
  append(c){this.children.push(c)}
+ querySelector(){return null}
  setAttribute(k,v){this[k]=v}
  addEventListener(k,v){this.handlers[k]=v}
  remove(){svg.children=svg.children.filter(x=>x!==this)}

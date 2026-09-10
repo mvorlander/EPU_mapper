@@ -15,7 +15,7 @@ class Element{
 const svg=new Element(),card=new Element();
 const elements=Object.fromEntries(['densityClear','grids','search','densityPalette','densityVisible','densityMode','densityOpacity','densityLegend','densityStatus','densityImport','densityMain','densityPass','foilStyle'].map(id=>[id,new Element()]));
 elements.densityPalette.value='viridis';elements.densityMode.value='holes';elements.densityOpacity.value='65';
-const context=vm.createContext({console,document:{
+const context=vm.createContext({console,config:{mode:'acquisition'},document:{
  createElement:()=>new Element(),createElementNS:()=>new Element(),
  querySelector:q=>q==='#densityLayer'?svg.children.find(c=>c.id==='densityLayer'):new Element()
 },$:id=>elements[id],views:{grid:{svg,card}},foilOverlay:{radius:1.2,style:'filled'},
