@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "Deprecated: VBC container deployment is no longer maintained. Use the local installation instructions in README.md." >&2
+
 # Builds the Docker image for the review app, copies it to the Plaschka cluster,
 # converts it into an Apptainer .sif, and refreshes the wrapper script.
 # Customize the variables below (or export environment overrides before invoking)

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "Deprecated: the VBC container wrapper is no longer maintained. Use the local launcher or src/review_app.py; see README.md." >&2
+
 APPTAINER_IMAGE=${APPTAINER_IMAGE:-/resources/cryo-em/epu_mapper_review.sif}
 DEFAULT_HOST=${HOST_OVERRIDE:-127.0.0.1}
 DEFAULT_PORT=${PORT_OVERRIDE:-8000}

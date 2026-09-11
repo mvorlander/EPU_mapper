@@ -1,4 +1,13 @@
-# EPU Mapper Container Tooling
+# Deprecated: VBC container tooling
+
+The VBC Docker/Apptainer deployment workflow is deprecated and is not maintained
+as a supported installation method. Use the [local installation instructions](../README.md#install)
+for Windows, macOS or Linux instead.
+
+The container assets and scripts are retained for existing installations only.
+The instructions below are archival and may not match the current application.
+
+## Archived deployment notes
 
 This folder contains the Docker assets that are used to produce the
 Apptainer image deployed on the VBC cluster. End users do **not** need to
