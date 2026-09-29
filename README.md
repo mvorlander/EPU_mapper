@@ -24,7 +24,7 @@ The program is free and open source, runs locally, and opens in a web browser.
 EPU Mapper supports both screening and multi-exposure collections. It helps
 document collection decisions.
 
-## Changelog: v0.2.9 → v0.9.0
+## Changelog: v0.2.9 → v0.9.1
 
 This consolidated summary covers the major changes since v0.2.9.
 

@@ -45,9 +45,9 @@ grid={id:'unmapped'};renderAtlas();assert.equal(svg.children.length,0);
         self.assertEqual(result.returncode,0,result.stderr)
 
     def test_screening_mrc_keeps_marker_layer(self):
-        source=(ROOT/'src/review_app.py').read_text()
+        source=(ROOT/'src/review_app.py').read_text(encoding='utf-8')
         self.assertIn("markerLayer.style.display=(atlasMode==='screened'||atlasMode==='mrc')?'block':'none'",source)
-        self.assertIn('aria-label="Atlas overlay opacity"',(ROOT/'src/dashboard_features.py').read_text())
+        self.assertIn('aria-label="Atlas overlay opacity"',(ROOT/'src/dashboard_features.py').read_text(encoding='utf-8'))
 
     @unittest.skipUnless(shutil.which('node'),'Node is required')
     def test_opacity_applies_to_overlay_container_not_individual_markers(self):
