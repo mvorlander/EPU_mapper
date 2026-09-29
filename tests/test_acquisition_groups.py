@@ -29,17 +29,24 @@ class AcquisitionGroupTests(unittest.TestCase):
               </TargetAreaTemplate></nested></root>''')
             store=AcquisitionStore(root,cache_root=root/'cache')
             try:
-                row=dict(id='exposure',hole='2',name='FoilHole_2_Data_5_1_20260904_120000.jpg',xml='data.xml')
+                row=dict(id='exposure',hole='2',name='FoilHole_2_Data_5_1_20260904_120000.jpg',xml='data.xml',stamp='20260904120000')
+                foil=dict(id='foil',hole='2',name='FoilHole_2_20260904_115900.jpg',xml='foil.xml',stamp='20260904115900')
                 def cached(path):
                     self.assertFalse(str(path).endswith('.mrc'))
                     return session if Path(path).name=='EpuSession.dm' else path
                 def info(path):
-                    return dict(readout_width=100 if path=='grid.xml' else 4,readout_height=100 if path=='grid.xml' else 4,ref_matrix=(1,0,0,1))
-                with patch.object(store,'geometry',return_value={'markers':[dict(hole='2',anchor='1',x=.5,y=.5)]}),patch.object(store,'grid',return_value=dict(path=str(root/'Images-Disc1/GridSquare_1'),image='grid')),patch.object(store,'media',return_value={'xml':'grid.xml'}),patch.object(store,'cache_optional',side_effect=cached),patch.object(store,'execute',return_value=[row]),patch('build_collage.parse_grid_info',side_effect=info):
+                    size=100 if path=='grid.xml' else 40 if path=='foil.xml' else 4
+                    return dict(readout_width=size,readout_height=size,ref_matrix=(1,0,0,1))
+                def rows(sql,args=()):
+                    return [foil] if "kind='foil'" in sql else [row]
+                with patch.object(store,'geometry',return_value={'markers':[dict(hole='2',anchor='1',x=.5,y=.5)]}),patch.object(store,'grid',return_value=dict(path=str(root/'Images-Disc1/GridSquare_1'),image='grid')),patch.object(store,'media',return_value={'xml':'grid.xml'}),patch.object(store,'cache_optional',side_effect=cached),patch.object(store,'execute',side_effect=rows),patch('build_collage.parse_grid_info',side_effect=info):
                     result=store.acquisition_areas('grid')
                     area=result['areas'][0]
                     self.assertEqual((area['hole'],area['anchor'],area['id']),('2','1','exposure'))
+                    self.assertEqual(area['foil'],'foil')
                     for actual,expected in zip(area['points'],[(.54,.56),(.58,.56),(.58,.60),(.54,.60)]):
+                        self.assertAlmostEqual(actual[0],expected[0]);self.assertAlmostEqual(actual[1],expected[1])
+                    for actual,expected in zip(area['foil_points'],[(.6,.65),(.7,.65),(.7,.75),(.6,.75)]):
                         self.assertAlmostEqual(actual[0],expected[0]);self.assertAlmostEqual(actual[1],expected[1])
                 store.ignore_data=True
                 with patch.object(store,'cache_optional',side_effect=AssertionError('No Data reads')):

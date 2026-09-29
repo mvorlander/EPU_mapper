@@ -7,6 +7,7 @@ import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'experiments/cryosparc_density'))
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from cryosparc_density import DensityIndex, exposure_key, load_locations
+from cryosparc_density_app import inspect_cs
 
 
 class DensityTests(unittest.TestCase):
@@ -45,6 +46,15 @@ class DensityTests(unittest.TestCase):
         with self.assertRaises(ValueError):load_locations(main,self.save('pass.cs',self.locations()))
         data=self.locations();data['uid']=[1,1]
         with self.assertRaises(ValueError):load_locations(self.save('dups.cs',data))
+
+    def test_header_inspection_suggests_unique_passthrough(self):
+        main=self.save('particles_selected.cs',np.array([(1,),(2,)],dtype=[('uid','u8')]))
+        passthrough=self.save('J53_passthrough_particles_selected.cs',self.locations())
+        result=inspect_cs(main,True)
+        self.assertTrue(result['needs_passthrough'])
+        self.assertEqual(result['particles'],2)
+        self.assertEqual(result['suggestion'],str(passthrough.resolve()))
+        self.assertIn('location/micrograph_path',inspect_cs(passthrough)['fields'])
 
     def test_identity_invalid_and_ambiguous(self):
         self.assertEqual(exposure_key('J8/'+self.key+'_EER_123_patch.mrc'),self.key)

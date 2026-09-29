@@ -43,6 +43,10 @@ function describeRequest(path,data){
  if(path.startsWith('/api/geometry/'))return ['Mapping FoilHole positions','grid'];
  if(path.startsWith('/api/areas/'))return ['Mapping planned acquisition areas','grid'];
  if(path.startsWith('/api/density/grid/'))return ['Mapping particle density','grid'];
+ if(path==='/api/density/import-path')return ['Starting chunked particle indexing',''];
+ if(path==='/api/hole-selection/histogram')return ['Building intensity histogram','grid'];
+ if(path.startsWith('/api/hole-selection/grid/'))return [data?'Saving FoilHole selection':'Loading EPU hole metadata','grid'];
+ if(path==='/api/hole-selection/export')return ['Starting particle-table export',''];
  if(path.startsWith('/api/holes/'))return ['Loading FoilHole list','grid'];
  if(path.startsWith('/api/exposures/'))return ['Finding matching Data previews','data'];
  if(path==='/api/cache-previews')return ['Preparing local previews',''];
@@ -83,8 +87,8 @@ class Viewer{
  reset(){this.zoom=1;this.x=this.y=0;this.fit()}
  fit(){if(!this.img.naturalWidth)return;const r=this.viewport.getBoundingClientRect(),s=Math.min(r.width/this.img.naturalWidth,r.height/this.img.naturalHeight),w=this.img.naturalWidth*s,h=this.img.naturalHeight*s;Object.assign(this.scene.style,{width:w+'px',height:h+'px',left:(r.width-w)/2+'px',top:(r.height-h)/2+'px',transform:`translate(${this.x}px,${this.y}px) scale(${this.zoom})`})}
  mark(markers,click){this.markers=markers;this.svg.replaceChildren();for(const m of markers){const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',m.x);c.setAttribute('cy',m.y);c.setAttribute('r',this.id==='atlas'?.018:.012);if(m.selected)c.classList.add('selected');if(m.color)c.style.fill=m.color;if(m.stroke)c.style.stroke=m.stroke;if(this.id==='grid')styleFoilCircle(c,m.selected,m);const t=document.createElementNS(c.namespaceURI,'title');t.textContent=m.label||('FoilHole '+m.hole+(m.anchor?' · '+(m.role==='anchor'?'centering hole':'beam-shifted from '+m.anchor):' · centering group unknown'));c.append(t);c.onclick=()=>Promise.resolve(click(m)).catch(fail);this.svg.append(c)}}
- clear(message='No matching image'){if(this.id==='data'&&config.mode==='foilhole')message='Data loading is off. Uncheck Ignore Data images in the launcher to include exposures.';this.token++;this.key='';this.img.hidden=true;this.img.removeAttribute('src');this.svg.replaceChildren();this.message.textContent=message;this.message.hidden=false;this.card.querySelector('.filename').textContent='';this.mrcButton.hidden=true}
- async load(key,name='',mrc='',isMrc=false,adjust=false){if(!key){this.clear('No matching '+this.id+' preview');return}const changed=key!==this.key,token=++this.token;this.key=key;this.name=name;this.mrcKey=mrc;this.isMrc=isMrc;if(isMrc)this.card.querySelector('details').open=true;if(!isMrc){this.previewKey=key;this.previewName=name;}this.img.hidden=true;this.message.hidden=false;this.message.textContent='Loading '+name+'…';this.card.querySelector('.filename').textContent=name;this.mrcButton.hidden=!mrc;try{const prepared=await api('/api/prepare/'+key,{viewer:this.id});if(prepared.job)await waitJob(prepared.job,()=>token===this.token);if(token!==this.token)return;const params=new URLSearchParams({adjust:adjust||isMrc?'true':'false',v:Date.now()});if(adjust){for(const n of ['low','high','gamma','sigma','routine'])params.set(n,this.card.querySelector('.'+n).value)}const image=new Image();image.src='/api/image/'+key+'?'+params;await image.decode();if(token!==this.token)return;this.img.src=image.src;this.img.hidden=false;this.message.hidden=true;if(changed)this.reset();else this.fit()}catch(e){if(token===this.token){this.message.textContent='Unavailable: '+e.message;this.img.hidden=true}}}
+ clear(message='No matching image',expected=false){if(this.id==='data'&&config.mode==='foilhole')message='Data loading is off. Uncheck Ignore Data images in the launcher to include exposures.';this.token++;this.key='';this.img.hidden=true;this.img.removeAttribute('src');this.svg.replaceChildren();this.message.textContent=message;this.message.classList.toggle('expected-empty',expected);this.message.hidden=false;this.card.querySelector('.filename').textContent='';this.mrcButton.hidden=true}
+ async load(key,name='',mrc='',isMrc=false,adjust=false){if(!key){this.clear('No matching '+this.id+' preview');return}const changed=key!==this.key,token=++this.token;this.key=key;this.name=name;this.mrcKey=mrc;this.isMrc=isMrc;if(isMrc)this.card.querySelector('details').open=true;if(!isMrc){this.previewKey=key;this.previewName=name;}this.img.hidden=true;this.message.classList.remove('expected-empty');this.message.hidden=false;this.message.textContent='Loading '+name+'…';this.card.querySelector('.filename').textContent=name;this.mrcButton.hidden=!mrc;try{const prepared=await api('/api/prepare/'+key,{viewer:this.id});if(prepared.job)await waitJob(prepared.job,()=>token===this.token);if(token!==this.token)return;const params=new URLSearchParams({adjust:adjust||isMrc?'true':'false',v:Date.now()});if(adjust){for(const n of ['low','high','gamma','sigma','routine'])params.set(n,this.card.querySelector('.'+n).value)}const image=new Image();image.src='/api/image/'+key+'?'+params;await image.decode();if(token!==this.token)return;this.img.src=image.src;this.img.hidden=false;this.message.hidden=true;if(changed)this.reset();else this.fit()}catch(e){if(token===this.token){this.message.textContent='Unavailable: '+e.message;this.img.hidden=true}}}
 }
 // Keep annotation context above the images, without a competing right sidebar.
 const reviewBar=document.querySelector('aside.review');
@@ -107,6 +111,7 @@ const compactStyle=document.createElement('style');compactStyle.textContent=`
 .images>.card:not(.enlarged)>.viewer-tools{grid-column:2;grid-row:2;display:flex;flex-direction:column;align-items:stretch;justify-content:center;flex-wrap:nowrap;padding:6px;gap:6px;background:#f7f9fc;overflow:auto}
 .viewer-tools button{white-space:normal;line-height:1.25}.heading{height:50px;padding:8px}.heading>div{min-width:0}.heading small{max-width:100%}.heading h2{font-size:12px}.nav{min-height:38px;padding:5px}.controls{padding:6px;min-height:32px}.controls:empty{display:none}
 .viewer-options{display:flex;flex-wrap:wrap;align-items:start;background:#f7f9fc}.viewer-options>details{flex:1;min-width:120px;padding:8px!important;border-top:0;font-size:11px}.viewer-options>details[open]{flex-basis:100%;order:1}.viewer-options .adjustment-badge{display:none}
+.message.expected-empty{top:50%;bottom:auto;left:50%;right:auto;transform:translate(-50%,-50%);width:min(82%,460px);padding:18px 22px;text-align:center;font-size:18px;font-weight:650;line-height:1.35;background:#172235e8;border:1px solid #40516a;color:#f1f5f9}
 @media(min-width:1800px){.layout{grid-template-columns:195px minmax(0,1fr)}.images>.card:not(.enlarged)>.viewport{height:clamp(300px,34vh,560px)}}
 @media(max-width:1150px){.layout{grid-template-columns:145px minmax(0,1fr);padding:0 10px 10px}.review h2{display:none}.images>.card:not(.enlarged){grid-template-columns:minmax(0,1fr)}.images>.card:not(.enlarged)>.viewport{grid-column:1;grid-row:2}.images>.card:not(.enlarged)>.viewer-tools{grid-column:1;grid-row:3;flex-direction:row;flex-wrap:wrap;justify-content:flex-start;overflow:visible}.heading button{font-size:11px;padding:5px}.review #target{max-width:160px}}
 @media(max-width:800px){.layout{display:grid;grid-template-columns:120px minmax(0,1fr)}.images{grid-template-columns:1fr 1fr}.layout>aside:not(.review){position:static}.review-field{min-width:80px}.heading{height:58px}}
@@ -192,7 +197,7 @@ const groupLegend=document.createElement('div');groupLegend.className='controls'
 groupLegend.textContent='Solid = centering hole · dashed = beam-shifted hole · same color = same centering group · white outer ring = displayed hole';
 overlayMenu.append(groupLegend);
 const areaControl=document.createElement('label');areaControl.className='controls';
-areaControl.innerHTML='<input type="checkbox" id="showAreas"> Show planned Data acquisition areas';
+areaControl.innerHTML='<input type="checkbox" id="showAreas"> Show planned Data acquisition areas on GridSquare and FoilHole';
 overlayMenu.append(areaControl);
 const focusHole=button('Zoom to selected hole',()=>{
  const m=grid?.markers?.find(m=>String(m.hole)===String(hole)),v=views.grid;
@@ -206,13 +211,13 @@ const areaNote=document.createElement('small');areaNote.id='areaNote';areaNote.c
 let areaToken=0;
 async function loadAreas(){
  const token=++areaToken,id=grid?.id;
- if(!$('showAreas').checked||!id){areaNote.hidden=true;drawHoles();return}
+ if(!$('showAreas').checked||!id){areaNote.hidden=true;drawHoles();drawFoilArea();return}
  areaNote.hidden=false;areaNote.textContent='Loading planned Data footprints…';
  try{
   const j=await api('/api/areas/'+id,{});
   const result=await waitJob(j.job,()=>token===areaToken&&grid?.id===id);
   if(!result||token!==areaToken||grid?.id!==id)return;
-  grid.areas=result.areas;areaNote.textContent=(result.areas.length?result.areas.length+' Data areas shown. Zoom in to distinguish the individual exposures. ':'No Data areas could be placed. ')+result.note;drawHoles();
+  grid.areas=result.areas;areaNote.textContent=(result.areas.length?result.areas.length+' Data areas shown. The FoilHole view shows the full pattern and highlights the active exposure. ':'No Data areas could be placed. ')+result.note;drawHoles();drawFoilArea();
  }catch(e){if(token===areaToken)areaNote.textContent='Data areas unavailable: '+e.message}
 }
 $('showAreas').onchange=loadAreas;
@@ -228,6 +233,25 @@ function drawAreas(){
   const title=document.createElementNS(p.namespaceURI,'title');title.textContent=area.name+' · planned acquisition area';p.append(title);
   p.onclick=async()=>{try{if(!await saveIfDirty())return;if(hole!==area.hole)await selectHole(area.hole);if(hole!==area.hole)return;const i=pairs.findIndex(x=>x.id===area.id);if(i>=0){shot=i;await showShot()}}catch(e){fail(e)}};
   views.grid.svg.append(p);
+ }
+}
+function drawFoilArea(){
+ views.foil.svg.replaceChildren();
+ if(!$('showAreas').checked)return;
+ const pair=pairs[shot];
+ if(!pair?.foil)return;
+ const areas=(grid?.areas||[]).filter(a=>a.foil===pair.foil&&a.foil_points);
+ areas.sort((a,b)=>(a.id===pair.id)-(b.id===pair.id));
+ for(const area of areas){
+  const active=area.id===pair.id,p=document.createElementNS('http://www.w3.org/2000/svg','polygon');
+  p.setAttribute('points',area.foil_points.map(x=>x.join(',')).join(' '));
+  p.setAttribute('vector-effect','non-scaling-stroke');p.dataset.exposure=area.id;
+  p.classList.add('foil-acquisition-area');if(active)p.classList.add('active');
+  p.style.fill=active?'rgba(255,255,255,.16)':'none';
+  p.style.stroke=active?'#ffffff':groupColor(area.anchor);p.style.strokeWidth=active?'3px':'1.4px';
+  p.style.strokeOpacity=active?'1':'.82';p.style.filter=active?'drop-shadow(0 0 2px #101824)':'none';p.style.pointerEvents='none';
+  const title=document.createElementNS(p.namespaceURI,'title');title.textContent=area.name+(active?' · active Data exposure':' · planned Data acquisition area');p.append(title);
+  views.foil.svg.append(p);
  }
 }
 function updateOverlayControls(){
@@ -296,10 +320,10 @@ function showFoilForExposure(p){
  if(p.foil){views.foil.load(p.foil,p.foil_name);return}
  const m=grid?.markers?.find(m=>m.hole===hole);
  views.foil.clear(m?.role==='shifted'?
-  'Beam-shift collection: FoilHole '+hole+' was targeted from centering hole '+m.anchor+'. No separate FoilHole image is expected for this target. Its Data images are available in the Data viewer.':
-  'Data images are available for FoilHole '+hole+', but no matching FoilHole preview is indexed. Its centering relationship is not confirmed; the preview may be unavailable.');
+  'Beam-shift acquisition — no separate FoilHole image expected.':
+  'No FoilHole preview indexed for this exposure.',true);
 }
-async function showShot(){const p=pairs[shot];if(!p)return;syncActiveHole(p.hole);views.data.load(p.id,p.name);showFoilForExposure(p);$('shotNav').textContent='Exposure '+(shot+1)+' / '+pairs.length;const strip=$('strips');strip.replaceChildren();pairs.forEach((p,i)=>{const b=button(String(i+1),async()=>{if(!await saveIfDirty())return;shot=i;await showShot()});b.classList.toggle('active',i===shot);b.title=p.name;strip.append(b)});await loadAnnotation()}
+async function showShot(){const p=pairs[shot];if(!p)return;syncActiveHole(p.hole);views.data.load(p.id,p.name,p.mrc||'');showFoilForExposure(p);drawFoilArea();$('shotNav').textContent='Exposure '+(shot+1)+' / '+pairs.length;const strip=$('strips');strip.replaceChildren();pairs.forEach((p,i)=>{const b=button(String(i+1),async()=>{if(!await saveIfDirty())return;shot=i;await showShot()});b.classList.toggle('active',i===shot);b.title=p.name;strip.append(b)});await loadAnnotation()}
 async function stepGrid(delta){if(!grid)return;const i=grids.findIndex(g=>g.id===grid.id)+delta;if(i>=0&&i<grids.length)await selectGrid(grids[i].id)}
 async function stepHole(delta){let i=holeRows.findIndex(h=>h.hole===hole)+delta;if(i>=0&&i<holeRows.length)return selectHole(holeRows[i].hole);const offset=holeOffset+(delta>0?100:-100);if(offset<0||offset>=holeTotal)return;holeOffset=offset;await loadHoles();if(holeRows.length)await selectHole(holeRows[delta>0?0:holeRows.length-1].hole)}
 async function stepShot(delta){if(!await saveIfDirty())return;const i=shot+delta;if(i>=0&&i<pairs.length){shot=i;await showShot()}}

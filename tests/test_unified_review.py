@@ -128,6 +128,33 @@ class UnifiedReviewTests(unittest.TestCase):
         self.assertEqual(report_filename('...'),'EPU-session-screening-report.html')
         self.assertEqual(report_filename('Gríd α'),'Gríd α-screening-report.html')
 
+    def test_dashboard_legend_swatches(self):
+        if not shutil.which('node'):
+            self.skipTest('Node unavailable')
+        function='function renderAtlasLegend(mode){'+REVIEW_TOOLS.split('function renderAtlasLegend(mode){',1)[1].split('\nlet manualTargets',1)[0]
+        script=r'''
+const assert=require('node:assert/strict');
+class Element {constructor(){this.children=[];this.style={}} append(...nodes){this.children.push(...nodes)} replaceChildren(){this.children=[]} setAttribute(){}}
+const document={createElement:()=>new Element()},atlasLegend=new Element();
+const ratingColors=['#64748b','#dc2626','#f97316','#ca8a04','#65a30d','#15803d'],categoryColors={2:'#3b82f6'};
+'''+function+r'''
+function item(label){return atlasLegend.children.find(e=>e.children[1]?.textContent===label).children[0]}
+renderAtlasLegend('rating');
+assert.equal(item('Rating 1').style.background,'#dc2626');
+assert.equal(item('Rating 5').style.background,'#15803d');
+assert.equal(item('Suitable outline').style.background,'transparent');
+assert.equal(item('Suitable outline').style.border,'2px solid #059669');
+assert.equal(item('Manual target').style.border,'2px dashed #0891b2');
+assert.equal(item('Active square').style.border,'2px solid #fff');
+renderAtlasLegend('status');
+assert.equal(item('Suitable').style.background,'#059669');
+assert.equal(item('Unsuitable').style.background,'#dc2626');
+assert.equal(item('Unmarked').style.background,'#64748b');
+renderAtlasLegend('raw');assert.equal(atlasLegend.children.length,0);
+'''
+        result=subprocess.run(['node'],input=script,text=True,capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_report_legends_and_hover_metadata(self):
         if not shutil.which('node'):
             self.skipTest('Node unavailable')

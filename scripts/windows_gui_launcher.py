@@ -37,6 +37,7 @@ from portable_session import (  # noqa: E402
     portable_session_source,
 )
 from server_startup import ADDRESS_PREFIX, READY_PREFIX, browser_url
+from hole_selection import filter_particles_from_file
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8000"
@@ -328,9 +329,15 @@ def _run_frozen_smoke_test() -> int:
         from acquisition_app import create_acquisition_app  # noqa: F401
         from cryosparc_density_app import install_density
         from cryosparc_density import DensityIndex
+        from hole_selection import filter_particles_from_file, resolve_selection
+        from hole_selection_app import install_hole_selection
+        from native_dialog import choose_path
         import cryosparc_density_app
         if not Path(cryosparc_density_app.__file__).with_name('cryosparc_density.js').is_file():
             raise RuntimeError('Particle density dashboard resource is missing')
+        import hole_selection_app
+        if not Path(hole_selection_app.__file__).with_name('hole_selection.js').is_file():
+            raise RuntimeError('FoilHole selection dashboard resource is missing')
         import position_corrections
         if not Path(position_corrections.__file__).with_name('position_corrections.js').is_file():
             raise RuntimeError('Observed-position tools resource is missing')
@@ -339,7 +346,8 @@ def _run_frozen_smoke_test() -> int:
         if tk is None or ttk is None:
             raise RuntimeError("Tkinter is unavailable")
         if not all(callable(value) for value in (find_grid_image, portable_export, create_app, compute_markers,
-                                                 reserve_socket, run_reserved_server, adjusted_preview)):
+                                                 reserve_socket, run_reserved_server, adjusted_preview,
+                                                 resolve_selection, filter_particles_from_file, install_hole_selection, choose_path)):
             raise RuntimeError("A packaged runtime entry point is not callable")
         # Exercise the frozen runtime, not just imports: missing resources or
         # dynamic FastAPI/Pydantic dependencies must fail before publishing.
@@ -390,6 +398,7 @@ class ReviewLauncher:
         self.atlas_by_session = dict(saved_atlas_by_session) if isinstance(saved_atlas_by_session, dict) else {}
         self._details_running = False
         self._portable_running = False
+        self._particle_filter_running = False
         self.last_portable_manifest = str(self.preferences.get("last_portable_manifest", "") or "")
         self.root = tk.Tk()
         self.root.title("EPU Mapper")
@@ -397,7 +406,12 @@ class ReviewLauncher:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_form(self) -> None:
-        frm = ttk.Frame(self.root, padding=10)
+        notebook=ttk.Notebook(self.root)
+        notebook.grid(row=0,column=0,sticky='nsew',padx=6,pady=(6,0))
+        review_page=ttk.Frame(notebook);filter_page=ttk.Frame(notebook)
+        notebook.add(review_page,text='Review EPU session');notebook.add(filter_page,text='Filter CryoSPARC particles')
+        review_page.columnconfigure(0,weight=1)
+        frm = ttk.Frame(review_page, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
@@ -533,6 +547,27 @@ class ReviewLauncher:
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
         self._sync_foil_controls()
+        self._build_particle_filter_tab(filter_page)
+
+    def _build_particle_filter_tab(self, parent) -> None:
+        parent.columnconfigure(0,weight=1)
+        frm=ttk.Frame(parent,padding=14);frm.grid(row=0,column=0,sticky='nsew');frm.columnconfigure(1,weight=1)
+        ttk.Label(frm,text='Apply a saved FoilHole selection to any compatible CryoSPARC particle table.',font=('TkDefaultFont',11,'bold')).grid(row=0,column=0,columnspan=3,sticky='w')
+        ttk.Label(frm,text='This runs without the browser or EPU images. Files are memory-mapped and filtered in chunks; source tables are unchanged.',wraplength=700).grid(row=1,column=0,columnspan=3,sticky='w',pady=(3,12))
+        self.filter_selection_var=tk.StringVar(value=str(self.preferences.get('last_filter_selection','') or ''))
+        self.filter_particles_var=tk.StringVar(value=str(self.preferences.get('last_filter_particles','') or ''))
+        self.filter_passthrough_var=tk.StringVar(value=str(self.preferences.get('last_filter_passthrough','') or ''))
+        self.filter_output_var=tk.StringVar(value=str(self.preferences.get('last_filter_output','') or ''))
+        rows=[('FoilHole selection file:',self.filter_selection_var,self._browse_filter_selection),('Particle .cs file:',self.filter_particles_var,self._browse_filter_particles),('Passthrough .cs (optional):',self.filter_passthrough_var,self._browse_filter_passthrough),('Output parent folder:',self.filter_output_var,self._browse_filter_output)]
+        for index,(label,var,command) in enumerate(rows,start=2):
+            ttk.Label(frm,text=label).grid(row=index,column=0,sticky='w',pady=4);ttk.Entry(frm,textvariable=var,width=72).grid(row=index,column=1,sticky='we',padx=8,pady=4);ttk.Button(frm,text='Browse',command=command).grid(row=index,column=2,pady=4)
+        options=ttk.Frame(frm);options.grid(row=6,column=0,columnspan=3,sticky='w',pady=(10,4))
+        self.filter_keep_unmatched_var=tk.BooleanVar(value=False);self.filter_include_excluded_var=tk.BooleanVar(value=False)
+        ttk.Checkbutton(options,text='Keep unmatched or ambiguous particles',variable=self.filter_keep_unmatched_var).pack(side='left')
+        ttk.Checkbutton(options,text='Also write excluded tables',variable=self.filter_include_excluded_var).pack(side='left',padx=(14,0))
+        self.particle_filter_btn=ttk.Button(frm,text='Filter particle table',command=self.start_particle_filter);self.particle_filter_btn.grid(row=7,column=0,sticky='w',pady=(10,0))
+        self.particle_filter_status=tk.StringVar(value='Choose a .epuholes.json selection file and particle table.')
+        ttk.Label(frm,textvariable=self.particle_filter_status,wraplength=700).grid(row=7,column=1,columnspan=2,sticky='w',padx=(8,0),pady=(10,0))
 
     def browse_session(self) -> None:
         initial_dir = _dialog_initial_directory(self.session_var.get().strip() or self.preferences.get("last_session", ""))
@@ -542,6 +577,64 @@ class ReviewLauncher:
             self._apply_session_atlas(path)
             self._remember_session(path)
             self._persist_preferences(self._transform_value(self.transform_var.get()))
+
+    def _browse_filter_selection(self) -> None:
+        initial=_dialog_initial_directory(self.filter_selection_var.get() or self.preferences.get('last_filter_selection',''))
+        path=filedialog.askopenfilename(title='Choose EPU Mapper FoilHole selection',initialdir=str(initial),filetypes=[('EPU Mapper FoilHole selection','*.epuholes.json'),('JSON files','*.json'),('All files','*.*')])
+        if path:self.filter_selection_var.set(path)
+
+    def _browse_filter_particles(self) -> None:
+        initial=_dialog_initial_directory(self.filter_particles_var.get() or self.preferences.get('last_filter_particles',''))
+        path=filedialog.askopenfilename(title='Choose CryoSPARC particle table',initialdir=str(initial),filetypes=[('CryoSPARC datasets','*.cs'),('All files','*.*')])
+        if path:
+            self.filter_particles_var.set(path)
+            try:
+                from cryosparc_density_app import inspect_cs
+                info=inspect_cs(path,True,{'location/micrograph_path'})
+                if info.get('suggestion'):
+                    self.filter_passthrough_var.set(info['suggestion']);self.particle_filter_status.set('Matching passthrough found automatically.')
+                elif info.get('needs_passthrough'):
+                    self.filter_passthrough_var.set('');self.particle_filter_status.set('Choose the matching passthrough containing location/micrograph_path.')
+                else:
+                    self.filter_passthrough_var.set('');self.particle_filter_status.set(f"Ready: {info['particles']:,} particles; micrograph paths found in the particle table.")
+            except Exception as exc:
+                self.particle_filter_status.set('Could not inspect particle table: '+str(exc))
+
+    def _browse_filter_passthrough(self) -> None:
+        initial=_dialog_initial_directory(self.filter_passthrough_var.get() or self.filter_particles_var.get())
+        path=filedialog.askopenfilename(title='Choose matching CryoSPARC passthrough',initialdir=str(initial),filetypes=[('CryoSPARC datasets','*.cs'),('All files','*.*')])
+        if path:self.filter_passthrough_var.set(path)
+
+    def _browse_filter_output(self) -> None:
+        initial=_dialog_initial_directory(self.filter_output_var.get() or self.filter_particles_var.get())
+        path=filedialog.askdirectory(title='Choose output parent folder',initialdir=str(initial))
+        if path:self.filter_output_var.set(path)
+
+    def start_particle_filter(self) -> None:
+        if self._particle_filter_running:return
+        selection=Path(self.filter_selection_var.get().strip()).expanduser();particles=Path(self.filter_particles_var.get().strip()).expanduser()
+        passthrough=Path(self.filter_passthrough_var.get().strip()).expanduser() if self.filter_passthrough_var.get().strip() else None
+        output=Path(self.filter_output_var.get().strip()).expanduser()
+        problems=[]
+        if not selection.is_file():problems.append('Choose an existing FoilHole selection file.')
+        if not particles.is_file() or particles.suffix.lower()!='.cs':problems.append('Choose an existing particle .cs file.')
+        if passthrough is not None and (not passthrough.is_file() or passthrough.suffix.lower()!='.cs'):problems.append('The passthrough must be an existing .cs file.')
+        if not output.is_dir():problems.append('Choose an existing output parent folder.')
+        if problems:messagebox.showerror('Cannot filter particles','\n'.join(problems),parent=self.root);return
+        self._particle_filter_running=True;self.particle_filter_btn.configure(state='disabled');self.particle_filter_status.set('Filtering in memory-bounded chunks…');self._persist_preferences(self._transform_value(self.transform_var.get()))
+        threading.Thread(target=self._run_particle_filter,args=(selection,particles,passthrough,output,bool(self.filter_keep_unmatched_var.get()),bool(self.filter_include_excluded_var.get())),daemon=True).start()
+
+    def _run_particle_filter(self, selection: Path, particles: Path, passthrough: Path | None, output: Path,
+                             keep_unmatched: bool, include_excluded: bool) -> None:
+        try:
+            result=filter_particles_from_file(selection,particles,passthrough,output,keep_unmatched,include_excluded)
+        except Exception as exc:
+            self._log(f'Particle filtering failed: {exc}\n');self.root.after(0,lambda message=str(exc):(self.particle_filter_status.set('Filtering failed: '+message),messagebox.showerror('Particle filtering failed',message,parent=self.root)))
+        else:
+            message=f"Saved {result['kept']:,} kept particles ({result['excluded']:,} excluded) to:\n{result['path']}"
+            self._log(message+'\n');self.root.after(0,lambda text=message:(self.particle_filter_status.set(text.replace('\n',' ')),messagebox.showinfo('Particle filtering complete',text,parent=self.root)))
+        finally:
+            self._particle_filter_running=False;self.root.after(0,lambda:self.particle_filter_btn.configure(state='normal'))
 
     def open_portable_session(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -1030,6 +1123,10 @@ class ReviewLauncher:
             "session_label": self.label_var.get().strip(),
             "show_advanced": bool(self.advanced_var.get()),
             "last_portable_manifest": self.last_portable_manifest,
+            "last_filter_selection": self.filter_selection_var.get().strip(),
+            "last_filter_particles": self.filter_particles_var.get().strip(),
+            "last_filter_passthrough": self.filter_passthrough_var.get().strip(),
+            "last_filter_output": self.filter_output_var.get().strip(),
         }
         path = self._prefs_path()
         path.parent.mkdir(parents=True, exist_ok=True)

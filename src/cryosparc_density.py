@@ -16,37 +16,62 @@ def exposure_key(path):
     return match.group(1) if match else None
 
 
-def load_locations(main_path, passthrough_path=None):
-    main = np.load(main_path, allow_pickle=False)
+class LocationColumns:
+    """Memory-mapped CryoSPARC location columns, UID-aligned in bounded slices."""
     required = ('location/micrograph_path', 'location/center_x_frac', 'location/center_y_frac')
-    if not main.dtype.names or 'uid' not in main.dtype.names:
-        raise ValueError('Expected a CryoSPARC structured .cs particle table with uid.')
-    if len(np.unique(main['uid'])) != len(main):
-        raise ValueError('Duplicate particle UIDs: refusing to count particles twice.')
-    other = None
-    order = None
-    if any(field not in main.dtype.names for field in required):
-        if not passthrough_path:
+
+    def __init__(self, main_path, passthrough_path=None, required=None):
+        self.required=tuple(required or type(self).required)
+        self.main = np.load(main_path, allow_pickle=False, mmap_mode='r')
+        main = self.main
+        if not main.dtype.names or 'uid' not in main.dtype.names:
+            raise ValueError('Expected a CryoSPARC structured .cs particle table with uid.')
+        main_uids=np.sort(main['uid'])
+        if len(main_uids)>1 and np.any(main_uids[1:]==main_uids[:-1]):
+            raise ValueError('Duplicate particle UIDs: refusing to count particles twice.')
+        del main_uids
+        self.other = None; self.order = None
+        needs_other = any(field not in main.dtype.names for field in self.required)
+        if needs_other and not passthrough_path:
             raise ValueError('Location fields are missing. Supply the matching passthrough .cs file.')
-        other = np.load(passthrough_path, allow_pickle=False)
-        if not other.dtype.names or 'uid' not in other.dtype.names:
-            raise ValueError('Passthrough has no particle UIDs.')
-        uids = other['uid']
-        if len(np.unique(uids)) != len(uids):
-            raise ValueError('Duplicate passthrough UIDs.')
-        sorting = np.argsort(uids)
-        positions = np.searchsorted(uids[sorting], main['uid'])
-        if np.any(positions >= len(uids)) or not np.array_equal(uids[sorting][positions], main['uid']):
-            raise ValueError('Passthrough is missing selected particle UIDs; choose the matching output.')
-        order = sorting[positions]
-    fields = {}
-    for field in required:
-        if field in main.dtype.names:
-            fields[field] = main[field]
-        elif other is not None and field in other.dtype.names:
-            fields[field] = other[field][order]
-        else:
-            raise ValueError('Missing required field: '+field)
+        if passthrough_path:
+            self.other = np.load(passthrough_path, allow_pickle=False, mmap_mode='r')
+            other = self.other
+            if not other.dtype.names or 'uid' not in other.dtype.names:
+                raise ValueError('Passthrough has no particle UIDs.')
+            uids = other['uid']
+            sorting = np.argsort(uids)
+            ordered=uids[sorting]
+            if len(ordered)>1 and np.any(ordered[1:]==ordered[:-1]):
+                raise ValueError('Duplicate passthrough UIDs.')
+            positions = np.searchsorted(ordered, main['uid'])
+            if np.any(positions >= len(uids)) or not np.array_equal(ordered[positions], main['uid']):
+                raise ValueError('Passthrough is missing selected particle UIDs; choose the matching output.')
+            self.order = sorting[positions]
+        for field in self.required:
+            if field not in main.dtype.names and (self.other is None or field not in self.other.dtype.names):
+                raise ValueError('Missing required field: '+field)
+
+    def values(self, field, start=0, stop=None):
+        stop = len(self.main) if stop is None else stop
+        if field in self.main.dtype.names:
+            return self.main[field][start:stop]
+        return self.other[field][self.order[start:stop]]
+
+    def chunks(self, size=None):
+        if size is None:
+            paths=self.main['location/micrograph_path'] if 'location/micrograph_path' in self.main.dtype.names else self.other['location/micrograph_path']
+            size=max(10_000,min(250_000,(64*1024*1024)//max(1,paths.dtype.itemsize)))
+        for start in range(0, len(self.main), size):
+            stop = min(len(self.main), start+size)
+            yield start, stop, tuple(self.values(field,start,stop) for field in self.required)
+
+
+def load_locations(main_path, passthrough_path=None):
+    columns = LocationColumns(main_path,passthrough_path)
+    main = columns.main
+    required = ('location/micrograph_path', 'location/center_x_frac', 'location/center_y_frac')
+    fields = {field:columns.values(field) for field in required}
     return fields, len(main)
 
 
@@ -56,35 +81,41 @@ class DensityIndex:
         self.lock = threading.RLock()
         self.records = {}
         self.summary = {'loaded': False}
+        self.sources = {}
         self.version = 0
 
-    def import_files(self, main, passthrough=None):
-        fields, total = load_locations(main, passthrough)
-        media = defaultdict(list)
+    def import_files(self, main, passthrough=None, source_names=None):
+        columns = LocationColumns(main,passthrough); total=len(columns.main)
+        media = defaultdict(list); media_rows=[]
         for row in self.store.execute("SELECT id,grid_id,hole,name FROM media WHERE kind='data'"):
             key = exposure_key(row['name'])
             if key:
-                media[key].append(row)
-        counts = defaultdict(lambda: np.zeros((16,16), dtype=np.int64))
+                media[key].append(len(media_rows));media_rows.append(row)
+        counts = np.zeros((len(media_rows),256),dtype=np.int64)
         rows = {}; matched = invalid = unmatched = ambiguous = 0
         unknown = set()
-        for path,x,y in zip(*(fields[k] for k in ('location/micrograph_path','location/center_x_frac','location/center_y_frac'))):
-            if not np.isfinite(x) or not np.isfinite(y) or not (0<=x<=1 and 0<=y<=1):
-                invalid += 1
-                continue
-            key = exposure_key(path)
-            candidates = media.get(key, [])
-            if len(candidates)!=1:
-                if candidates: ambiguous += 1
-                else: unmatched += 1
-                if len(unknown)<10: unknown.add(str(path))
-                continue
-            row=candidates[0]; rows[row['id']]=row
-            # CryoSPARC Y is bottom-up; EPU preview/SVG Y is top-down.
-            ix=min(15,int(float(x)*16)); iy=min(15,int((1-float(y))*16))
-            counts[row['id']][iy,ix] += 1
-            matched += 1
-        records = {key:dict(rows[key],histogram=value.tolist(),particles=int(value.sum())) for key,value in counts.items()}
+        for _,_,(paths,x,y) in columns.chunks():
+            x=np.asarray(x);y=np.asarray(y)
+            valid=np.isfinite(x)&np.isfinite(y)&(x>=0)&(x<=1)&(y>=0)&(y<=1);invalid+=int((~valid).sum())
+            unique,inverse=np.unique(paths,return_inverse=True)
+            codes=np.full(len(unique),-1,dtype=np.int64)
+            for i,path in enumerate(unique):
+                candidates=media.get(exposure_key(path),[])
+                if len(candidates)==1:codes[i]=candidates[0]
+                elif candidates:codes[i]=-2
+                elif len(unknown)<10:unknown.add(str(path))
+            particle_codes=codes[inverse]
+            ambiguous+=int((valid&(particle_codes==-2)).sum());unmatched+=int((valid&(particle_codes==-1)).sum())
+            good=valid&(particle_codes>=0);matched+=int(good.sum())
+            if not np.any(good):continue
+            ix=np.minimum(15,(x[good]*16).astype(np.int64));iy=np.minimum(15,((1-y[good])*16).astype(np.int64))
+            flat=particle_codes[good]*256+iy*16+ix
+            counts += np.bincount(flat,minlength=counts.size).reshape(counts.shape)
+        records={}
+        for index,value in enumerate(counts):
+            if not value.any():continue
+            row=media_rows[index];rows[row['id']]=row
+            records[row['id']]=dict(row,histogram=value.reshape(16,16).tolist(),particles=int(value.sum()))
         grid_counts = defaultdict(int)
         for record in records.values():
             grid_counts[record['grid_id']] += record['particles']
@@ -96,6 +127,7 @@ class DensityIndex:
                      warning='Subset density, not total particle abundance. Blank = unrepresented or unmapped, not zero. Coordinates assume full-frame micrographs with unchanged orientation; cropped/rotated imports require registration. Alignment shifts are not applied.')
         with self.lock:
             self.records=records;self.summary=summary;self.version+=1
+            self.sources=dict(main=str(main),passthrough=str(passthrough) if passthrough else '',**(source_names or {}))
         return summary
 
     def grid_density(self, gid, transform='identity'):

@@ -1,12 +1,14 @@
 """Local, persistent acquisition index. Network reads are queued and bounded.
 
 The index is trusted until explicit refresh (or opt-in live polling). Data MRCs
-are never indexed. FoilHole-only scans never enter a Data directory.
+are indexed by exact preview filename only and read on explicit request.
+FoilHole-only scans never enter a Data directory.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -168,7 +170,7 @@ class AcquisitionStore:
 
     def media(self, key):
         rows = self.execute("SELECT * FROM media WHERE id=?", (key,))
-        if not rows or (self.ignore_data and rows[0]["kind"] == "data"):
+        if not rows or (self.ignore_data and rows[0]["kind"] in ('data','data_mrc')):
             raise KeyError("Image not available in this mode")
         return rows[0]
 
@@ -290,8 +292,17 @@ class AcquisitionStore:
                         path = directory/folder/name
                         xml = str(path.with_suffix('.xml')) if stem+'.xml' in entries else ''
                         rows.append((stable_id(path),gid,kind,name.split('_')[1],name,str(path),xml,timestamp(name),generation))
+                        if kind=='data':
+                            # Discover exact exposure counterparts by filename only.
+                            # Never substitute fraction stacks or neighboring exposures.
+                            match=next((stem+ext for ext in ('.mrc','.mrcs') if stem+ext in entries),None)
+                            if match:
+                                mrc_path=directory/folder/match
+                                rows.append((stable_id(mrc_path),gid,'data_mrc',name.split('_')[1],match,str(mrc_path),xml,timestamp(name),generation))
                     self.db.executemany('INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?,?,?,?)', rows)
                     self.db.execute("DELETE FROM media WHERE grid_id=? AND kind=? AND generation!=?", (gid,kind,generation))
+                    if kind=='data':
+                        self.db.execute("DELETE FROM media WHERE grid_id=? AND kind='data_mrc' AND generation!=?",(gid,generation))
                     self.db.commit()
                 if kind == 'data':
                     # Track missing JPEGs from image XMLs without treating movie
@@ -319,7 +330,7 @@ class AcquisitionStore:
         if refresh:
             # Refresh only previously cached files, never stat every raw movie.
             for row in self.execute("SELECT media.id,media.kind FROM cached JOIN media ON cached.id=media.id"):
-                if self.ignore_data and row['kind']=='data':
+                if self.ignore_data and row['kind'] in ('data','data_mrc'):
                     continue
                 try:
                     self.cache_file(row['id'],refresh=True)
@@ -552,7 +563,8 @@ class AcquisitionStore:
         except (KeyError, TypeError, ValueError, AttributeError):
             return dict(areas=[],note='Data areas need the EPU session template and GridSquare coordinate transformations.')
         mapping = _TRANSFORM_FUNCS.get(transform,_TRANSFORM_FUNCS['identity'])
-        footprints = {}; areas = []; missing = 0
+        footprints = {}; foil_frames = {}; areas = []; missing = 0; foil_missing = 0
+        foils = self.execute("SELECT * FROM media WHERE grid_id=? AND kind='foil' ORDER BY stamp,name",(gid,))
         for row in self.execute("SELECT * FROM media WHERE grid_id=? AND kind='data' ORDER BY stamp,name",(gid,)):
             parts = row['name'].split('_')
             area = parts[3] if len(parts)>3 else ''
@@ -579,12 +591,43 @@ class AcquisitionStore:
                 if not all(0<=x<=1 and 0<=y<=1 for x,y in points):
                     missing += 1
                     continue
-                areas.append(dict(id=row['id'],hole=row['hole'],anchor=marker['anchor'],area=area,points=points,name=row['name']))
+                preceding=[f for f in foils if f['stamp'] and f['stamp']<=row['stamp']]
+                foil=preceding[-1] if preceding else foils[0] if len(foils)==1 and not row['stamp'] else None
+                foil_points = None
+                if foil:
+                    if foil['id'] not in foil_frames:
+                        try:
+                            foil_info=parse_grid_info(self.cache_optional(foil['xml']))
+                            fw,fh=foil_info['readout_width'],foil_info['readout_height']
+                            if fw<=0 or fh<=0:
+                                raise ValueError('Invalid FoilHole dimensions')
+                            foil_frames[foil['id']]=(fw,fh,foil_info['ref_matrix'])
+                        except (KeyError,TypeError,ValueError,OSError):
+                            foil_frames[foil['id']]=None
+                    frame=foil_frames[foil['id']]
+                    foil_marker=markers.get(str(foil['hole'])) or markers.get(foil['hole'])
+                    if frame and foil_marker:
+                        fw,fh,foil_matrix=frame
+                        target_delta=matrix_vector(grid_matrix,
+                            (marker['x']-foil_marker['x'])*width,
+                            (marker['y']-foil_marker['y'])*height)
+                        candidate=[]
+                        for x,y in footprints[setting]:
+                            qx,qy=matrix_vector(foil_matrix,target_delta[0]+dx+x,target_delta[1]+dy+y,inverse=True)
+                            candidate.append((.5+qx/fw,.5+qy/fh))
+                        if all(math.isfinite(v) for point in candidate for v in point):
+                            foil_points=candidate
+                if foil_points is None:
+                    foil_missing += 1
+                areas.append(dict(id=row['id'],hole=row['hole'],anchor=marker['anchor'],area=area,
+                    points=points,foil=foil['id'] if foil else '',foil_points=foil_points,name=row['name']))
             except ValueError:
                 missing += 1
         note = 'Planned Data footprints from EPU template offsets; not measured beam landing positions.'
         if missing:
             note += f' {missing} exposures lack usable geometry.'
+        if foil_missing:
+            note += f' {foil_missing} areas cannot be placed on a FoilHole preview because its image or coordinate metadata is unavailable.'
         return dict(areas=areas,note=note)
 
     def grid(self, gid):
@@ -624,6 +667,9 @@ class AcquisitionStore:
             preceding=[f for f in foils if f['stamp'] and f['stamp']<=row['stamp']]
             foil=preceding[-1] if preceding else foils[0] if len(foils)==1 and not row['stamp'] else None
             result.append(dict(id=row['id'],hole=row['hole'],name=row['name'],stamp=row['stamp'],foil=foil['id'] if foil else '',foil_name=foil['name'] if foil else '',annotation=self.annotation('exposure:'+row['id']),metrics=self.metric(row['id'])))
+            candidates=[stable_id(Path(row['path']).with_suffix(ext)) for ext in ('.mrc','.mrcs')]
+            matches=self.execute("SELECT id FROM media WHERE kind='data_mrc' AND id IN (?,?)",candidates)
+            result[-1]['mrc']=next((key for key in candidates if any(m['id']==key for m in matches)),'')
         return dict(foil=foils[-1]['id'] if foils else '',foil_name=foils[-1]['name'] if foils else '',exposures=result,missing=[] if self.ignore_data else [r for r in self.meta('missing:'+gid,[]) if r['hole']==hole])
 
     def annotation(self,key):

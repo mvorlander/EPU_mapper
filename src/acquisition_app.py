@@ -103,7 +103,7 @@ def create_acquisition_app(source, atlas=None, mode='acquisition', transform='id
         local = store.local_file(key)
         if not local:
             raise HTTPException(409,'Preview not cached yet; load the image first')
-        if media['kind'] not in ('atlas','grid','foil','data','atlas_mrc','grid_mrc'):
+        if media['kind'] not in ('atlas','grid','foil','data','atlas_mrc','grid_mrc','data_mrc'):
             raise HTTPException(403,'Not a display image')
         if adjust or media['kind'].endswith('_mrc'):
             from image_adjustments import adjusted_preview

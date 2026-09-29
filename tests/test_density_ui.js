@@ -3,7 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
 class Element{
- constructor(){this.style={};this.children=[];this.attributes={};this.value='';this.checked=true;this._text=''}
+ constructor(){this.style={};this.children=[];this.attributes={};this.value='';this.checked=true;this._text='';this.classList={toggle(){},add(){},remove(){}}}
  set textContent(value){this._text=value;this.children=[]}
  get textContent(){return this._text}
  setAttribute(k,v){this.attributes[k]=v}
@@ -13,11 +13,11 @@ class Element{
  remove(){svg.children=svg.children.filter(c=>c!==this)}
 }
 const svg=new Element(),card=new Element();
-const elements=Object.fromEntries(['densityClear','grids','search','densityPalette','densityVisible','densityMode','densityOpacity','densityLegend','densityStatus','densityImport','densityMain','densityPass','foilStyle'].map(id=>[id,new Element()]));
+const elements=Object.fromEntries(['densityClear','grids','search','densityPalette','densityVisible','densityMode','densityOpacity','densityLegend','densityStatus','densityImport','densityMain','densityPass','densityChooseMain','densityMainChoice','densityChoosePass','densityPassChoice','densityMap','foilStyle'].map(id=>[id,new Element()]));
 elements.densityPalette.value='viridis';elements.densityMode.value='holes';elements.densityOpacity.value='65';
 const context=vm.createContext({console,config:{mode:'acquisition'},document:{
  createElement:()=>new Element(),createElementNS:()=>new Element(),
- querySelector:q=>q==='#densityLayer'?svg.children.find(c=>c.id==='densityLayer'):new Element()
+ head:new Element(),querySelector:q=>q==='#densityLayer'?svg.children.find(c=>c.id==='densityLayer'):new Element()
 },$:id=>elements[id],views:{grid:{svg,card}},foilOverlay:{radius:1.2,style:'filled'},
  grid:{id:'g',markers:[{hole:'1',x:.3,y:.4}]},
  styleFoilCircle:(circle,selected,marker)=>{circle.style.fill='red';circle.style.stroke=marker.color;circle.style.strokeDasharray=marker.role==='shifted'?'dashed':'';circle.style.strokeWidth=selected?3:1},

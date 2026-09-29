@@ -16,11 +16,47 @@ The program is free and open source, runs locally, and opens in a web browser.
   unscreened collection targets.
 - View annotations on the Atlas, with adjustable overlay opacity.
 - Zoom, pan, enlarge images and adjust contrast or low-pass filtering.
+- Inspect EPU's recorded FoilHole intensities and final selections, then refine
+  an acquired-hole subset with a reversible selection brush.
 - Share annotated screening results as self-contained HTML reports that open
   without EPU Mapper or the original data.
 
 EPU Mapper supports both screening and multi-exposure collections. It helps
-document collection decisions. 
+document collection decisions.
+
+## Changelog: v0.2.9 → v0.9.0
+
+This consolidated summary covers the major changes since v0.2.9.
+
+- **Unified screening and acquisition review.** One browser workspace links
+  Atlas, GridSquare, FoilHole and individual Data exposures, including
+  multi-exposure collections and a FoilHole-only mode.
+- **Annotations and collection planning.** Save ratings, suitability and
+  comments locally; view them directly on the Atlas with legends and adjustable
+  opacity; mark unscreened targets or rectangular areas for later collection.
+- **Better image inspection.** Linked selection, zoom, pan, enlarged views,
+  contrast presets, gamma and low-pass filtering, plus on-demand Atlas,
+  GridSquare and individual Data MRC loading. Planned exposure footprints and
+  observed targeting-shift annotations help inspect acquisition geometry.
+- **Portable results.** Export self-contained HTML screening reports with
+  embedded images and interactive Atlas layers, or copy a full portable session
+  to another computer. Annotation JSON and detailed PDF exports remain available.
+- **CryoSPARC particle mapping and filtering.** Map particle subsets back to
+  EPU exposures, inspect per-square counts and density overlays, and select
+  acquired holes using an intensity histogram and a brush with undo/redo.
+  Export filtered particle tables with UID-aligned passthrough rows, a selection
+  CSV and a provenance manifest; reuse portable `.epuholes.json` selections
+  through the launcher's standalone filtering tab.
+- **Large-dataset and network-drive workflows.** Persistent indexing, local
+  preview caching and explicit refresh reduce repeated network reads. Native
+  file pickers, memory-mapped particle tables, chunked background processing
+  and direct-folder exports support large CryoSPARC datasets.
+- **Installation and documentation.** Portable Windows builds, a macOS
+  launcher, automatic free-port selection and clearer startup diagnostics;
+  an illustrated walkthrough and expanded data requirements. A separate
+  [comparison tool](docs/cryosparc-ice-comparison.md) relates recorded EPU
+  intensities to CryoSPARC's relative ice estimates.
+
 ## Install
 
 ### Windows
@@ -59,7 +95,7 @@ For illustrated instructions, see the [detailed walkthrough](#detailed-walkthrou
    while using the dashboard.
 2. **Inspect images.** Click a square on the Atlas or in the list, then select
    holes or use the Previous/Next buttons. JPEG/PNG previews load on demand;
-   Atlas and GridSquare MRCs can be loaded for closer inspection.
+   Atlas, GridSquare and individual Data MRCs can be loaded for closer inspection.
 3. **Annotate.** Use the review bar for ratings, suitability and comments.
    **Cmd/Ctrl + Enter** in the comment box saves and advances to the next square.
    Use **Add target / area** below the Atlas to mark additional collection targets.
@@ -94,7 +130,38 @@ Import a particle `.cs` file and its matching passthrough file, if needed, throu
 **CryoSPARC particle density** in the dashboard. Color-coded densities and
 per-square counts show where the selected particles came from.
 
+The **FoilHole selection & CryoSPARC export** panel starts with a
+histogram-guided recorded-intensity range, or optionally all acquired holes.
+The histogram retains EPU's recorded selection as a comparison. Use the
+variable-radius selection brush on the GridSquare,
+with EPU-style Control/Shift shortcuts, undo and redo,
+then apply the selection to any compatible `.cs` table; particle-density
+mapping is optional. Matching passthrough rows remain
+UID-aligned. The download also includes a hole-selection CSV and a JSON manifest
+recording the filter and unmatched-particle policy; particle stacks are not read
+or copied.
+
+For multi-million-particle datasets, use **Choose particle dataset…**. The native
+file picker indexes the existing table in place and suggests a matching
+passthrough when one is needed. This runs in a background job using memory-mapped
+chunks, avoiding a browser upload and duplicate input copy. Brush
+edits never rewrite particle files. Final filtering is a separate background
+export; only the kept tables are written by default, while excluded tables are
+optional because they can nearly double output size and time. Set a direct
+output folder with its native folder picker for very large tables to avoid
+creating a second ZIP-sized copy. A browser-upload fallback remains available
+for environments where the native picker cannot be used.
+
+**Download portable selection file** writes a small `.epuholes.json` containing
+the resolved exposure selection but no images or particles. The launcher's
+**Filter CryoSPARC particles** tab can apply it to later CryoSPARC tables without
+opening the dashboard. It needs `location/micrograph_path` in either the particle
+or matching passthrough table; particle coordinates are not required.
+
 These describe the imported subset, not total particle abundance or ice thickness.
+EPU's `PixelIntensityMean` is a relative image-intensity measurement, not a
+calibrated ice-thickness value; the recorded final `Selected` state is retained
+as a histogram comparison.
 Colors are scaled within each square; blank regions mean unknown, not zero.
 Mapping assumes matching image orientation and cropping. Density overlays are
 not included in exported reports or bundles.
@@ -194,10 +261,15 @@ with the selected hole. **Previous/Next square** sits below the GridSquare viewe
 White outlines indicate the active square on the Atlas and active hole on the
 GridSquare.
 
+Enable **Show planned Data acquisition areas on GridSquare and FoilHole** to see
+all planned exposure footprints on the GridSquare. The FoilHole viewer shows the
+footprint of the active Data exposure and updates it as you step between exposures.
+These are positions calculated from EPU metadata, not measured beam positions.
+
 Scroll to zoom and drag to pan. **Enlarge** opens a larger view; **Zoom to selected
 hole** focuses the GridSquare on the active hole. Under **Adjust image**, try
 auto-contrast, black/white levels, gamma or low-pass filtering. These change the
-display, not the original data. Use **Load MRC** on the Atlas or GridSquare when
+display, not the original data. Use **Load MRC** on the Atlas, GridSquare or Data image when
 you need a higher-resolution view.
 
 On a network drive, previews are cached as you browse. **Prepare local previews**

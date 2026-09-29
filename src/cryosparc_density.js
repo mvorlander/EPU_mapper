@@ -1,12 +1,16 @@
 // Optional acquisition dashboard extension; no CryoSPARC connection required.
 const densityPanel=document.createElement('details');
+densityPanel.id='densityPanel';
 densityPanel.style.cssText='margin:12px 18px;padding:12px;background:white;border:2px solid #8069c8;border-radius:10px';
 densityPanel.innerHTML=`<summary style="cursor:pointer;font-weight:600">CryoSPARC particle density · optional</summary>
 <p class="muted">Import a selected particle .cs file and its matching passthrough if needed. No particle stacks or Data MRCs are read.</p>
 <p class="muted">Compare subsets in this session: choose another .cs pair and import again. This replaces density only; your EPU session and annotations stay unchanged.</p>
-<label>Particles <input type="file" id="densityMain" accept=".cs"></label>
-<label>Passthrough (optional) <input type="file" id="densityPass" accept=".cs"></label>
-<button id="densityImport">Import particle density</button>
+<div class="density-dataset">
+ <button id="densityChooseMain">Choose particle dataset…</button><span id="densityMainChoice" class="density-choice">No dataset selected</span>
+ <button id="densityChoosePass">Add passthrough…</button><span id="densityPassChoice" class="density-choice"></span>
+ <button id="densityMap" disabled>Map particles</button>
+</div>
+<details class="density-upload-fallback"><summary>Browser upload fallback</summary><p class="muted">Use only when the native picker is unavailable. Browser uploads copy the input into the local cache and are limited to 256 MiB per file.</p><label>Particles <input type="file" id="densityMain" accept=".cs"></label><label>Passthrough <input type="file" id="densityPass" accept=".cs"></label><button id="densityImport">Upload and map</button></details>
 <button id="densityClear" disabled>Clear density</button>
 <label><input type="checkbox" id="densityVisible" checked> Show density on GridSquare</label>
 <label>Display <select id="densityMode"><option value="holes">Mean density per FoilHole</option><option value="spatial">Binned spatial density</option></select></label>
@@ -16,8 +20,10 @@ densityPanel.innerHTML=`<summary style="cursor:pointer;font-weight:600">CryoSPAR
 <p id="densityStatus" role="status">No particles imported. Blank regions are unknown, not zero density.</p>
 <p id="densityLegend" class="muted"></p>`;
 document.querySelector('header').after(densityPanel);
+const densityStyle=document.createElement('style');densityStyle.textContent=`.density-dataset{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0}.density-choice{padding:7px 10px;border-radius:7px;background:#f2f0fb;color:#564783;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.density-choice.required{background:#fff2dc;color:#8a5913}.density-upload-fallback{margin:8px 0;color:#617087}.density-upload-fallback label{margin-right:8px}`;document.head.append(densityStyle);
 let densityResult=null,densityRequest=0,densityLoaded=false;
 let densityGridCounts=null;
+let densityPaths={particles:'',passthrough:''},densityInspection=null;
 const originalRenderGrids=renderGrids;
 renderGrids=function(){
  originalRenderGrids();
@@ -126,11 +132,42 @@ $('densityImport').onclick=async()=>{
  }catch(e){$('densityStatus').textContent='Import failed: '+e.message}
  finally{activity.finish();$('densityImport').disabled=false;$('densityClear').disabled=!densityLoaded}
 };
+async function finishDensityImport(started){
+ const job=started.job;jobActivities.set(job,['Indexing particle table in chunks','']);
+ const result=await waitJob(job);updateDensityCounts(result);
+ $('densityStatus').textContent=`${result.matched.toLocaleString()} / ${result.particles.toLocaleString()} particles matched; ${result.represented_holes} holes, ${result.represented_exposures} exposures. Unmatched: ${result.unmatched}; ambiguous: ${result.ambiguous}; invalid coordinates: ${result.invalid}. `+result.warning;
+ await loadDensity();
+}
+function densityFileSize(bytes){const units=['B','KB','MB','GB','TB'];let value=bytes,index=0;while(value>=1024&&index<units.length-1){value/=1024;index++}return `${value.toFixed(index?1:0)} ${units[index]}`}
+function updateDensityDataset(){
+ const main=$('densityMainChoice'),pass=$('densityPassChoice');
+ if(densityInspection){main.textContent=`${densityInspection.name} · ${densityInspection.particles.toLocaleString()} particles · ${densityFileSize(densityInspection.size)}`;main.title=densityPaths.particles}else{main.textContent='No dataset selected';main.title=''}
+ pass.textContent=densityPaths.passthrough?densityPaths.passthrough.split(/[\\/]/).pop():densityInspection?.needs_passthrough?'Matching passthrough required':'';pass.title=densityPaths.passthrough;
+ pass.classList.toggle('required',!!densityInspection?.needs_passthrough&&!densityPaths.passthrough);
+ $('densityChoosePass').textContent=densityPaths.passthrough?'Replace passthrough…':densityInspection?.needs_passthrough?'Choose passthrough…':'Add passthrough…';
+ $('densityMap').disabled=!densityPaths.particles||(densityInspection?.needs_passthrough&&!densityPaths.passthrough);
+}
+async function inspectDensityChoice(path,suggest=false){return api('/api/density/inspect-path',{path,suggest_passthrough:suggest})}
+async function chooseDensityFile(role){
+ const main=role==='particles',button=$(main?'densityChooseMain':'densityChoosePass');button.disabled=true;
+ try{
+  const picked=await api('/api/native-dialog',{kind:'cs',prompt:main?'Choose CryoSPARC particle dataset':'Choose matching CryoSPARC passthrough',initial:densityPaths[role]||densityPaths.particles});if(picked.cancelled)return;
+  const info=await inspectDensityChoice(picked.path,main);if(!info.has_uid)throw Error('The selected table has no particle UIDs.');
+  if(main){densityPaths={particles:info.path,passthrough:info.suggestion||''};densityInspection=info;$('densityStatus').textContent=info.needs_passthrough?(info.suggestion?'Matching passthrough found automatically. Review the files, then map particles.':'This particle table stores locations in a passthrough. Choose the matching file.'):'Dataset ready. Location fields are present in the particle table.'}
+  else{if(!densityInspection)throw Error('Choose the particle dataset first.');if(!densityInspection.missing.every(field=>info.fields.includes(field)))throw Error('This passthrough does not contain the required location fields.');densityPaths.passthrough=info.path;$('densityStatus').textContent='Particle and passthrough datasets are ready.'}
+  updateDensityDataset();
+ }catch(e){$('densityStatus').textContent='Could not choose dataset: '+e.message}
+ finally{button.disabled=false}
+}
+$('densityChooseMain').onclick=()=>chooseDensityFile('particles');$('densityChoosePass').onclick=()=>chooseDensityFile('passthrough');
+$('densityMap').onclick=async()=>{const button=$('densityMap');button.disabled=true;$('densityStatus').textContent='Indexing particle locations in memory-bounded chunks…';try{await finishDensityImport(await api('/api/density/import-path',densityPaths))}catch(e){$('densityStatus').textContent='Import failed: '+e.message}finally{button.disabled=false;updateDensityDataset()}};
+updateDensityDataset();
 api('/api/density/summary').then(s=>{
  if(s.loaded){updateDensityCounts(s);$('densityStatus').textContent=`${s.matched.toLocaleString()} selected particles loaded across ${s.represented_holes} holes. `+s.warning;loadDensity()}
 }).catch(e=>{$('densityStatus').textContent='Density service unavailable: '+e.message});
 if(config.mode==='foilhole'){
  $('densityImport').disabled=true;
+ $('densityChooseMain').disabled=true;$('densityChoosePass').disabled=true;$('densityMap').disabled=true;
  $('densityMain').disabled=true;$('densityPass').disabled=true;
  $('densityStatus').textContent='Data loading is off. Uncheck Ignore Data images in the launcher to match particle exposures; no Data MRCs are needed.';
 }

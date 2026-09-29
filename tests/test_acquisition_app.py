@@ -94,6 +94,36 @@ class AcquisitionAppTests(unittest.TestCase):
             self.assertTrue(pair['foil'])
             forbidden=store.add_media(self.source/'Data/should_not_read.mrc','data')
             self.assertEqual(client.post('/api/prepare/'+forbidden,json={}).status_code,404)
+            forbidden_mrc=store.add_media(self.source/'Data/exposure.mrc','data_mrc')
+            self.assertEqual(client.post('/api/prepare/'+forbidden_mrc,json={}).status_code,404)
+
+    def test_data_mrc_is_exact_match_and_loaded_only_on_request(self):
+        import mrcfile
+        import numpy as np
+        preview=next(self.source.glob('Images-Disc*/GridSquare_*/Data/*.jpg'))
+        with mrcfile.new(preview.with_suffix('.mrc'),overwrite=True) as mrc:
+            mrc.set_data(np.arange(64*64,dtype=np.float32).reshape(64,64))
+        # A movie-like counterpart must not substitute for another exposure.
+        other=next(p for p in self.source.glob('Images-Disc*/GridSquare_*/Data/*.jpg') if p!=preview)
+        with mrcfile.new(other.with_name(other.stem+'_fractions.mrc'),overwrite=True) as mrc:
+            mrc.set_data(np.zeros((2,16,16),dtype=np.float32))
+        app=self.app();store=app.state.acquisition_store
+        with TestClient(app) as client:
+            status=self.ready(client);grid=status['grids'][0]
+            all_rows=[]
+            for hole in client.get('/api/holes/'+grid['id']).json()['rows']:
+                all_rows.extend(client.get('/api/exposures/'+grid['id']+'/'+hole['hole']).json()['exposures'])
+            row=next(r for r in all_rows if r['name']==preview.name)
+            self.assertTrue(row['mrc'])
+            self.assertFalse(next(r for r in all_rows if r['name']==other.name)['mrc'])
+            self.assertIsNone(store.local_file(row['mrc']))
+            self.assertEqual(grid['exposures'],9)
+            self.job(client,client.post('/api/prepare/'+row['id'],json={'viewer':'data'}))
+            self.assertIsNone(store.local_file(row['mrc']))
+            self.job(client,client.post('/api/prepare/'+row['mrc'],json={'viewer':'data'}))
+            image=client.get('/api/image/'+row['mrc']+'?adjust=true&low=1&high=99&sigma=1')
+            self.assertEqual(image.status_code,200,image.text if image.status_code!=200 else '')
+            self.assertIn("views.data.load(p.id,p.name,p.mrc||'')",client.get('/').text)
 
     def test_launcher_command_selects_mode(self):
         for mode in ('screening','acquisition','foilhole'):

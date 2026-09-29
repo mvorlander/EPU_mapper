@@ -12,15 +12,15 @@ from acquisition_ui import PAGE
 class FoilOverlayTests(unittest.TestCase):
     def test_beam_shift_message_distinguishes_unknown_relationship(self):
         helper='function showFoilForExposure'+PAGE.split('function showFoilForExposure',1)[1].split('async function showShot',1)[0]
-        script="const assert=require('node:assert/strict');let hole='2',grid={markers:[{hole:'2',role:'shifted',anchor:'1'}]},message='',loaded='';const views={foil:{clear(m){message=m},load(id){loaded=id}}};\n"+helper+"""
+        script="const assert=require('node:assert/strict');let hole='2',grid={markers:[{hole:'2',role:'shifted',anchor:'1'}]},message='',expected=false,loaded='';const views={foil:{clear(m,e){message=m;expected=e},load(id){loaded=id}}};\n"+helper+"""
 showFoilForExposure({foil:''});
-assert.match(message,/Beam-shift collection/);
-assert.match(message,/centering hole 1/);
-assert.match(message,/Data images are available/);
+assert.match(message,/Beam-shift acquisition/);
+assert.match(message,/no separate FoilHole image expected/);
+assert.equal(expected,true);
 grid.markers=[];
 showFoilForExposure({foil:''});
-assert.match(message,/not confirmed/);
-assert.doesNotMatch(message,/No separate FoilHole image is expected/);
+assert.match(message,/No FoilHole preview indexed/);
+assert.equal(expected,true);
 showFoilForExposure({foil:'real-preview'});
 assert.equal(loaded,'real-preview');
 """
@@ -99,8 +99,38 @@ syncActiveHole('missing');assert.equal(svg.children.length,0);
         self.assertIn("Zoom to selected hole",script)
         self.assertIn("No Data areas could be placed.",script)
         self.assertIn("m?.role==='shifted'",script)
-        self.assertIn("No separate FoilHole image is expected",script)
-        self.assertIn("centering relationship is not confirmed",script)
+        self.assertIn("no separate FoilHole image expected",script)
+        self.assertIn("No FoilHole preview indexed",script)
+        self.assertIn("message.classList.toggle('expected-empty',expected)",script)
+        self.assertIn('.message.expected-empty',script)
+        self.assertIn('Show planned Data acquisition areas on GridSquare and FoilHole',script)
+        self.assertIn('showFoilForExposure(p);drawFoilArea()',script)
+
+    def test_foil_area_shows_full_pattern_and_highlights_selected_exposure(self):
+        helper='function drawFoilArea'+PAGE.split('function drawFoilArea',1)[1].split('function updateOverlayControls',1)[0]
+        script=r'''
+const assert=require('node:assert/strict');let shot=0;
+const pairs=[{id:'one',foil:'foil-a'},{id:'two',foil:'foil-a'}];
+const grid={areas:[
+ {id:'one',foil:'foil-a',anchor:'anchor-a',name:'Exposure one',foil_points:[[.1,.2],[.3,.2],[.3,.4],[.1,.4]]},
+ {id:'two',foil:'foil-a',anchor:'anchor-a',name:'Exposure two',foil_points:[[.5,.6],[.7,.6],[.7,.8],[.5,.8]]},
+ {id:'other',foil:'foil-b',anchor:'anchor-b',name:'Other pattern',foil_points:[[.2,.2],[.4,.2],[.4,.4],[.2,.4]]}
+]};
+const checkbox={checked:true},svg={children:[],replaceChildren(){this.children=[]},append(x){this.children.push(x)}};
+const views={foil:{svg}},$=()=>checkbox;
+function groupColor(anchor){return anchor==='anchor-a'?'teal':'purple'}
+const document={createElementNS(ns,tag){const node={tag,namespaceURI:ns,style:{},dataset:{},classes:[],children:[],setAttribute(k,v){this[k]=v},append(x){this.children.push(x)}};node.classList={add(...x){node.classes.push(...x)}};return node}};
+'''+helper+r'''
+drawFoilArea();assert.equal(svg.children.length,2);
+assert.equal(svg.children[0].dataset.exposure,'two');assert.equal(svg.children[0].style.stroke,'teal');assert.equal(svg.children[0].style.fill,'none');
+assert.equal(svg.children[1].dataset.exposure,'one');assert.equal(svg.children[1].style.stroke,'#ffffff');assert.equal(svg.children[1].style.strokeWidth,'3px');assert.ok(svg.children[1].classes.includes('active'));
+shot=1;drawFoilArea();assert.equal(svg.children.length,2);
+assert.equal(svg.children[0].dataset.exposure,'one');assert.equal(svg.children[1].dataset.exposure,'two');assert.equal(svg.children[1].style.stroke,'#ffffff');
+pairs[1].foil='other';drawFoilArea();assert.equal(svg.children.length,0);
+checkbox.checked=false;shot=0;drawFoilArea();assert.equal(svg.children.length,0);
+'''
+        result=subprocess.run(['node'],input=script,text=True,capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr)
 
 
 if __name__ == '__main__':

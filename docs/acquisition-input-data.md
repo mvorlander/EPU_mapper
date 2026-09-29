@@ -6,11 +6,51 @@ Open `EPU Mapper.app`, select the session and matching Atlas folder, and start *
 
 The dashboard opens while indexing continues in the background. Click a GridSquare to load its first FoilHole/Data pair. **Click** hole overlays or use **Previous/Next hole**; use **Previous/Next exposure** for individual images from one hole. Ignoring Data preserves all four panels, showing a clear Data-loading-off message, and retains automatic FoilHole overlays. Positions come from `Metadata/GridSquare_*.dm` pixel centers, with an automatic fallback to GridSquare and FoilHole XML stage coordinates. GridSquare XML reference dimensions are required. Missing metadata for one hole does not hide the others: **Refresh index** as copying progresses to add newly available holes. Coordinates are not guessed or clamped into the image.
 
-JPEG/PNG previews load on demand into a local cache. Only Atlas and GridSquare viewers offer **Load MRC**. All viewers support scroll zoom, drag pan, enlargement, contrast routines, gamma and preview-scale Gaussian low-pass filtering. Adjustments do not change original images.
+**Show planned Data acquisition areas on GridSquare and FoilHole** draws all metadata-derived exposure footprints on the GridSquare and the active exposure's footprint on its matching FoilHole preview. The FoilHole layer follows Previous/Next exposure. It requires the EPU session template plus GridSquare, FoilHole and Data coordinate transformations; unavailable geometry is reported rather than guessed.
+
+JPEG/PNG previews load on demand into a local cache. Atlas, GridSquare and Data viewers offer **Load MRC** when a matching file exists. Data MRCs must have the same filename stem as the preview and are read only on explicit request; movie/fraction stacks are not substituted. Use **Refresh index** after adding files. All viewers support scroll zoom, drag pan, enlargement, contrast routines, gamma and preview-scale Gaussian low-pass filtering. Adjustments do not change original images. Data MRCs remain optional and are not read for HTML export or bulk preview caching.
 
 **Refresh index** explicitly checks for changed source data. **Prepare local previews** copies indexed JPEG/PNG previews, not MRCs, to the local cache; repeating resumes already cached files. It does not create a portable session bundle. Cached images and annotations can be reopened with the share disconnected; uncached images still need the share. Annotations are stored locally and can be downloaded as JSON. Legacy GridSquare ratings, comments and suitability are copied into the local unified index without altering source files or overwriting newer local annotations.
 
 **Atlas annotations** switches between live suitability, rating, EPU categories and raw imagery. **Add target / area** places a point or a two-corner rectangle for manual collection planning, without changing microscope metadata. Overlay opacity is independent of image contrast.
+
+When `Metadata/GridSquare_*.dm` contains EPU target-filter metadata, the
+**FoilHole selection & CryoSPARC export** panel exposes each target's recorded
+`PixelIntensityMean` and EPU `Selected` state. These are deliberately separate:
+the intensity is relative and is not a calibrated ice-thickness measurement,
+and EPU's final decision can include criteria beyond the saved numeric range.
+Choose a session-wide histogram-guided intensity interval (the default), or all
+acquired holes. EPU's recorded final selection remains visible as the purple
+histogram comparison rather than a separate working mode. A variable-radius
+brush can exclude or restore acquired holes on individual GridSquares. Swipe to
+remove, Control-swipe to add, Control-click to add one, Shift-click to remove
+one, and Shift-scroll to resize the brush. The brush circle remains visible as
+it changes size; middle- or right-drag temporarily pans the image without
+leaving brush mode. The compact brush controls remain
+visible when the GridSquare viewer is enlarged;
+undo, redo and clearing brush overrides do not alter the source session.
+
+After importing a CryoSPARC particle `.cs` file (and its matching passthrough
+when location fields are stored there), export produces a ZIP with kept and
+excluded particle tables, corresponding UID-aligned passthrough tables, a
+per-hole CSV and a JSON provenance manifest. Unmatched particles are excluded
+by default and can explicitly be retained. Original fields, row values and UIDs
+are preserved; particle stacks and Data MRCs are not read. Multi-million-particle
+tables should be loaded with **Choose particle dataset…**. Its native file picker
+indexes them in place and suggests a matching passthrough when needed. The server
+memory-maps and indexes the table in bounded chunks, so the browser does not
+upload or duplicate the input. Interactive brush changes only update hole-state
+metadata. The separate export job writes kept tables by default; writing excluded
+tables is optional because it can almost double the output size and runtime.
+For very large tables, choose a direct output folder so results are written
+there without first creating an additional downloadable ZIP copy.
+
+Particle-density mapping is not required for filtering. Choose a different
+particle table directly in the selection panel, or download the portable
+`.epuholes.json` selection and use the launcher's **Filter CryoSPARC particles**
+tab later. The standalone path does not start the server or read EPU images. It
+requires only the original `location/micrograph_path` field from the main or
+UID-matched passthrough table, so downstream tables do not need image coordinates.
 
 **Export HTML screening report** embeds current annotations and JPEG images into an offline browser report. Choose one suitable square, all suitable squares, or explicitly all screened images. The optional high-resolution Atlas reads its MRC when available and embeds a JPEG up to 4096 pixels; MRC files are never embedded. Exported Atlas layers have their own opacity control. Export runs independently of the launcher's full-session bundle export. Detailed PDF export and the legacy report editor retain their separate legacy review data; unified edits are not mirrored back into that editor.
 

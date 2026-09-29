@@ -207,6 +207,25 @@ $('legend').textContent=(config.mode==='foilhole'?'Data loading is off. ':'')+'A
 atlasTools.innerHTML='<label>Atlas annotations <select id="atlasColorMode"><option value="status">Collection suitability</option><option value="rating">Rating</option><option value="categories">EPU categories</option><option value="raw">Raw Atlas</option></select></label><button id="manualTarget">Add target / area</button>';
 views.atlas.card.querySelector('.viewer-options').after(atlasTools);
 const categoryColors={'-1':'#94a3b8',0:'#40e0d0',1:'#f97316',2:'#3b82f6',3:'#facc15',4:'#ec4899',5:'#c084fc',6:'#d946ef'},ratingColors=['#64748b','#dc2626','#f97316','#ca8a04','#65a30d','#15803d'];
+function renderAtlasLegend(mode){
+ atlasLegend.replaceChildren();atlasLegend.style.gap='8px 14px';
+ if(mode==='raw'){atlasLegend.textContent='Raw Atlas — no annotation overlays.';return}
+ const swatch=(label,color,outline=false,dashed=false)=>{
+  const item=document.createElement('span');item.style.cssText='display:inline-flex;align-items:center;gap:6px;white-space:nowrap';
+  const icon=document.createElement('span');icon.setAttribute('aria-hidden','true');icon.style.cssText='display:inline-block;width:13px;height:13px;flex:none;border-radius:50%;box-sizing:border-box';
+  icon.style.border='2px '+(dashed?'dashed':'solid')+' '+color;icon.style.background=outline?'transparent':color;
+  if(color==='#fff')icon.style.boxShadow='0 0 0 2px #475569';
+  const text=document.createElement('span');text.textContent=label;item.append(icon,text);atlasLegend.append(item);
+ };
+ if(mode==='rating')ratingColors.forEach((color,i)=>swatch(i?'Rating '+i:'Unrated',color));
+ if(mode==='categories'){for(const [key,color] of Object.entries(categoryColors))swatch('Category '+key,color)}
+ const outline=mode!=='status';
+ swatch(outline?'Suitable outline':'Suitable','#059669',outline);
+ swatch(outline?'Unsuitable outline':'Unsuitable','#dc2626',outline);
+ swatch(outline?'Unmarked outline':'Unmarked','#64748b',outline);
+ swatch('Active square','#fff',true);swatch('Manual target','#0891b2',true,true);
+ if(mode==='categories'){const note=document.createElement('span');note.textContent='Category colors are display colors, not the EPU UI palette.';atlasLegend.append(note)}
+}
 let manualTargets=[],targetArmed=false,targetCorner=null,targetAtlas='';
 const targetPanel=document.createElement('details');targetPanel.className='contrast';targetPanel.innerHTML='<summary>Manual collection targets</summary><p>Click an unscreened square to add a target. For an area, click two opposite corners. Targets are planning annotations, not microscope acquisition commands.</p><label><input type="checkbox" id="targetRectangle"> Rectangular area</label><input id="targetComment" aria-label="Manual target comment" placeholder="Target notes"><button id="cancelTarget">Cancel placement</button><p id="targetHint" role="status"></p><div id="targetList"></div>';
 views.atlas.card.append(targetPanel);
@@ -215,7 +234,7 @@ const nativeRenderAtlas=renderAtlas;
 renderAtlas=function(){
  nativeRenderAtlas();if(!atlas)return;
  const mode=$('atlasColorMode').value,svg=views.atlas.svg;
- if(mode==='raw'){svg.replaceChildren();return}
+ if(mode==='raw'){svg.replaceChildren();renderAtlasLegend(mode);return}
  const ms=views.atlas.markers.map(m=>{const g=grids.find(g=>g.id===m.id),a=dirty&&grid?.id===m.id&&$('scope').value==='grid'?{rating:Number($('rating').value),status:$('suitability').value}:g?.annotation||{};return {...m,color:mode==='rating'?ratingColors[a.rating||0]:a.status==='suitable'?'#059669':a.status==='unsuitable'?'#dc2626':'#64748b',stroke:a.status==='suitable'?'#059669':a.status==='unsuitable'?'#dc2626':'#64748b'}});
  views.atlas.mark(ms,m=>selectGrid(m.id));
  if(mode==='categories'&&atlas.width&&atlas.height){
@@ -231,9 +250,7 @@ renderAtlas=function(){
   if(t.bounds){const [x,y,x2,y2]=t.bounds;shape.setAttribute('x',x);shape.setAttribute('y',y);shape.setAttribute('width',x2-x);shape.setAttribute('height',y2-y)}else{shape.setAttribute('cx',t.x);shape.setAttribute('cy',t.y);shape.setAttribute('r',.022)}
   shape.style.fill='none';shape.style.stroke='#0891b2';shape.style.strokeWidth='2px';shape.style.strokeDasharray='5 3';shape.style.pointerEvents='none';shape.setAttribute('vector-effect','non-scaling-stroke');const title=document.createElementNS(shape.namespaceURI,'title');title.textContent='Manual target '+(i+1)+': '+t.comment;shape.append(title);svg.append(shape);
  }
- atlasLegend.textContent=mode==='categories'?'EPU categories (arbitrary display colors, not EPU UI colors): '+Object.entries(categoryColors).map(([k])=>k).join(', '):mode==='rating'?'Rating: 1 red · 2 orange · 3 gold · 4 lime · 5 green. Outline: green suitable / red unsuitable.':'Green = suitable · red = unsuitable · grey = unmarked';
- if(mode==='categories'){atlasLegend.replaceChildren();for(const [k,color] of Object.entries(categoryColors)){const s=document.createElement('span');s.textContent='● Category '+k;s.style.color=color;atlasLegend.append(s)}const n=document.createElement('span');n.textContent='Arbitrary colors; not EPU UI colors.';atlasLegend.append(n)}
- const note=document.createElement('span');note.textContent='White ring = active square · dashed cyan = manual target';atlasLegend.append(note);
+ renderAtlasLegend(mode);
 };
 $('atlasColorMode').onchange=renderAtlas;
 async function loadAtlasTargets(){const id=atlas?.id;if(!id)return;const rows=await api('/api/atlas-targets');if(id!==atlas?.id)return;manualTargets=rows;$('targetList').replaceChildren();for(const [i,t] of rows.entries()){const row=document.createElement('div');row.className='controls';const text=document.createElement('span');text.textContent='Target '+(i+1)+' · '+t.comment;row.append(text,button('Remove',async()=>{if(!confirm('Remove this manual target?'))return;const r=await fetch('/api/atlas-targets/'+t.id,{method:'DELETE'});if(!r.ok){fail(new Error(await r.text()));return}await loadAtlasTargets()}));$('targetList').append(row)}renderAtlas()}
