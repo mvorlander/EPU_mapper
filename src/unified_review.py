@@ -29,7 +29,7 @@ def build_report(store, label, scope='representative', high_resolution=True, tra
     from image_adjustments import adjusted_preview
     atlas=store.meta('atlas') or {}
     grids=store.grids()
-    warnings=[];assets={}
+    warnings=[];assets={};calibrations={}
 
     def embed(key):
         if not key:
@@ -38,6 +38,7 @@ def build_report(store, label, scope='representative', high_resolution=True, tra
             try:
                 with Image.open(store.cache_file(key)) as image:
                     assets[key]=_embedded_image_uri(image,1800)
+                    calibrations[key]=store.image_calibration(key)['width_m']
             except (OSError,ValueError,KeyError) as exc:
                 warnings.append('Preview unavailable: '+str(exc))
                 assets[key]=''
@@ -98,7 +99,7 @@ def build_report(store, label, scope='representative', high_resolution=True, tra
     categories=[]
     if atlas.get('width') and atlas.get('height'):
         categories=[dict(key=key,x=n['center'][0]/atlas['width'],y=n['center'][1]/atlas['height'],category=n.get('category')) for key,n in atlas.get('nodes',{}).items() if n.get('center')]
-    payload=dict(title=label or store.source.name,created=time.strftime('%Y-%m-%d %H:%M %Z'),summary='\n'.join(warnings),scope=scope,atlas=atlas_uri,categories=atlas_uri,records=records,assets=assets,category_nodes=categories,category_colors={str(k):'#%02x%02x%02x'%v for k,v in _EPU_CATEGORY_COLORS.items()})
+    payload=dict(calibrations=calibrations,atlas_width_m=store.image_calibration(atlas['id'])['width_m'] if atlas.get('id') else None,exclude_empty_holes=store.review_settings()['exclude_empty_holes'],title=label or store.source.name,created=time.strftime('%Y-%m-%d %H:%M %Z'),summary='\n'.join(warnings),scope=scope,atlas=atlas_uri,categories=atlas_uri,records=records,assets=assets,category_nodes=categories,category_colors={str(k):'#%02x%02x%02x'%v for k,v in _EPU_CATEGORY_COLORS.items()})
     serialized=json.dumps(payload,ensure_ascii=True).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
     template=PLAN_HTML.replace("p.foil_name===m.foil_name", "m.id!=null?String(p.id)===String(m.id):p.foil_name===m.foil_name")
     return template.replace('__PLAN_DATA__',serialized).replace('</body>',REPORT_TOOLS+'</body>'),warnings
@@ -271,7 +272,7 @@ for(const [label,status] of [['Mark square suitable','suitable'],['Mark square u
 const reportPanel=document.createElement('details');reportPanel.className='contrast';reportPanel.style.cssText='margin:10px 18px;background:white;border:1px solid #ccd7e4;border-radius:8px';
 reportPanel.innerHTML='<summary>Export HTML screening report</summary><label>Screening images <select id="reportScope"><option value="representative">One suitable GridSquare</option><option value="targets">All suitable GridSquares</option><option value="all_screened">ALL screened GridSquares / exposures (may be large)</option></select></label><label><input id="reportHigh" type="checkbox" checked> High-resolution Atlas (reads Atlas MRC if available; embeds JPEG only)</label><button id="reportBuild">Build portable HTML</button><span id="reportStatus" role="status"></span><a id="reportDownload" hidden download>Download HTML report</a>';
 document.querySelector('header').after(reportPanel);
-$('reportBuild').onclick=async()=>{if(!await saveIfDirty())return;if($('reportScope').value==='all_screened'&&!confirm('Include every indexed screening exposure? This may take time and produce a very large HTML file.'))return;const activity=beginActivity('Building portable HTML report');$('reportBuild').disabled=true;$('reportDownload').hidden=true;$('reportStatus').textContent='Preparing embedded images…';try{const j=await api('/api/report-html',{scope:$('reportScope').value,high_resolution:$('reportHigh').checked});const r=await waitJob(j.job);$('reportDownload').href=r.url;$('reportDownload').hidden=false;$('reportStatus').textContent=r.warnings.length?'Ready with '+r.warnings.length+' warnings (listed in report).':'Ready — opens offline in any browser.'}catch(e){$('reportStatus').textContent='Export failed: '+e.message}finally{activity.finish();$('reportBuild').disabled=false}};
+$('reportBuild').onclick=async()=>{if(!await saveIfDirty())return;if($('reportScope').value==='all_screened'&&!confirm('Include every indexed screening exposure? The FoilHole review filter applies. This may take time and produce a very large HTML file.'))return;const activity=beginActivity('Building portable HTML report');$('reportBuild').disabled=true;$('reportDownload').hidden=true;$('reportStatus').textContent='Preparing embedded images…';try{const j=await api('/api/report-html',{scope:$('reportScope').value,high_resolution:$('reportHigh').checked});const r=await waitJob(j.job);$('reportDownload').href=r.url;$('reportDownload').hidden=false;$('reportStatus').textContent=r.warnings.length?'Ready with '+r.warnings.length+' warnings (listed in report).':'Ready — opens offline in any browser.'}catch(e){$('reportStatus').textContent='Export failed: '+e.message}finally{activity.finish();$('reportBuild').disabled=false}};
 let targetLoadedAtlas='';const reviewStatusApi=api;api=async function(path,data){const result=await reviewStatusApi(path,data);if(path==='/api/status'&&result.atlas?.id&&targetLoadedAtlas!==result.atlas.id){targetLoadedAtlas=result.atlas.id;setTimeout(()=>loadAtlasTargets().catch(fail),0)}return result};
 if(atlas)loadAtlasTargets().catch(fail);renderAtlas();
 '''

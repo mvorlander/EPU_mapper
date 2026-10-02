@@ -53,6 +53,30 @@ class AcquisitionAppTests(unittest.TestCase):
             time.sleep(.01)
         self.fail('Job did not finish: '+str(result))
 
+    def test_review_filter_settings_and_calibration_api(self):
+        app=self.app()
+        with TestClient(app) as client:
+            status=self.ready(client);grid=status['grids'][0]
+            store=app.state.acquisition_store
+            store.add_media(self.root/'FoilHole_empty.jpg','foil',grid['id'],'empty')
+            endpoint='/api/holes/'+grid['id']
+            total=client.get(endpoint).json()['total']
+            self.assertEqual(client.post('/api/review-settings',json={'exclude_empty_holes':True}).status_code,200)
+            filtered=client.get(endpoint).json()
+            self.assertEqual(filtered['total'],total-1)
+            self.assertNotIn('empty',filtered['eligible_holes'])
+            self.assertTrue(client.get('/api/review-settings').json()['exclude_empty_holes'])
+            self.assertEqual(client.post('/api/review-settings',json={'exclude_empty_holes':'yes'}).status_code,400)
+            client.post('/api/review-settings',json={'exclude_empty_holes':False})
+            self.assertEqual(client.get(endpoint).json()['total'],total)
+            calibration=client.get('/api/calibration/'+grid['image'])
+            self.assertEqual(calibration.status_code,200)
+            self.assertGreater(calibration.json()['width_m'],0)
+            self.assertEqual(client.get('/api/calibration/missing').status_code,404)
+        with TestClient(self.app('foilhole')) as client:
+            self.ready(client)
+            self.assertEqual(client.post('/api/review-settings',json={'exclude_empty_holes':True}).status_code,409)
+
     def test_acquisition_images_geometry_mrc_and_annotations(self):
         with TestClient(self.app()) as client:
             self.assertIn('Unified review',client.get('/').text)

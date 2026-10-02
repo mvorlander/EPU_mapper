@@ -16,6 +16,9 @@ The program is free and open source, runs locally, and opens in a web browser.
   unscreened collection targets.
 - View annotations on the Atlas, with adjustable overlay opacity.
 - Zoom, pan, enlarge images and adjust contrast or low-pass filtering.
+- Inspect calibrated scale bars (default **200 Å**) and change each viewer’s
+  length under **Scale bar**, or choose **Auto size**.
+- Exclude FoilHoles without Data previews from review and HTML reports.
 - Inspect EPU's recorded FoilHole intensities and final selections, then refine
   an acquired-hole subset with a reversible selection brush.
 - Share annotated screening results as self-contained HTML reports that open
@@ -24,7 +27,7 @@ The program is free and open source, runs locally, and opens in a web browser.
 EPU Mapper supports both screening and multi-exposure collections. It helps
 document collection decisions.
 
-## Changelog: v0.2.9 → v0.9.1
+## Changelog: v0.2.9 → v0.10.0
 
 This consolidated summary covers the major changes since v0.2.9.
 
@@ -38,9 +41,16 @@ This consolidated summary covers the major changes since v0.2.9.
   contrast presets, gamma and low-pass filtering, plus on-demand Atlas,
   GridSquare and individual Data MRC loading. Planned exposure footprints and
   observed targeting-shift annotations help inspect acquisition geometry.
+  Calibrated scale bars default to 200 Å, with custom lengths and automatic sizing
+  in the browser and HTML reports.
 - **Portable results.** Export self-contained HTML screening reports with
   embedded images and interactive Atlas layers, or copy a full portable session
-  to another computer. Annotation JSON and detailed PDF exports remain available.
+  to another computer. HTML reports include independent Atlas and GridSquare
+  overlay opacity, unlabelled FoilHole circles and a moving active-hole highlight.
+  Annotation JSON and detailed PDF exports remain available.
+- **Focused review.** Optionally exclude FoilHoles without Data previews from
+  navigation, clickable overlays and HTML reports; the reversible setting is
+  saved per session.
 - **CryoSPARC particle mapping and filtering.** Map particle subsets back to
   EPU exposures, inspect per-square counts and density overlays, and select
   acquired holes using an intensity histogram and a brush with undo/redo.
@@ -115,7 +125,9 @@ HTML reports include Atlas views, annotations and embedded JPEG images.
 Choose one suitable square, all suitable squares, or all screened images.
 The optional high-resolution Atlas retains separate annotation layers with
 legends, metadata hover text and opacity control. Reports open offline in a
-standard browser; regenerate them after changing annotations.
+standard browser; regenerate them after changing annotations. GridSquare FoilHole
+markers have their own opacity control, omit number labels, and highlight the
+active hole with a white ring as you click markers or step through exposures.
 
 The launcher also offers a **portable session bundle** for copying the session
 and Atlas to another computer. This is separate from HTML export and takes
@@ -271,6 +283,21 @@ hole** focuses the GridSquare on the active hole. Under **Adjust image**, try
 auto-contrast, black/white levels, gamma or low-pass filtering. These change the
 display, not the original data. Use **Load MRC** on the Atlas, GridSquare or Data image when
 you need a higher-resolution view.
+
+Each viewer has a **Scale bar** menu. The default is **200 Å**; enter a different
+length in Å or enable **Auto size** for the current magnification. Bars update
+with zoom, resizing and MRC loading. Calibration uses the EPU XML image dimensions
+or the assembled Atlas MRC header, accounting for reduced JPEG previews. If a bar
+would be smaller than one screen pixel or larger than the viewer, the menu explains
+how to adjust it. Missing calibration is reported rather than estimated. Exported
+HTML reports include the same scale controls.
+
+Enable **Exclude FoilHoles without Data images** above the FoilHole list to review
+only holes with indexed Data JPEG/PNG previews. The setting is saved per session
+and applies to the list, Previous/Next hole navigation, clickable overlays and
+HTML reports. Turning it off restores all holes; source files and annotations
+are unchanged. This requires Data loading, so it is disabled in **Ignore Data
+images** mode. After copying additional previews, use **Refresh index**.
 
 On a network drive, previews are cached as you browse. **Prepare local previews**
 caches them in advance; **Refresh index** discovers files added since indexing.

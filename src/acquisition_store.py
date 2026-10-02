@@ -647,8 +647,11 @@ class AcquisitionStore:
             row['missing']=None if self.ignore_data else len(self.meta('missing:'+row['id'],[]))
         return rows
 
-    def holes(self,gid,offset=0,limit=100,query=''):
+    def holes(self,gid,offset=0,limit=100,query='',exclude_empty=None):
         allowed=('foil',) if self.ignore_data else ('foil','data')
+        exclude_empty=self.review_settings()['exclude_empty_holes'] if exclude_empty is None else exclude_empty and not self.ignore_data
+        if exclude_empty:
+            allowed=('data',)
         where='grid_id=? AND kind IN ('+','.join('?' for _ in allowed)+')'
         args=[gid,*allowed]
         if query:
@@ -657,7 +660,54 @@ class AcquisitionStore:
         total=self.execute(f'SELECT COUNT(DISTINCT hole) AS n FROM media WHERE {where}',args)[0]['n']
         for row in rows:
             row['annotation']=self.annotation('hole:'+gid+':'+row['hole'])
-        return dict(rows=rows,total=total,offset=offset)
+        eligible=[r['hole'] for r in self.execute("SELECT DISTINCT hole FROM media WHERE grid_id=? AND kind='data'",(gid,))] if exclude_empty else None
+        return dict(rows=rows,total=total,offset=offset,eligible_holes=eligible)
+
+    def review_settings(self):
+        return dict(exclude_empty_holes=bool(self.meta('review:exclude-empty-holes',False)) and not self.ignore_data)
+
+    def image_calibration(self,key):
+        """Physical image width in metres; never confuse reduced previews with detector pixels."""
+        from build_collage import parse_grid_info
+        row=self.media(key)
+        path=Path(row['path'])
+        atlas=self.meta('atlas') or {}
+        # A stitched Atlas has a different frame from the XML camera tile.
+        if row['kind'].startswith('atlas'):
+            mrc=atlas.get('mrc')
+            if mrc:
+                try:
+                    import mrcfile
+                    with mrcfile.open(self.local_file(mrc) or self.media(mrc)['path'],header_only=True,permissive=True) as header:
+                        width=float(header.header.nx)*float(header.voxel_size.x)*1e-10
+                    if math.isfinite(width) and width>0:
+                        return dict(width_m=width,source='MRC header')
+                except (OSError,ValueError):
+                    pass
+            # Only trust XML when the assembled frame is known.
+            if atlas.get('frame_source')!='xml-readout':
+                return dict(width_m=None,source='Calibration unavailable')
+        try:
+            xml=self.cache_optional(row['xml'] or path.with_suffix('.xml'))
+        except OSError:
+            xml=None
+        try:
+            info=parse_grid_info(xml) if xml else {}
+            width=float(info.get('pixel_size',0))*float(info.get('readout_width',0))
+            if math.isfinite(width) and width>0:
+                return dict(width_m=width,source='EPU XML')
+        except (ValueError,TypeError):
+            pass
+        if row['kind'].endswith('_mrc'):
+            try:
+                import mrcfile
+                with mrcfile.open(self.local_file(key) or path,header_only=True,permissive=True) as header:
+                    width=float(header.header.nx)*float(header.voxel_size.x)*1e-10
+                if math.isfinite(width) and width>0:
+                    return dict(width_m=width,source='MRC header')
+            except (OSError,ValueError):
+                pass
+        return dict(width_m=None,source='Calibration unavailable')
 
     def exposures(self,gid,hole):
         foils=self.execute("SELECT * FROM media WHERE grid_id=? AND hole=? AND kind='foil' ORDER BY stamp,name",(gid,hole))

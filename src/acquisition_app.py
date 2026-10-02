@@ -60,6 +60,24 @@ def create_acquisition_app(source, atlas=None, mode='acquisition', transform='id
         store.grid(gid)
         return store.holes(gid,offset,limit,query)
 
+    @app.get('/api/review-settings')
+    def review_settings():
+        return store.review_settings()
+
+    @app.post('/api/review-settings')
+    def save_review_settings(value: dict):
+        enabled=value.get('exclude_empty_holes')
+        if not isinstance(enabled,bool):
+            raise HTTPException(400,'exclude_empty_holes must be a boolean')
+        if enabled and store.ignore_data:
+            raise HTTPException(409,'Enable Data loading before excluding holes without Data previews.')
+        store.set_meta('review:exclude-empty-holes',enabled)
+        return store.review_settings()
+
+    @app.get('/api/calibration/{key}')
+    def calibration(key: str):
+        return store.image_calibration(key)
+
     @app.get('/api/exposures/{gid}/{hole}')
     def exposures(gid: str,hole: str):
         store.grid(gid)

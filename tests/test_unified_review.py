@@ -37,6 +37,23 @@ class UnifiedReviewTests(unittest.TestCase):
     def payload(self,html):
         return json.loads(re.search(r'<script type="application/json" id="plan-data">(.*?)</script>',html,re.S).group(1))
 
+    def test_report_calibration_and_empty_hole_filter(self):
+        g=self.store.grids()[0]
+        hole=self.store.holes(g['id'])['rows'][0]['hole']
+        self.store.execute("DELETE FROM media WHERE grid_id=? AND hole=? AND kind='data'",(g['id'],hole))
+        unfiltered=self.payload(build_report(self.store,'test','all_screened',False)[0])
+        self.assertTrue(any(p['id']==hole and not p['data'] for r in unfiltered['records'] if r['key']==g['id'] for p in r['pairs']))
+        self.store.set_meta('review:exclude-empty-holes',True)
+        html,_=build_report(self.store,'test','all_screened',False)
+        filtered=self.payload(html)
+        self.assertTrue(filtered['exclude_empty_holes'])
+        self.assertTrue(all(p['data'] for r in filtered['records'] for p in r['pairs']))
+        self.assertFalse(any(p['id']==hole for r in filtered['records'] if r['key']==g['id'] for p in r['pairs']))
+        # Synthetic Atlas MRC deliberately lacks voxel calibration; do not guess from tile XML.
+        self.assertIsNone(filtered['atlas_width_m'])
+        self.assertTrue(all(v>0 for v in filtered['calibrations'].values()))
+        self.assertIn('Scale bar length in angstroms',html)
+
     def test_target_validation_persistence_and_deletion(self):
         atlas_id=self.store.meta('atlas')['id']
         self.assertEqual(self.client.post('/api/atlas-targets',json=dict(atlas_id='wrong',x=.2,y=.3)).status_code,409)
